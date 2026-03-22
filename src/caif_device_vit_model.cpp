@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #include "caif_device_vit_model.h"
 #include "caif_device_ops.h"
+#include <cstring>
 #include "caif_exception.h"
 #include <cmath>
 
@@ -188,11 +189,17 @@ CAIF_DeviceTensor CAIF_DeviceViTModel::Forward(const CAIF_DeviceTensor &input,
     {
       const size_t src_offset=b*seq_len*dim;
       const size_t dst_offset=b*dim;
+#ifdef USE_CAIF_CUDA
       cudaMemcpyAsync(cls_output.DevicePtr()+dst_offset,
                       x.DevicePtr()+src_offset,
                       dim*sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       _stream->Handle());
+#else
+      std::memcpy(cls_output.DevicePtr()+dst_offset,
+                  x.DevicePtr()+src_offset,
+                  dim*sizeof(float));
+#endif
     }
 
     // Cache for backward
@@ -233,11 +240,17 @@ CAIF_DeviceTensor CAIF_DeviceViTModel::Backward(const CAIF_DeviceTensor &grad_ou
     {
       const size_t src_offset=b*dim;
       const size_t dst_offset=b*seq_len*dim;
+#ifdef USE_CAIF_CUDA
       cudaMemcpyAsync(grad_seq.DevicePtr()+dst_offset,
                       grad_cls.DevicePtr()+src_offset,
                       dim*sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       _stream->Handle());
+#else
+      std::memcpy(grad_seq.DevicePtr()+dst_offset,
+                  grad_cls.DevicePtr()+src_offset,
+                  dim*sizeof(float));
+#endif
     }
 
     // Step 3: Backward through final norm

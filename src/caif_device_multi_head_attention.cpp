@@ -18,6 +18,7 @@
 #include "caif_exception.h"
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <random>
 
 namespace instance
@@ -1478,12 +1479,21 @@ CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::ForwardCached(
       const size_t src_offset=row*_kv_cache_max_len*head_dim;
       const size_t dst_offset=row*total_len*head_dim;
       const size_t copy_size=total_len*head_dim*sizeof(float);
+#ifdef USE_CAIF_CUDA
       cudaMemcpyAsync(k_full.DevicePtr()+dst_offset,
                       _kv_cache_k.DevicePtr()+src_offset,
                       copy_size,cudaMemcpyDeviceToDevice,_stream->Handle());
       cudaMemcpyAsync(v_full.DevicePtr()+dst_offset,
                       _kv_cache_v.DevicePtr()+src_offset,
                       copy_size,cudaMemcpyDeviceToDevice,_stream->Handle());
+#else
+      std::memcpy(k_full.DevicePtr()+dst_offset,
+                  _kv_cache_k.DevicePtr()+src_offset,
+                  copy_size);
+      std::memcpy(v_full.DevicePtr()+dst_offset,
+                  _kv_cache_v.DevicePtr()+src_offset,
+                  copy_size);
+#endif
     }
 
     // Step 9: GQA expand K/V if needed

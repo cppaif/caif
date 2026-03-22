@@ -23,6 +23,10 @@
 #include <cstdint>
 #include <vector>
 
+#ifndef USE_CAIF_CUDA
+typedef void *cudaStream_t;
+#endif
+
 namespace instance
 {
 

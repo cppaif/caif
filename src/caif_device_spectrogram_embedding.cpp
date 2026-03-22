@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #include "caif_device_spectrogram_embedding.h"
 #include "caif_device_ops.h"
+#include <cstring>
 #include "caif_cuda_kernels.h"
 #include "caif_exception.h"
 #include <cmath>
@@ -163,11 +164,17 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTens
       for(uint32_t b=0;b<batch;++b)
       {
         const size_t dst_offset=b*out_seq_len*dim;
+#ifdef USE_CAIF_CUDA
         cudaMemcpyAsync(output.DevicePtr()+dst_offset,
                         _cls_token.DevicePtr(),
                         dim*sizeof(float),
                         cudaMemcpyDeviceToDevice,
                         _stream->Handle());
+#else
+        std::memcpy(output.DevicePtr()+dst_offset,
+                    _cls_token.DevicePtr(),
+                    dim*sizeof(float));
+#endif
       }
 
       // Copy projected frames to positions 1..time_frames for each batch
@@ -175,11 +182,17 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTens
       {
         const size_t src_offset=b*time_frames*dim;
         const size_t dst_offset=b*out_seq_len*dim+dim;  // +dim to skip CLS
+#ifdef USE_CAIF_CUDA
         cudaMemcpyAsync(output.DevicePtr()+dst_offset,
                         proj_output.DevicePtr()+src_offset,
                         time_frames*dim*sizeof(float),
                         cudaMemcpyDeviceToDevice,
                         _stream->Handle());
+#else
+        std::memcpy(output.DevicePtr()+dst_offset,
+                    proj_output.DevicePtr()+src_offset,
+                    time_frames*dim*sizeof(float));
+#endif
       }
 
       return output;
@@ -230,11 +243,17 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTen
       {
         const size_t src_offset=b*out_seq_len*dim+dim;  // +dim to skip CLS
         const size_t dst_offset=b*time_frames*dim;
+#ifdef USE_CAIF_CUDA
         cudaMemcpyAsync(grad_proj.DevicePtr()+dst_offset,
                         grad_output.DevicePtr()+src_offset,
                         time_frames*dim*sizeof(float),
                         cudaMemcpyDeviceToDevice,
                         _stream->Handle());
+#else
+        std::memcpy(grad_proj.DevicePtr()+dst_offset,
+                    grad_output.DevicePtr()+src_offset,
+                    time_frames*dim*sizeof(float));
+#endif
       }
     }
     else

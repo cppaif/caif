@@ -13,8 +13,13 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - C++ AI Framework
 // CUDA kernel declarations for operations not supported by cuDNN
+//
+// IMPORTANT: Every function declared in this header has a GPU implementation
+// in caif_cuda_kernels.cu and a CPU no-op stub in caif_cuda_kernels_cpu.cpp.
+// When adding a new launch_* function here, you MUST also add a matching
+// stub to caif_cuda_kernels_cpu.cpp or CPU-only builds will fail to link.
 //------------------------------------------------------------------------------
 #ifndef CAIF_CUDA_KERNELS_H
 #define CAIF_CUDA_KERNELS_H

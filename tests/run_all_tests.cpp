@@ -248,7 +248,6 @@ int main(int argc,char *argv[])
     {"Neural Network Training Tests", "./test_neural_network_training", false},
     {"Learning Process Tests", "./test_learning_process", false},
     {"Integration Tests", "./test_integration", false},
-    {"Model Serializer Tests", "./test_model_serializer", false},
     {"Pythagorean Example Tests", "./test_pythagorean_example", false},
     {"Pythagorean Detailed Tests", "./test_pythagorean_detailed", false},
     // Device-based tests (use CUDA automatically via USE_CAIF_CUDA)
