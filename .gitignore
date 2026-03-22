@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.eggs
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Training artifacts
+*.safetensors
+*.gguf
+*.tok
+*.tokens
+*.bin
+*.ckpt
+
+# Logs
+*.log
+nohup.out
