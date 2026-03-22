@@ -53,7 +53,7 @@ int main()
     const uint32_t vocab_size=256;
     const uint32_t max_seq_len=32;
     const uint32_t dim=64;
-    const uint32_t num_heads=4;
+    const uint32_t num_heads=2;
     const uint32_t num_layers=2;
     const uint32_t ffn_dim=dim*4;
 
@@ -67,7 +67,7 @@ int main()
     model_cfg.ffn_dim=ffn_dim;
     model_cfg.causal=true;
     model_cfg.use_rope=true;
-    model_cfg.pe_mode=PositionalEncodingMode_e::None;
+    model_cfg.pe_mode=PositionalEncodingMode_e::Sinusoidal;
     model_cfg.output_dim=vocab_size;
     model_cfg.tie_weights=true;
 
@@ -76,10 +76,7 @@ int main()
     auto model=std::make_unique<CAIF_DeviceTransformerModel>(model_cfg,stream);
     network.AddLayer(std::move(model));
 
-    ISE_Out::Out()<<"Model: "
-                  <<network.TotalParameterCount()
-                  <<" parameters"
-                  <<std::endl;
+    ISE_Out::Out()<<"Model: "<<network.TotalParameterCount()<<" parameters"<<std::endl;
 
     // Create synthetic training data — a repeating pattern of tokens
     // In production, load real tokenized text here
@@ -95,25 +92,15 @@ int main()
       target_data[i]=static_cast<float>((i+1)%vocab_size);
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostRaw(input_data.data(),
-                                                          {batch_size,seq_len},
-                                                          CAIF_DataType_e::Float32,
-                                                          stream);
-
-    CAIF_DeviceTensor target=CAIF_DeviceTensor::FromHostRaw(target_data.data(),
-                                                            {batch_size,seq_len},
-                                                            CAIF_DataType_e::Float32,
-                                                            stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),{batch_size,seq_len},stream);
+    CAIF_DeviceTensor target=CAIF_DeviceTensor::FromHostData(target_data.data(),{batch_size,seq_len},stream);
 
     // Training loop
     const uint32_t num_steps=50;
     const float learning_rate=1e-3f;
     network.InitializeAdam(learning_rate,0.9f,0.999f,1e-8f);
 
-    ISE_Out::Out()<<"Training for "
-                  <<num_steps
-                  <<" steps..."
-                  <<std::endl;
+    ISE_Out::Out()<<"Training for "<<num_steps<<" steps..."<<std::endl;
 
     for(uint32_t step=0;step<num_steps;++step)
     {
@@ -124,11 +111,7 @@ int main()
 
       // Loss + gradient
       CAIF_DeviceTensor grad_output;
-      const float loss=
-        CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(output,
-                                                            target,
-                                                            grad_output,
-                                                            stream);
+      const float loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(output,target,grad_output,stream);
 
       // Backward
       network.Backward(grad_output);
@@ -138,8 +121,7 @@ int main()
 
       if((step+1)%10==0)
       {
-        ISE_Out::Out()<<"  step "<<(step+1)<<"/"<<num_steps
-                      <<" loss="<<loss<<std::endl;
+        ISE_Out::Out()<<"  step "<<(step+1)<<"/"<<num_steps<<" loss="<<loss<<std::endl;
       }
     }
 
