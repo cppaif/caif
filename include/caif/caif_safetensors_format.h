@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // SafeTensors format implementation
 //------------------------------------------------------------------------------
 #ifndef CAIF_SAFETENSORS_FORMAT_H

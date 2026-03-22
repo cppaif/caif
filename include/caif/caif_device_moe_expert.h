@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Expert (single expert FFN)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_MOE_EXPERT_H

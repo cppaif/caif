@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Tensor adapter for gradual migration from old to new tensor architecture
 //------------------------------------------------------------------------------
 #ifndef CAIF_TENSOR_ADAPTER_H

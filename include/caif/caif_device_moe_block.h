@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Transformer Block (pre-norm) layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_MOE_BLOCK_H

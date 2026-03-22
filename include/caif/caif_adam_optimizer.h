@@ -15,7 +15,7 @@
 /**
  * @file aif_adam_optimizer.h
  * @brief Adam optimizer implementation
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -49,7 +49,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with optimizer parameters
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param learning_rate Learning rate for parameter updates
        * @param beta1 Exponential decay rate for first moment estimates
        * @param beta2 Exponential decay rate for second moment estimates

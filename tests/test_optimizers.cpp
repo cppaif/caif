@@ -14,8 +14,8 @@
 
 /**
  * @file test_optimizers.cpp
- * @brief Test suite for AIF optimizers
- * @author AIF Development Team
+ * @brief Test suite for CAIF optimizers
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

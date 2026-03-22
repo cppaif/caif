@@ -15,7 +15,7 @@
 /**
  * @file aif_dense_layer.cpp
  * @brief Implementation of the CAIF_DenseLayer class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  */
 

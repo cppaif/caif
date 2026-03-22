@@ -924,7 +924,7 @@ static void TestGQADescriptionString()
 
 int main()
 {
-  std::cout<<"=== AIF GQA Tests ===\n\n";
+  std::cout<<"=== CAIF GQA Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestGQAForwardShape();

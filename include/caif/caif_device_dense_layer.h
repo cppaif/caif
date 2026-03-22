@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident dense layer using CAIF_DeviceTensor
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_DENSE_LAYER_H

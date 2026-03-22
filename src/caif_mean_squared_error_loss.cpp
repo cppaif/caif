@@ -15,7 +15,7 @@
 /**
  * @file aif_mean_squared_error_loss.cpp
  * @brief Implementation of the CAIF_MeanSquaredErrorLoss class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

@@ -15,7 +15,7 @@
 /**
  * @file aif_max_pooling2d_layer.cpp
  * @brief Implementation of the CAIF_MaxPooling2DLayer class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

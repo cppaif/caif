@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // SafeTensors Format Tests
 //------------------------------------------------------------------------------
 #include "caif_safetensors_format.h"
@@ -59,7 +59,7 @@ static void TestBasicSaveLoad()
   try
   {
     CAIF_CudaStream stream;
-    const std::string test_path="/tmp/test_basic_safetensors.safetensors";
+    const std::string test_path="test_basic_safetensors.safetensors";
 
     // Create tensors
     CAIF_DeviceTensor tensor1=CAIF_DeviceTensor::Zeros({4,8},stream);
@@ -180,7 +180,7 @@ static void TestDenseNetworkSaveLoad()
   try
   {
     CAIF_CudaStream stream;
-    const std::string test_path="/tmp/test_dense_network.safetensors";
+    const std::string test_path="test_dense_network.safetensors";
 
     // Create network
     CAIF_DeviceNetwork net1(stream);
@@ -245,7 +245,7 @@ static void TestViTModelSaveLoad()
   try
   {
     CAIF_CudaStream stream;
-    const std::string test_path="/tmp/test_vit_model.safetensors";
+    const std::string test_path="test_vit_model.safetensors";
 
     // Create small ViT config
     CAIF_DeviceViTModel::Config_t config;
@@ -411,7 +411,7 @@ static void TestFileFormatValidation()
   try
   {
     CAIF_CudaStream stream;
-    const std::string test_path="/tmp/test_format.safetensors";
+    const std::string test_path="test_format.safetensors";
 
     // Create and save a tensor
     CAIF_DeviceTensor tensor=CAIF_DeviceTensor::Zeros({2,3},stream);
@@ -499,7 +499,7 @@ static void TestPythonSerializationCompatibility()
   try
   {
     CAIF_CudaStream stream;
-    const std::string test_path="/tmp/aif_python_compat.safetensors";
+    const std::string test_path="caif_python_compat.safetensors";
 
     // Create tensors with known values
     CAIF_DeviceTensor weight=CAIF_DeviceTensor::Zeros({2,3},stream);
@@ -518,12 +518,12 @@ static void TestPythonSerializationCompatibility()
     tensors.push_back({"model.bias",&bias});
 
     std::map<std::string,std::string> metadata;
-    metadata["framework"]="AIF";
+    metadata["framework"]="CAIF";
     metadata["version"]="1.0";
 
     format.Save(test_path,tensors,metadata);
 
-    // Load back with AIF and verify
+    // Load back with CAIF and verify
     auto loaded=format.Load(test_path,stream);
 
     bool passed=true;

@@ -22,7 +22,7 @@
  * The network learns to predict the hypotenuse (c) given two sides (a, b)
  * We'll trace the data through each layer to see how it transforms
  * 
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0 
  * @date 2024
  */

@@ -15,7 +15,7 @@
 /**
  * @file aif_loss_function.h
  * @brief Base loss function class for neural network training
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

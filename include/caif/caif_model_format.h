@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Abstract interface for model serialization formats
 //------------------------------------------------------------------------------
 #ifndef CAIF_MODEL_FORMAT_H

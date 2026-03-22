@@ -1,8 +1,8 @@
-#!/home/aidev/pytorch_cuda/bin/python3
+#!/usr/bin/env python3
 """
-Python Serialization Compatibility Test for AIF SafeTensors
+Python Serialization Compatibility Test for CAIF SafeTensors
 
-This script verifies that SafeTensors files created by AIF can be read
+This script verifies that SafeTensors files created by CAIF can be read
 by the Python safetensors library.
 
 Run test_safetensors first to create the test file, then run this script.
@@ -12,7 +12,7 @@ import sys
 import numpy as np
 
 def main():
-    test_path = "/tmp/aif_python_compat.safetensors"
+    test_path = "caif_python_compat.safetensors"
 
     try:
         from safetensors import safe_open
@@ -33,8 +33,8 @@ def main():
                 print("[FAIL] No metadata found")
                 return 1
 
-            if metadata.get("framework") != "AIF":
-                print(f"[FAIL] Expected framework='AIF', got '{metadata.get('framework')}'")
+            if metadata.get("framework") != "CAIF":
+                print(f"[FAIL] Expected framework='CAIF', got '{metadata.get('framework')}'")
                 return 1
 
             print("[PASS] Metadata readable")

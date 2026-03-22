@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Tests for multi-modal embedding layers
 //------------------------------------------------------------------------------
 #include "caif_device_tabular_embedding.h"

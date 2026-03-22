@@ -14,8 +14,8 @@
 
 /**
  * @file aif_serialization_constants.h
- * @brief Constants for model serialization in AIF framework
- * @author AIF Development Team
+ * @brief Constants for model serialization in CAIF framework
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

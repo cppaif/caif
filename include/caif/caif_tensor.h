@@ -14,8 +14,8 @@
 
 /**
  * @file aif_tensor.h
- * @brief Core tensor class for the AIF (AI Framework)
- * @author AIF Development Team
+ * @brief Core tensor class for the CAIF (AI Framework)
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

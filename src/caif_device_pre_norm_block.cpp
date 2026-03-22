@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Generic pre-norm residual block layer implementation
 //------------------------------------------------------------------------------
 #include "caif_device_pre_norm_block.h"

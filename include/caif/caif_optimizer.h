@@ -15,7 +15,7 @@
 /**
  * @file aif_optimizer.h
  * @brief Base optimizer class for neural network parameter updates
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -44,7 +44,7 @@ namespace instance
     public:
       /**
        * @brief Parameterized constructor
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param learning_rate Learning rate for parameter updates
        */
       explicit CAIF_Optimizer(CAIF_Framework &framework,
@@ -185,13 +185,13 @@ namespace instance
     protected:
       /**
        * @brief Get framework reference
-       * @return Reference to AIF framework instance
+       * @return Reference to CAIF framework instance
        */
       CAIF_Framework &Framework(){return _framework;}
       
       /**
        * @brief Get framework reference (const)
-       * @return Const reference to AIF framework instance
+       * @return Const reference to CAIF framework instance
        */
       const CAIF_Framework &Framework()const{return _framework;}
       

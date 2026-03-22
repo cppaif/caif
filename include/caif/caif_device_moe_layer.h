@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Layer (complete Mixture of Experts layer)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_MOE_LAYER_H

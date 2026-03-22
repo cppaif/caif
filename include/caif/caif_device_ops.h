@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device operations for CAIF_DeviceTensor
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_OPS_H

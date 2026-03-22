@@ -14,8 +14,8 @@
 
 /**
  * @file test_neural_network_training.cpp
- * @brief Test suite for AIF neural network training functionality
- * @author AIF Development Team
+ * @brief Test suite for CAIF neural network training functionality
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -178,7 +178,7 @@ bool TestNeuralNetworkCompilation()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -257,7 +257,7 @@ bool TestNeuralNetworkForward()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -323,7 +323,7 @@ bool TestNeuralNetworkPrediction()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -398,7 +398,7 @@ bool TestNeuralNetworkTrainingRegression()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -481,7 +481,7 @@ bool TestNeuralNetworkTrainingClassification()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -564,7 +564,7 @@ bool TestNeuralNetworkErrorHandling()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -623,7 +623,7 @@ bool TestNeuralNetworkMultipleLayers()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    instance::CAIF_Base::SOut()<<"FAILED - AIF Exception: "<<e<<"\n";
+    instance::CAIF_Base::SOut()<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -748,7 +748,7 @@ bool TestNeuralNetworkFeatureExtraction()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    std::cout<<"FAILED - AIF Exception: "<<e<<"\n";
+    std::cout<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -835,7 +835,7 @@ bool TestDEERBugRepro()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    std::cout<<"FAILED - AIF Exception: "<<e<<"\n";
+    std::cout<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -983,7 +983,7 @@ bool TestNeuralNetworkTrainingBinaryLogits()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    std::cout<<"FAILED - AIF Exception: "<<e<<"\n";
+    std::cout<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -1093,7 +1093,7 @@ bool TestBiasInitializationForBCELogits()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    std::cout<<"FAILED - AIF Exception: "<<e<<"\n";
+    std::cout<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -1177,7 +1177,7 @@ bool TestImageShapedTraining()
   }
   catch(const instance::CAIF_Exception &e)
   {
-    std::cout<<"FAILED - AIF Exception: "<<e<<"\n";
+    std::cout<<"FAILED - CAIF Exception: "<<e<<"\n";
     return false;
   }
   catch(const std::exception &e)
@@ -1193,7 +1193,7 @@ bool TestImageShapedTraining()
 int main(int argc,char *argv[])
 {
   ConfigureBackendFromArgs(argc,argv);
-  std::cout<<"=== AIF Neural Network Training Test Suite ===\n\n";
+  std::cout<<"=== CAIF Neural Network Training Test Suite ===\n\n";
   
   bool all_tests_passed=true;
   

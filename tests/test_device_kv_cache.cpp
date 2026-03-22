@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // KV-Cache test for Multi-Head Attention
 //------------------------------------------------------------------------------
 #include "caif_device_multi_head_attention.h"

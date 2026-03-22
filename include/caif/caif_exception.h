@@ -41,7 +41,7 @@ namespace instance
 #define CCAIF_CATCH_BLOCK()\
   catch(CAIF_Exception &e)\
   {\
-    ISE_Out::ErrLog()<<"AIF Exception :"<<e<<std::endl;\
+    ISE_Out::ErrLog()<<"CAIF Exception :"<<e<<std::endl;\
     RETHROW_CAIFE(e,"CAIF_Exception");\
   }\
   catch(ISE_Exception &iseex)\

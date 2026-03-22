@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Router (expert selection network)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_MOE_ROUTER_H

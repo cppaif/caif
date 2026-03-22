@@ -15,7 +15,7 @@
 /**
  * @file aif_dense_layer.h
  * @brief Dense (fully connected) layer implementation
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -41,7 +41,7 @@ namespace instance
     public:
       /**
        * @brief Constructor for dense layer
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param units Number of output units/neurons
        * @param activation Activation function type
        * @param use_bias Whether to use bias terms

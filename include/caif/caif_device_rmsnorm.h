@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident RMSNorm layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_RMSNORM_H

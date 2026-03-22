@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident Transformer Block (pre-norm) layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_TRANSFORMER_BLOCK_H

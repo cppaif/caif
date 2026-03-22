@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Transformer model training tests
 //------------------------------------------------------------------------------
 #include <iostream>

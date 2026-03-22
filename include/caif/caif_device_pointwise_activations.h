@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Pointwise activation leaf classes (header-only)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_POINTWISE_ACTIVATIONS_H

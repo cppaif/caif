@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident Vision Transformer (ViT) model
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_VIT_MODEL_H

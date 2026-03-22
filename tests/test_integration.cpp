@@ -14,8 +14,8 @@
 
 /**
  * @file test_integration.cpp
- * @brief Integration test suite for AIF neural network framework
- * @author AIF Development Team
+ * @brief Integration test suite for CAIF neural network framework
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -576,7 +576,7 @@ bool TestOptimizerComparison()
 int main(int argc,char *argv[])
 {
   ConfigureBackendFromArgs(argc,argv);
-  instance::CAIF_Base::SOut()<<"=== AIF Integration Test Suite ===\n\n";
+  instance::CAIF_Base::SOut()<<"=== CAIF Integration Test Suite ===\n\n";
   
   bool all_tests_passed=true;
   
@@ -589,7 +589,7 @@ int main(int argc,char *argv[])
   if(all_tests_passed==true)
   {
     instance::CAIF_Base::SOut()<<"All integration tests PASSED!\n";
-    instance::CAIF_Base::SOut()<<"The AIF neural network framework is working correctly!\n";
+    instance::CAIF_Base::SOut()<<"The CAIF neural network framework is working correctly!\n";
     return 0;
   }
   else

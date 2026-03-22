@@ -17,7 +17,7 @@
 namespace instance
 {
 
-// Initialize AIF-specific log levels
+// Initialize CAIF-specific log levels
 ISE_Out::ISE_LogLevel CAIF_Base::_ll=ISE_Out::ReserveLogLevel("CAIF_LOG",true);
 ISE_Out::ISE_LogLevel CAIF_Base::_ell=ISE_Out::ReserveLogLevel("CAIF_ERROR",true);
 ISE_Out::ISE_LogLevel CAIF_Base::_dll=ISE_Out::ReserveLogLevel("CAIF_DEBUG",false);

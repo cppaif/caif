@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident generic Feed-Forward Network layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_FFN_H

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Test: CAIF_DeviceMLAttention (Multi-head Latent Attention)
 //------------------------------------------------------------------------------
 #include "caif_device_ml_attention.h"
@@ -1067,7 +1067,7 @@ int main()
   }
   catch(const CAIF_Exception &e)
   {
-    ISE_Out::ErrLog()<<"AIF Exception: "<<e<<std::endl;
+    ISE_Out::ErrLog()<<"CAIF Exception: "<<e<<std::endl;
     return 1;
   }
   catch(const std::exception &e)

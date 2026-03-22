@@ -14,8 +14,8 @@
 
 /**
  * @file test_loss_functions.cpp
- * @brief Test suite for AIF loss functions
- * @author AIF Development Team
+ * @brief Test suite for CAIF loss functions
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -679,7 +679,7 @@ bool TestCategoricalCrossEntropyErrorHandling()
     }
     catch(...)
     {
-      std::cout<<"  [CCE ErrorHandling] Caught non-AIF exception (expected failure)\n";
+      std::cout<<"  [CCE ErrorHandling] Caught non-CAIF exception (expected failure)\n";
     }
     
     // Test invalid target shape for class indices
@@ -699,7 +699,7 @@ bool TestCategoricalCrossEntropyErrorHandling()
     }
     catch(...)
     {
-      std::cout<<"  [CCE ErrorHandling] Caught non-AIF exception (expected failure)\n";
+      std::cout<<"  [CCE ErrorHandling] Caught non-CAIF exception (expected failure)\n";
     }
     
     std::cout<<"PASSED\n";
@@ -743,7 +743,7 @@ bool TestLossFunctionErrorHandling()
     }
     catch(...)
     {
-      std::cout<<"  [MSE ErrorHandling] Caught non-AIF exception (expected failure)\n";
+      std::cout<<"  [MSE ErrorHandling] Caught non-CAIF exception (expected failure)\n";
     }
     
     // Test gradient with shape mismatch
@@ -760,7 +760,7 @@ bool TestLossFunctionErrorHandling()
     }
     catch(...)
     {
-      std::cout<<"  [MSE ErrorHandling] Caught non-AIF exception (expected failure)\n";
+      std::cout<<"  [MSE ErrorHandling] Caught non-CAIF exception (expected failure)\n";
     }
     
     std::cout<<"PASSED\n";
@@ -1008,7 +1008,7 @@ static bool TestBCEWithLogitsSanity()
  */
 int main()
 {
-  std::cout<<"=== AIF Loss Functions Test Suite ===\n\n";
+  std::cout<<"=== CAIF Loss Functions Test Suite ===\n\n";
   
   bool all_tests_passed=true;
   

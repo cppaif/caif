@@ -15,7 +15,7 @@
 /**
  * @file aif_categorical_cross_entropy_loss.cpp
  * @brief Implementation of the CAIF_CategoricalCrossEntropyLoss class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

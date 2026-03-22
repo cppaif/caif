@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Data type enumeration and utilities
 //------------------------------------------------------------------------------
 #ifndef CAIF_DATA_TYPE_H

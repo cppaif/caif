@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident frozen (non-trainable) linear layer with dtype-agnostic
 // weight storage
 //------------------------------------------------------------------------------

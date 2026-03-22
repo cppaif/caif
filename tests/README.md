@@ -1,6 +1,6 @@
-# AIF Neural Network Framework Test Suite
+# CAIF Neural Network Framework Test Suite
 
-This directory contains comprehensive tests for the AIF (Artificial Intelligence Framework) neural network library. The test suite validates all major components including loss functions, optimizers, neural network training, and integration scenarios.
+This directory contains comprehensive tests for the CAIF (Artificial Intelligence Framework) neural network library. The test suite validates all major components including loss functions, optimizers, neural network training, and integration scenarios.
 
 ## Test Structure
 
@@ -48,9 +48,9 @@ This directory contains comprehensive tests for the AIF (Artificial Intelligence
 
 ### Prerequisites
 
-1. **Build the AIF library first:**
+1. **Build the CAIF library first:**
    ```bash
-   cd ..  # Go to AIF root directory
+   cd ..  # Go to CAIF root directory
    make   # or scons
    ```
 
@@ -101,7 +101,7 @@ Each test provides detailed output including:
 
 Example output:
 ```
-=== AIF Loss Functions Test Suite ===
+=== CAIF Loss Functions Test Suite ===
 
 Testing MSE Loss - Simple Case... PASSED
 Testing MSE Gradient... PASSED
@@ -177,7 +177,7 @@ All tests PASSED!
    ```
    Error: libcaif.a not found
    ```
-   **Solution:** Build the AIF library first with `make` or `scons` in the parent directory.
+   **Solution:** Build the CAIF library first with `make` or `scons` in the parent directory.
 
 2. **Compilation errors:**
    - Ensure you have C++23 support
@@ -185,7 +185,7 @@ All tests PASSED!
    - Verify include paths in Makefile
 
 3. **Test failures:**
-   - Check that the AIF library was built correctly
+   - Check that the CAIF library was built correctly
    - Verify that all implementations are complete
    - Review error messages for specific issues
 
@@ -194,7 +194,7 @@ All tests PASSED!
 For debugging failed tests, you can compile with debug symbols:
 ```bash
 make clean
-CXXFLAGS="-std=c++23 -Wall -Wextra -g -O0 -I../include/aif" make all
+CXXFLAGS="-std=c++23 -Wall -Wextra -g -O0 -I../include/caif" make all
 ```
 
 ## Adding New Tests
@@ -246,7 +246,7 @@ These tests are designed to be run in CI/CD pipelines. The test runner returns a
 
 ## Contributing
 
-When contributing new features to AIF:
+When contributing new features to CAIF:
 
 1. **Add corresponding tests** for new functionality
 2. **Ensure all existing tests pass** 
@@ -258,5 +258,5 @@ When contributing new features to AIF:
 For issues with the test suite:
 1. Check this README for common solutions
 2. Review test output for specific error messages
-3. Ensure the AIF library builds correctly
+3. Ensure the CAIF library builds correctly
 4. Verify your development environment meets requirements 

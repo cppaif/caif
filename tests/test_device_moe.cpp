@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // MoE (Mixture of Experts) Tests
 //------------------------------------------------------------------------------
 #include "caif_device_moe_layer.h"
@@ -1620,7 +1620,7 @@ int main()
 {
   try
   {
-    std::cout<<"=== AIF MoE Tests ===\n\n";
+    std::cout<<"=== CAIF MoE Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
     TestExpertForwardShape();

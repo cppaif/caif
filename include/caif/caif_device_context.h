@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device context singleton for cuBLAS/cuDNN handle management
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_CONTEXT_H

@@ -807,7 +807,7 @@ static void TestRoPEDescriptionString()
 
 int main()
 {
-  std::cout<<"=== AIF RoPE Tests ===\n\n";
+  std::cout<<"=== CAIF RoPE Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestRoPEForwardShape();

@@ -73,6 +73,7 @@ Pass these with `-D` on the cmake command line:
 | `CAIF_BUILD_TESTS` | `OFF` | Build test executables |
 | `CAIF_BUILD_SHARED` | `ON` | Build shared library (.so) |
 | `CAIF_BUILD_STATIC` | `ON` | Build static library (.a) |
+| `CAIF_BUILD_RETRAINER` | `OFF` | Build retrainer fine-tuning tool (requires CUDA) |
 
 ### Custom dependency paths
 
@@ -176,6 +177,12 @@ caif/
   include/caif/           # Public headers
   src/                    # Implementation (.cpp, .cu)
   tests/                  # Test source files
+  retrainer/              # LoRA fine-tuning tool (optional, requires CUDA)
+    CMakeLists.txt
+    include/retrainer/
+    src/
+    scripts/              # Python pipeline scripts
+    README.md             # Retrainer documentation
   ise_lib/                # Bundled ISE base library (logging, exceptions)
     CMakeLists.txt
     include/ise_lib/

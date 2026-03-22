@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident tabular embedding layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_TABULAR_EMBEDDING_H

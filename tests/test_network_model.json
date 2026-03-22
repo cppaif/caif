@@ -1,0 +1,44 @@
+{
+  "format_version": 1,
+  "is_compiled": true,
+  "is_trained": true,
+  "model_version": "",
+  "optimizer_type": "adam",
+  "loss_type": "categorical_cross_entropy",
+  "learning_rate": 0.001,
+  "training_iterations": 0,
+  "input_shape": [1,784],
+  "output_shape": [1,10],
+  "layers": [
+    {
+      "layer_index": 0,
+      "layer_type": "dense",
+      "config": {
+        "units": 128,
+        "activation": "relu"
+      }
+    },
+    {
+      "layer_index": 1,
+      "layer_type": "dropout",
+      "config": {
+        "rate": 0.3
+      }
+    },
+    {
+      "layer_index": 2,
+      "layer_type": "dense",
+      "config": {
+        "units": 64,
+        "activation": "relu"
+      }
+    },
+    {
+      "layer_index": 3,
+      "layer_type": "dense",
+      "config": {
+        "units": 10,
+        "activation": "softmax"
+      }
+    }
+  ]}

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Transformer Model implementation
 //------------------------------------------------------------------------------
 #include "caif_device_moe_transformer_model.h"

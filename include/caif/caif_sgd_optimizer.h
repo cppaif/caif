@@ -15,7 +15,7 @@
 /**
  * @file aif_sgd_optimizer.h
  * @brief SGD (Stochastic Gradient Descent) optimizer implementation
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -41,7 +41,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with optimizer parameters
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param learning_rate Learning rate for parameter updates
        * @param momentum Momentum factor (0.0 for no momentum)
        * @param weight_decay Weight decay factor for L2 regularization

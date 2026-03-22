@@ -610,7 +610,7 @@ static void TestDescription()
 
 int main()
 {
-  std::cout<<"=== AIF DeviceTransformerModel Tests ===\n\n";
+  std::cout<<"=== CAIF DeviceTransformerModel Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestForwardShape();

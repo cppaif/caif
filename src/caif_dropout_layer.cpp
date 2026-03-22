@@ -15,7 +15,7 @@
 /**
  * @file aif_dropout_layer.cpp
  * @brief Implementation of the CAIF_DropoutLayer class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

@@ -15,7 +15,7 @@
 /**
  * @file aif_convolution2d_layer.h
  * @brief Convolution 2D layer for neural networks
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -40,7 +40,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with convolution parameters
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param filters Number of output filters (output channels)
        * @param kernel_size Size of convolution kernel (assumed square)
        * @param stride Stride for convolution operation

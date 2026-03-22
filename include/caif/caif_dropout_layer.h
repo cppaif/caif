@@ -15,7 +15,7 @@
 /**
  * @file aif_dropout_layer.h
  * @brief Dropout layer implementation for regularization
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -41,7 +41,7 @@ namespace instance
     public:
       /**
        * @brief Constructor for dropout layer
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param rate Dropout rate (0.0 to 1.0)
        */
       explicit CAIF_DropoutLayer(CAIF_Framework &framework,const float rate=g_caif_default_dropout_rate);

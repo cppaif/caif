@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident Linear Head (output projection layer)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_LINEAR_HEAD_H

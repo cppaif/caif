@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident spectrogram embedding implementation
 //------------------------------------------------------------------------------
 #include "caif_device_spectrogram_embedding.h"

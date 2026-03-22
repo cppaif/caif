@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Generic weight name mapper implementation
 //------------------------------------------------------------------------------
 #include "caif_weight_mapper.h"

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Abstract base class for device-resident layers
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_LAYER_H

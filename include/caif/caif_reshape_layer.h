@@ -29,7 +29,7 @@ namespace instance
     public:
       /**
        * @brief Constructor
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param target_shape Shape to reshape to (excluding batch dimension)
        */
       explicit CAIF_ReshapeLayer(CAIF_Framework &framework,const std::vector<uint32_t> &target_shape);

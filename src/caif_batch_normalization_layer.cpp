@@ -15,7 +15,7 @@
 /**
  * @file aif_batch_normalization_layer.cpp
  * @brief Implementation of the CAIF_BatchNormalizationLayer class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

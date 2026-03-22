@@ -14,8 +14,8 @@
 
 /**
  * @file aif_neural_network.h
- * @brief Neural network class for the AIF (AI Framework)
- * @author AIF Development Team
+ * @brief Neural network class for the CAIF (AI Framework)
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -86,7 +86,7 @@ namespace instance
       
       /**
        * @brief Constructor with framework reference
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        */
       explicit CAIF_NeuralNetwork(CAIF_Framework &framework);
       

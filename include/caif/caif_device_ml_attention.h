@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Multi-head Latent Attention (MLA) layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_ML_ATTENTION_H

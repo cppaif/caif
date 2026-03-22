@@ -20,7 +20,7 @@
  * by intercepting and displaying actual tensor values at each step
  * while learning the Pythagorean theorem: a² + b² = c²
  * 
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0 
  * @date 2024
  */

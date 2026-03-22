@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Gated activation leaf classes (header-only)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_GATED_ACTIVATIONS_H

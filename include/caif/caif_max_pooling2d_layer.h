@@ -15,7 +15,7 @@
 /**
  * @file aif_max_pooling2d_layer.h
  * @brief Max pooling 2D layer for neural networks
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -39,7 +39,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with pooling parameters
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param pool_size Size of pooling window (assumed square)
        * @param stride Stride for pooling operation (default: same as pool_size)
        * @param padding Padding type (0 = valid, >0 = same)

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
-// Generic weight name mapper between HuggingFace and AIF conventions
+// CAIF - AI Framework
+// Generic weight name mapper between HuggingFace and CAIF conventions
 //------------------------------------------------------------------------------
 #ifndef CAIF_WEIGHT_MAPPER_H
 #define CAIF_WEIGHT_MAPPER_H
@@ -30,12 +30,12 @@ namespace instance
 
 /**
  * @brief Generic weight name mapper for converting between HuggingFace
- * SafeTensors weight names and AIF parameter names.
+ * SafeTensors weight names and CAIF parameter names.
  *
- * AIF layers already follow HF naming conventions (q_proj.weight, etc.)
+ * CAIF layers already follow HF naming conventions (q_proj.weight, etc.)
  * and composite layers build hierarchical names via prefix propagation.
  * The main difference is typically a top-level prefix (e.g., HF uses
- * "model." while AIF uses no prefix) or occasional aliases (e.g., tied
+ * "model." while CAIF uses no prefix) or occasional aliases (e.g., tied
  * weights where "lm_head.weight" == "embed_tokens.weight").
  *
  * Usage:
@@ -55,12 +55,12 @@ class CAIF_WeightMapper:public CAIF_Base
     /**
      * @brief Add a prefix mapping rule.
      *
-     * All HF names starting with hf_prefix will be mapped to AIF names
+     * All HF names starting with hf_prefix will be mapped to CAIF names
      * by replacing hf_prefix with aif_prefix. Rules are tried in order
      * of longest prefix match.
      *
      * @param hf_prefix The HuggingFace name prefix (e.g., "model.")
-     * @param aif_prefix The AIF name prefix (e.g., "" for stripping)
+     * @param aif_prefix The CAIF name prefix (e.g., "" for stripping)
      */
     void AddPrefixRule(const std::string &hf_prefix,const std::string &aif_prefix);
 
@@ -70,12 +70,12 @@ class CAIF_WeightMapper:public CAIF_Base
      * Use for special cases like tied weights or renamed parameters.
      *
      * @param hf_name The exact HF weight name
-     * @param aif_name The corresponding AIF parameter name
+     * @param aif_name The corresponding CAIF parameter name
      */
     void AddAlias(const std::string &hf_name,const std::string &aif_name);
 
     /**
-     * @brief Convert an HF weight name to an AIF parameter name.
+     * @brief Convert an HF weight name to an CAIF parameter name.
      *
      * Tries aliases first, then prefix rules (longest match wins).
      * Returns empty string if no rule matches.
@@ -83,7 +83,7 @@ class CAIF_WeightMapper:public CAIF_Base
     std::string HfToAif(const std::string &hf_name)const;
 
     /**
-     * @brief Convert an AIF parameter name to an HF weight name.
+     * @brief Convert an CAIF parameter name to an HF weight name.
      *
      * Tries reverse aliases first, then reverse prefix rules.
      * Returns empty string if no rule matches.
@@ -91,19 +91,19 @@ class CAIF_WeightMapper:public CAIF_Base
     std::string AifToHf(const std::string &aif_name)const;
 
     /**
-     * @brief HF names needed for a list of AIF parameter names.
+     * @brief HF names needed for a list of CAIF parameter names.
      * @return Vector of (hf_name,aif_name) pairs for all resolvable names
      */
     std::vector<std::pair<std::string,std::string>>
     RequiredHfNames(const std::vector<std::string> &aif_names)const;
 
     /**
-     * @brief Find AIF parameter names that cannot be resolved to any
+     * @brief Find CAIF parameter names that cannot be resolved to any
      * available HF name.
      *
-     * @param aif_names Expected AIF parameter names
+     * @param aif_names Expected CAIF parameter names
      * @param available_hf_names Set of HF names available in safetensors
-     * @return List of AIF parameter names that have no matching HF weight
+     * @return List of CAIF parameter names that have no matching HF weight
      */
     std::vector<std::string> MissingNames(const std::vector<std::string> &aif_names,
                                            const std::set<std::string> &available_hf_names)const;

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident Multi-Head Attention layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_MULTI_HEAD_ATTENTION_H

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // LoRA (Low-Rank Adaptation) adapter wrapping any CAIF_DeviceLayer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_LORA_ADAPTER_H

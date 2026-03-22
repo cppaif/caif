@@ -15,7 +15,7 @@
 /**
  * @file aif_tensor.cpp
  * @brief Implementation of the CAIF_Tensor class
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

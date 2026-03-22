@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident Transformer Model
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_TRANSFORMER_MODEL_H

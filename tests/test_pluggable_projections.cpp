@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Test: Pluggable projections for MLA, FFN, and MoEExpert
 //------------------------------------------------------------------------------
 #include "caif_device_ml_attention.h"
@@ -1025,7 +1025,7 @@ int main()
 {
   try
   {
-    ISE_Out::Out()<<"=== AIF Pluggable Projections Tests ===\n\n";
+    ISE_Out::Out()<<"=== CAIF Pluggable Projections Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
     // MLA tests
@@ -1062,7 +1062,7 @@ int main()
   }
   catch(const CAIF_Exception &e)
   {
-    ISE_Out::ErrLog()<<"AIF Exception: "<<e<<std::endl;
+    ISE_Out::ErrLog()<<"CAIF Exception: "<<e<<std::endl;
     return 1;
   }
   catch(const std::exception &e)

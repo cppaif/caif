@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident patch embedding layer (ViT-style)
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_PATCH_EMBEDDING_H

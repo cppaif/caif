@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident MoE Layer implementation
 //------------------------------------------------------------------------------
 #include "caif_device_moe_layer.h"

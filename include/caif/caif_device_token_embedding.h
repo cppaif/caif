@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident token embedding layer
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_TOKEN_EMBEDDING_H

@@ -655,7 +655,7 @@ static void TestParameterCount()
 
 int main()
 {
-  std::cout<<"=== AIF DeviceLinearHead Tests ===\n\n";
+  std::cout<<"=== CAIF DeviceLinearHead Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestForwardShape();

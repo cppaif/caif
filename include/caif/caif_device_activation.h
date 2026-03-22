@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device activation strategy hierarchy: base + pointwise + gated abstractions
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_ACTIVATION_H

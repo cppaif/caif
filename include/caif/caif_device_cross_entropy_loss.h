@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Cross-entropy loss from logits for language modeling
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_CROSS_ENTROPY_LOSS_H

@@ -136,7 +136,7 @@ int main(int argc,char *argv[])
   ISE_Out::AddLogLevel(ISE_Out::ISE_LogLevel(ISE_Out::DEBUG));
   ISE_Out::AddLogLevel(ISE_Out::ISE_LogLevel(ISE_Out::ERROR));
   
-  ISE_Out::Log()<<"AIF Neural Network Tests"<<std::endl
+  ISE_Out::Log()<<"CAIF Neural Network Tests"<<std::endl
                 <<"======================="<<std::endl;
   
   try
@@ -268,7 +268,7 @@ int main(int argc,char *argv[])
   }
   catch(const CAIF_Exception &e)
   {
-    ISE_Out::ErrorLog()<<"AIF Exception with stack trace: "<<e<<std::endl;
+    ISE_Out::ErrorLog()<<"CAIF Exception with stack trace: "<<e<<std::endl;
     return 1;
   }
   catch(const std::exception &e)

@@ -27,7 +27,7 @@
  * 5. Weight updates
  * 6. Improved predictions over iterations
  * 
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0 
  * @date 2024
  */

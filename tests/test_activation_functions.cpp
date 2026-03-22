@@ -14,8 +14,8 @@
 
 /**
  * @file test_activation_functions.cpp
- * @brief Comprehensive tests for activation functions in the AIF framework
- * @author AIF Development Team
+ * @brief Comprehensive tests for activation functions in the CAIF framework
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -704,7 +704,7 @@ bool TestActivationCharacteristics()
  */
 int main()
 {
-  std::cout<<"=== AIF Activation Functions Test Suite ==="<<std::endl;
+  std::cout<<"=== CAIF Activation Functions Test Suite ==="<<std::endl;
   std::cout<<std::endl;
   
   bool all_tests_passed=true;

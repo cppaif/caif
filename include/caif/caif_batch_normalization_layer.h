@@ -15,7 +15,7 @@
 /**
  * @file aif_batch_normalization_layer.h
  * @brief Batch normalization layer for neural networks
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -39,7 +39,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with normalization parameters
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        * @param epsilon Small value to prevent division by zero
        * @param momentum Momentum for running statistics
        * @param affine Whether to use learnable scale and shift parameters

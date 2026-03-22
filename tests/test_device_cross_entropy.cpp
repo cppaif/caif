@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Cross-entropy loss tests
 //------------------------------------------------------------------------------
 #include <iostream>

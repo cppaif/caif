@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Device-resident neural network using CAIF_DeviceTensor
 //------------------------------------------------------------------------------
 #ifndef CAIF_DEVICE_NETWORK_H
@@ -236,7 +236,7 @@ class CAIF_DeviceNetwork:public CAIF_Base
      * @deprecated Use SaveSafeTensors instead
      *
      * Saves layer architecture, weights, biases, and optionally Adam state.
-     * The file format is AIF device network binary format (.aifdn).
+     * The file format is CAIF device network binary format (.aifdn).
      * Only supports networks with dense layers.
      *
      * @param filepath Path to save the model

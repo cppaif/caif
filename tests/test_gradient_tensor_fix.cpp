@@ -15,7 +15,7 @@
 /**
  * @file test_gradient_tensor_fix.cpp
  * @brief Test to verify the gradient tensor size bug fix
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  * 

@@ -199,7 +199,7 @@ void PrintTestSummary(const std::vector<TestResult> &results)
   if(failed_count==0)
   {
     std::cout<<"\n✅ ALL TESTS PASSED! ✅\n";
-    std::cout<<"The AIF neural network framework is fully functional!\n";
+    std::cout<<"The CAIF neural network framework is fully functional!\n";
   }
   else
   {
@@ -218,7 +218,7 @@ void PrintTestSummary(const std::vector<TestResult> &results)
 int main(int argc,char *argv[])
 {
   std::cout<<"===========================================\n";
-  std::cout<<"  AIF Neural Network Framework Test Suite  \n";
+  std::cout<<"  CAIF Neural Network Framework Test Suite  \n";
   std::cout<<"===========================================\n\n";
   std::cout<<"Usage: ./run_all_tests [--backend=cuda|eigen|blas] [--timeout=SECONDS]\n\n";
 

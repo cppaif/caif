@@ -15,7 +15,7 @@
 /**
  * @file aif_mean_squared_error_loss.h
  * @brief Mean Squared Error loss function implementation
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

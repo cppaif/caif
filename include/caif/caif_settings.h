@@ -14,7 +14,7 @@
 
 /**
  * @file aif_settings.h
- * @brief Global runtime configuration for AIF framework
+ * @brief Global runtime configuration for CAIF framework
  */
 
 #pragma once
@@ -24,7 +24,7 @@
 namespace instance
 {
   /**
-   * @brief Static configuration flags for AIF runtime behaviour.
+   * @brief Static configuration flags for CAIF runtime behaviour.
    *
    * External programs (like Solve) may set these flags once at process
    * startup instead of relying on environment variables.

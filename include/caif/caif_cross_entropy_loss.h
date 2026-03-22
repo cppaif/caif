@@ -15,7 +15,7 @@
 /**
  * @file aif_cross_entropy_loss.h
  * @brief Cross Entropy loss function implementation
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */

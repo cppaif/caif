@@ -15,7 +15,7 @@
 /**
  * @file aif_layer.h
  * @brief Base layer class for neural network layers
- * @author AIF Development Team
+ * @author CAIF Development Team
  * @version 1.0
  * @date 2024
  */
@@ -45,7 +45,7 @@ namespace instance
     public:
       /**
        * @brief Constructor with framework reference
-       * @param framework Reference to AIF framework instance
+       * @param framework Reference to CAIF framework instance
        */
       explicit CAIF_Layer(CAIF_Framework &framework):_framework(framework),
                                                    _initialized(false),
@@ -298,13 +298,13 @@ namespace instance
     protected:
       /**
        * @brief Get framework reference
-       * @return Reference to AIF framework instance
+       * @return Reference to CAIF framework instance
        */
       CAIF_Framework &Framework(){return _framework;}
       
       /**
        * @brief Get framework reference (const)
-       * @return Const reference to AIF framework instance
+       * @return Const reference to CAIF framework instance
        */
       const CAIF_Framework &Framework()const{return _framework;}
       

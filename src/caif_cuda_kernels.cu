@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //------------------------------------------------------------------------------
-// AIF - AI Framework
+// CAIF - AI Framework
 // Custom CUDA kernels for operations not supported by cuDNN
 //------------------------------------------------------------------------------
 // Disable GNU C++ extensions to avoid rsqrt conflict between CUDA and glibc
