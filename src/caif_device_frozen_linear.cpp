@@ -42,7 +42,7 @@ CAIF_DeviceFrozenLinear::CAIF_DeviceFrozenLinear(uint32_t input_dim,
       THROW_CAIFE("FrozenLinear: input_dim and output_dim must be > 0");
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceFrozenLinear::CAIF_DeviceFrozenLinear(
@@ -78,7 +78,7 @@ CAIF_DeviceFrozenLinear &CAIF_DeviceFrozenLinear::operator=(CAIF_DeviceFrozenLin
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceFrozenLinear::LoadFromTensor(CAIF_DeviceTensor &&weight)
@@ -87,7 +87,7 @@ void CAIF_DeviceFrozenLinear::LoadFromTensor(CAIF_DeviceTensor &&weight)
   {
     _weight=std::move(weight);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceFrozenLinear::LoadScalesFromHost(const void *data,size_t num_bytes)
@@ -99,7 +99,7 @@ void CAIF_DeviceFrozenLinear::LoadScalesFromHost(const void *data,size_t num_byt
     _scales=CAIF_DeviceTensor::Zeros({num_groups},*_stream,CAIF_DataType::CAIF_DataType_e::Float16);
     _scales.CopyFromHostRaw(data,num_bytes);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 bool CAIF_DeviceFrozenLinear::NeedsScales()const
@@ -156,7 +156,7 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear::ConvertToFP32()const
 
     THROW_CAIFE("FrozenLinear: unsupported storage dtype for conversion");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceFrozenLinear::Forward(const CAIF_DeviceTensor &input,
@@ -226,7 +226,7 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear::Forward(const CAIF_DeviceTensor &inpu
     }
     return output_2d;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceFrozenLinear::Backward(const CAIF_DeviceTensor &grad_output)
@@ -280,7 +280,7 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear::Backward(const CAIF_DeviceTensor &gra
     }
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceFrozenLinear::ZeroGradients()
@@ -300,7 +300,7 @@ CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::ParameterTensor(size_t index)
     static_cast<void>(index);
     THROW_CAIFE("FrozenLinear: no trainable parameters");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::ParameterTensor(size_t index)const
@@ -310,7 +310,7 @@ const CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::ParameterTensor(size_t index)c
     static_cast<void>(index);
     THROW_CAIFE("FrozenLinear: no trainable parameters");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::GradientTensor(size_t index)
@@ -320,7 +320,7 @@ CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::GradientTensor(size_t index)
     static_cast<void>(index);
     THROW_CAIFE("FrozenLinear: no trainable parameters");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::GradientTensor(size_t index)const
@@ -330,7 +330,7 @@ const CAIF_DeviceTensor &CAIF_DeviceFrozenLinear::GradientTensor(size_t index)co
     static_cast<void>(index);
     THROW_CAIFE("FrozenLinear: no trainable parameters");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceFrozenLinear::TotalParameterCount()const
@@ -347,7 +347,7 @@ std::string CAIF_DeviceFrozenLinear::Description()const
            ","+std::to_string(_output_dim)+
            ","+dt.Name()+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceFrozenLinear::ParameterNames(const std::string &prefix)const
@@ -357,5 +357,5 @@ std::vector<std::string> CAIF_DeviceFrozenLinear::ParameterNames(const std::stri
     static_cast<void>(prefix);
     return {};
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

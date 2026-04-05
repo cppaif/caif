@@ -1656,12 +1656,6 @@ void CAIF_BLASBackend::FusedAdamUpdate(
     float p=param_data[i];
     float g=grad_data[i];
 
-    // Apply weight decay (L2 regularization)
-    if(weight_decay>0.0f)
-    {
-      g=g+weight_decay*p;
-    }
-
     // Update biased first moment estimate: m = beta1 * m + (1 - beta1) * g
     float m_val=beta1*m_data[i]+one_minus_beta1*g;
     m_data[i]=m_val;
@@ -1675,7 +1669,15 @@ void CAIF_BLASBackend::FusedAdamUpdate(
     const float v_hat=v_val/bias_correction2;
 
     // Update parameter: param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
-    param_data[i]=p-lr*m_hat/(std::sqrt(v_hat)+epsilon);
+    p=p-lr*m_hat/(std::sqrt(v_hat)+epsilon);
+
+    // Decoupled weight decay (AdamW): param = param - lr * wd * param
+    if(weight_decay>0.0f)
+    {
+      p=p-lr*weight_decay*p;
+    }
+
+    param_data[i]=p;
   }
 }
 

@@ -587,7 +587,7 @@ CAIF_DeviceTensor CAIF_DeviceTensor::To(CAIF_DataType::CAIF_DataType_e target_dt
     THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceTensor::Synchronize()const

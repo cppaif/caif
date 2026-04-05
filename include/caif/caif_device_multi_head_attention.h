@@ -161,11 +161,10 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayer
     bool _kv_cache_enabled;          // Whether caching is active
 
     // FlashAttention flag — auto-selected per Forward() call based on
-    // attention matrix size. Naive (cuBLAS) is faster for short sequences;
-    // flash is needed for long sequences where O(n²) memory is prohibitive.
-    // Threshold: 256MB for the attention matrix.
+    // attention matrix size. cuBLAS batched matmul path is faster due to
+    // better GPU occupancy; flash backward only needed when O(n²) attention
+    // matrix exceeds available free GPU memory.
     bool _use_flash_attention;
-    static constexpr size_t FLASH_ATTN_THRESHOLD_BYTES=256ULL*1024*1024;
 };
 
 }//end instance namespace

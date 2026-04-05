@@ -15,9 +15,12 @@
 #include "caif_device_network.h"
 #include "caif_device_ops.h"
 #include "caif_safetensors_format.h"
+#include "caif_cuda_kernels.h"
+#include "caif_host_tensor.h"
 #include "caif_exception.h"
 #include <fstream>
 #include <sstream>
+#include <cmath>
 
 namespace instance
 {
@@ -32,6 +35,7 @@ CAIF_DeviceNetwork::CAIF_DeviceNetwork(CAIF_CudaStream &stream):_stream(&stream)
                                                              _adam_beta1(0.9f),
                                                              _adam_beta2(0.999f),
                                                              _adam_epsilon(1e-8f),
+                                                             _adam_weight_decay(0.0f),
                                                              _adam_t(0),
                                                              _adam_m(),
                                                              _adam_v()
@@ -48,6 +52,7 @@ CAIF_DeviceNetwork::CAIF_DeviceNetwork(CAIF_DeviceNetwork &&other):_stream(other
                                                                 _adam_beta1(other._adam_beta1),
                                                                 _adam_beta2(other._adam_beta2),
                                                                 _adam_epsilon(other._adam_epsilon),
+                                                                _adam_weight_decay(other._adam_weight_decay),
                                                                 _adam_t(other._adam_t),
                                                                 _adam_m(std::move(other._adam_m)),
                                                                 _adam_v(std::move(other._adam_v))
@@ -74,6 +79,7 @@ CAIF_DeviceNetwork &CAIF_DeviceNetwork::operator=(CAIF_DeviceNetwork &&other)
       _adam_beta1=other._adam_beta1;
       _adam_beta2=other._adam_beta2;
       _adam_epsilon=other._adam_epsilon;
+      _adam_weight_decay=other._adam_weight_decay;
       _adam_t=other._adam_t;
       _adam_m=std::move(other._adam_m);
       _adam_v=std::move(other._adam_v);
@@ -84,7 +90,7 @@ CAIF_DeviceNetwork &CAIF_DeviceNetwork::operator=(CAIF_DeviceNetwork &&other)
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::AddDenseLayer(uint32_t input_size,
@@ -135,7 +141,7 @@ void CAIF_DeviceNetwork::AddDenseLayer(uint32_t input_size,
     // Invalidate Adam state since architecture changed
     _adam_initialized=false;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::AddLayer(std::unique_ptr<CAIF_DeviceLayer> layer)
@@ -158,7 +164,7 @@ void CAIF_DeviceNetwork::AddLayer(std::unique_ptr<CAIF_DeviceLayer> layer)
     // Invalidate Adam state since architecture changed
     _adam_initialized=false;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::SetLayerTrainable(size_t index,bool trainable)
@@ -174,7 +180,20 @@ void CAIF_DeviceNetwork::SetLayerTrainable(size_t index,bool trainable)
     // Invalidate Adam state since trainability changed
     _adam_initialized=false;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
+}
+
+bool CAIF_DeviceNetwork::IsLayerTrainable(size_t index)const
+{
+  try
+  {
+    if(index>=_layers.size())
+    {
+      THROW_CAIFE("DeviceNetwork::IsLayerTrainable: index out of range");
+    }
+    return _trainable[index];
+  }
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceNetwork::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -199,7 +218,7 @@ CAIF_DeviceTensor CAIF_DeviceNetwork::Forward(const CAIF_DeviceTensor &input,boo
 
     return current;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::Backward(const CAIF_DeviceTensor &grad_output)
@@ -223,7 +242,7 @@ void CAIF_DeviceNetwork::Backward(const CAIF_DeviceTensor &grad_output)
       grad=(*it)->Backward(grad);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::ZeroGradients()
@@ -235,10 +254,14 @@ void CAIF_DeviceNetwork::ZeroGradients()
       layer->ZeroGradients();
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceNetwork::InitializeAdam(float lr,float beta1,float beta2,float epsilon)
+void CAIF_DeviceNetwork::InitializeAdam(float lr,
+                                        float beta1,
+                                        float beta2,
+                                        float epsilon,
+                                        float weight_decay)
 {
   try
   {
@@ -251,6 +274,7 @@ void CAIF_DeviceNetwork::InitializeAdam(float lr,float beta1,float beta2,float e
     _adam_beta1=beta1;
     _adam_beta2=beta2;
     _adam_epsilon=epsilon;
+    _adam_weight_decay=weight_decay;
     _adam_t=0;
 
     // Clear existing state
@@ -276,7 +300,7 @@ void CAIF_DeviceNetwork::InitializeAdam(float lr,float beta1,float beta2,float e
 
     _adam_initialized=true;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::AdamStep()
@@ -311,12 +335,85 @@ void CAIF_DeviceNetwork::AdamStep()
                                   _adam_beta1,
                                   _adam_beta2,
                                   _adam_epsilon,
+                                  _adam_weight_decay,
                                   _adam_t);
         moment_idx++;
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
+}
+
+float CAIF_DeviceNetwork::ClipGradientNorm(float max_norm)
+{
+  try
+  {
+    if(_stream==nullptr)
+    {
+      THROW_CAIFE("DeviceNetwork: network has been moved from");
+    }
+
+#ifdef USE_CAIF_CUDA
+    // Accumulate sum of squares across all trainable gradient tensors
+    CAIF_DeviceTensor total_sq=CAIF_DeviceTensor::Zeros({1},*_stream);
+
+    for(size_t i=0;i<_layers.size();++i)
+    {
+      if(_trainable[i]==false)
+      {
+        continue;
+      }
+      for(size_t p=0;p<_layers[i]->ParameterTensorCount();++p)
+      {
+        const CAIF_DeviceTensor &grad=_layers[i]->GradientTensor(p);
+        const int n=static_cast<int>(grad.TotalElements());
+        if(n>0)
+        {
+          launch_sum_of_squares(grad.DevicePtr(),
+                                total_sq.DevicePtr(),
+                                n,
+                                _stream->Handle());
+        }
+      }
+    }
+
+    // Read total norm to host
+    CAIF_HostTensor host_sq=total_sq.ToHost();
+    const float total_norm=std::sqrt(host_sq.At({0}));
+
+    // Scale gradients if norm exceeds max_norm
+    if(total_norm>max_norm)
+    {
+      const float clip_coeff=max_norm/total_norm;
+      for(size_t i=0;i<_layers.size();++i)
+      {
+        if(_trainable[i]==false)
+        {
+          continue;
+        }
+        for(size_t p=0;p<_layers[i]->ParameterTensorCount();++p)
+        {
+          CAIF_DeviceTensor &grad=_layers[i]->GradientTensor(p);
+          const int n=static_cast<int>(grad.TotalElements());
+          if(n>0)
+          {
+            launch_elementwise_mul_scalar(grad.DevicePtr(),
+                                         clip_coeff,
+                                         grad.DevicePtr(),
+                                         n,
+                                         _stream->Handle());
+          }
+        }
+      }
+    }
+
+    return total_norm;
+#else
+    (void)max_norm;
+    return 0.0f;
+#endif
+  }
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceDenseLayer &CAIF_DeviceNetwork::DenseLayer(size_t index)
@@ -330,7 +427,7 @@ CAIF_DeviceDenseLayer &CAIF_DeviceNetwork::DenseLayer(size_t index)
     }
     return *dense;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceDenseLayer &CAIF_DeviceNetwork::DenseLayer(size_t index)const
@@ -345,7 +442,7 @@ const CAIF_DeviceDenseLayer &CAIF_DeviceNetwork::DenseLayer(size_t index)const
     }
     return *dense;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceNetwork::TotalParameterCount()const
@@ -359,7 +456,7 @@ size_t CAIF_DeviceNetwork::TotalParameterCount()const
     }
     return count;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 uint32_t CAIF_DeviceNetwork::InputSize()const
@@ -368,7 +465,7 @@ uint32_t CAIF_DeviceNetwork::InputSize()const
   {
     return _input_size;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 uint32_t CAIF_DeviceNetwork::OutputSize()const
@@ -377,7 +474,7 @@ uint32_t CAIF_DeviceNetwork::OutputSize()const
   {
     return _output_size;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -391,7 +488,7 @@ void CAIF_DeviceNetwork::SaveSafeTensors(const std::string &path)const
     CAIF_SafeTensorsFormat format;
     Save(path,format);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::LoadSafeTensors(const std::string &path)
@@ -401,7 +498,7 @@ void CAIF_DeviceNetwork::LoadSafeTensors(const std::string &path)
     CAIF_SafeTensorsFormat format;
     Load(path,format);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::Save(const std::string &path,const CAIF_ModelFormat &format)const
@@ -463,7 +560,7 @@ void CAIF_DeviceNetwork::Save(const std::string &path,const CAIF_ModelFormat &fo
     // Save using the format
     format.Save(path,tensors,metadata);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::Load(const std::string &path,const CAIF_ModelFormat &format)
@@ -545,7 +642,7 @@ void CAIF_DeviceNetwork::Load(const std::string &path,const CAIF_ModelFormat &fo
     _adam_m.clear();
     _adam_v.clear();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -639,6 +736,7 @@ void CAIF_DeviceNetwork::SaveModel(const std::string &filepath,bool save_optimiz
       out.write(reinterpret_cast<const char *>(&_adam_beta1),sizeof(float));
       out.write(reinterpret_cast<const char *>(&_adam_beta2),sizeof(float));
       out.write(reinterpret_cast<const char *>(&_adam_epsilon),sizeof(float));
+      out.write(reinterpret_cast<const char *>(&_adam_weight_decay),sizeof(float));
       out.write(reinterpret_cast<const char *>(&_adam_t),sizeof(int));
 
       // Write moment tensors
@@ -666,7 +764,7 @@ void CAIF_DeviceNetwork::SaveModel(const std::string &filepath,bool save_optimiz
 
     out.close();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimizer_state)
@@ -771,6 +869,7 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
       in.read(reinterpret_cast<char *>(&_adam_beta1),sizeof(float));
       in.read(reinterpret_cast<char *>(&_adam_beta2),sizeof(float));
       in.read(reinterpret_cast<char *>(&_adam_epsilon),sizeof(float));
+      in.read(reinterpret_cast<char *>(&_adam_weight_decay),sizeof(float));
       in.read(reinterpret_cast<char *>(&_adam_t),sizeof(int));
 
       // Read moment tensor count
@@ -816,6 +915,7 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
       in.read(reinterpret_cast<char *>(&dummy_f),sizeof(float));  // beta1
       in.read(reinterpret_cast<char *>(&dummy_f),sizeof(float));  // beta2
       in.read(reinterpret_cast<char *>(&dummy_f),sizeof(float));  // epsilon
+      in.read(reinterpret_cast<char *>(&dummy_f),sizeof(float));  // weight_decay
       in.read(reinterpret_cast<char *>(&dummy_i),sizeof(int));    // t
 
       uint32_t moment_count=0;
@@ -834,7 +934,7 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
 
     in.close();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

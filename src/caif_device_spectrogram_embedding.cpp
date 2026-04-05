@@ -62,7 +62,7 @@ CAIF_DeviceSpectrogramEmbedding::CAIF_DeviceSpectrogramEmbedding(const Config_t 
     // Initialize weights
     InitializeWeights(0);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceSpectrogramEmbedding::CAIF_DeviceSpectrogramEmbedding(
@@ -200,7 +200,7 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTens
 
     return proj_output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
@@ -284,7 +284,7 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTen
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceSpectrogramEmbedding::ZeroGradients()
@@ -298,7 +298,7 @@ void CAIF_DeviceSpectrogramEmbedding::ZeroGradients()
       _grad_cls.Fill(0.0f);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceSpectrogramEmbedding::ParameterTensorCount()const
@@ -401,7 +401,7 @@ std::string CAIF_DeviceSpectrogramEmbedding::Description()const
     desc+=")";
     return desc;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceSpectrogramEmbedding::ParameterNames(const std::string &prefix)const
@@ -417,7 +417,7 @@ std::vector<std::string> CAIF_DeviceSpectrogramEmbedding::ParameterNames(const s
     }
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceSpectrogramEmbedding::InitializeWeights(uint32_t seed)
@@ -453,7 +453,7 @@ void CAIF_DeviceSpectrogramEmbedding::InitializeWeights(uint32_t seed)
       _cls_token.CopyFromHost(cls_data.data(),cls_data.size());
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

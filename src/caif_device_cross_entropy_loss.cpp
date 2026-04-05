@@ -80,7 +80,7 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
 
     return losses;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_DeviceCrossEntropyLoss::ComputeLoss(const CAIF_DeviceTensor &logits,
@@ -126,7 +126,7 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLoss(const CAIF_DeviceTensor &logits,
     return 0.0f;
 #endif
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
@@ -151,18 +151,38 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
     CAIF_DeviceTensor grad=CAIF_DeviceTensor::Uninitialized(logits_shape,stream);
 
 #ifdef USE_CAIF_CUDA
+    // Count valid positions (non-ignored) for gradient scale.
+    // Use the same reduce kernel as ComputeLoss — output[1] is the count.
+    CAIF_DeviceTensor per_losses=ComputePerPositionLoss(logits,targets,stream,ignore_index);
+    CAIF_DeviceTensor reduction=CAIF_DeviceTensor::Zeros({2},stream);
+    launch_cross_entropy_reduce_mean(per_losses.DevicePtr(),
+                                     targets.DevicePtr(),
+                                     reduction.DevicePtr(),
+                                     static_cast<int>(n),
+                                     ignore_index,
+                                     stream.Handle());
+    CAIF_HostTensor host_result=reduction.ToHost();
+    const float valid_count=host_result.At({1});
+
+    float scale=0.0f;
+    if(valid_count>=1.0f)
+    {
+      scale=1.0f/valid_count;
+    }
+
     launch_cross_entropy_logits_backward(logits.DevicePtr(),
                                          targets.DevicePtr(),
                                          grad.DevicePtr(),
                                          static_cast<int>(n),
                                          static_cast<int>(vocab_size),
                                          ignore_index,
+                                         scale,
                                          stream.Handle());
 #endif
 
     return grad;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
@@ -174,15 +194,54 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
 {
   try
   {
-    // Compute loss first
-    float loss=ComputeLoss(logits,targets,stream,ignore_index);
+    const auto &logits_shape=logits.Shape();
 
-    // Compute gradient
-    grad_logits=ComputeGradient(logits,targets,stream,ignore_index);
+    // Flatten to [N, vocab_size]
+    uint32_t n=1;
+    for(size_t i=0;i<logits_shape.size()-1;++i)
+    {
+      n*=logits_shape[i];
+    }
+    const uint32_t vocab_size=logits_shape.back();
+
+#ifdef USE_CAIF_CUDA
+    // Fused path: count + loss/grad + reduce — no host sync between kernels
+    CAIF_DeviceTensor per_losses=CAIF_DeviceTensor::Uninitialized({n},stream);
+    grad_logits=CAIF_DeviceTensor::Uninitialized(logits_shape,stream);
+    CAIF_DeviceTensor result=CAIF_DeviceTensor::Zeros({2},stream);
+
+    launch_cross_entropy_fused(logits.DevicePtr(),
+                               targets.DevicePtr(),
+                               per_losses.DevicePtr(),
+                               grad_logits.DevicePtr(),
+                               result.DevicePtr(),
+                               static_cast<int>(n),
+                               static_cast<int>(vocab_size),
+                               ignore_index,
+                               stream.Handle());
+
+    // Single host sync at the end — result[0]=count, result[1]=loss_sum
+    CAIF_HostTensor host_result=result.ToHost();
+    const float valid_count=host_result.At({0});
+    const float loss_sum=host_result.At({1});
+
+    float loss=0.0f;
+    if(valid_count>=1.0f)
+    {
+      loss=loss_sum/valid_count;
+    }
 
     return loss;
+#else
+    (void)targets;
+    (void)grad_logits;
+    (void)ignore_index;
+    (void)n;
+    (void)vocab_size;
+    return 0.0f;
+#endif
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

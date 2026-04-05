@@ -69,7 +69,7 @@ CAIF_DeviceMoERouter::CAIF_DeviceMoERouter(const Config_t &config,CAIF_CudaStrea
 
     _stream->Synchronize();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoERouter::CAIF_DeviceMoERouter(CAIF_DeviceMoERouter &&other)
@@ -284,7 +284,7 @@ CAIF_DeviceMoERouter::RouterOutput_t CAIF_DeviceMoERouter::Route(const CAIF_Devi
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoERouter::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -295,7 +295,7 @@ CAIF_DeviceTensor CAIF_DeviceMoERouter::Forward(const CAIF_DeviceTensor &input,b
     RouterOutput_t output=Route(input,training);
     return std::move(output.expert_weights);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoERouter::Backward(const CAIF_DeviceTensor &grad_output)
@@ -306,7 +306,7 @@ CAIF_DeviceTensor CAIF_DeviceMoERouter::Backward(const CAIF_DeviceTensor &grad_o
     // grad_output: gradient w.r.t. expert_weights [num_tokens, top_k]
     return BackwardRouting(grad_output);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoERouter::BackwardRouting(const CAIF_DeviceTensor &grad_weights)
@@ -355,7 +355,7 @@ CAIF_DeviceTensor CAIF_DeviceMoERouter::BackwardRouting(const CAIF_DeviceTensor 
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMoERouter::ZeroGradients()
@@ -368,7 +368,7 @@ void CAIF_DeviceMoERouter::ZeroGradients()
       _grad_b_router.Fill(0.0f);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMoERouter::ParameterTensorCount()const

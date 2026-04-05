@@ -29,13 +29,20 @@ scons -c               # Clean
 - Headers symlinked at `../../include/caif/`
 
 **Compiler:** GCC, C++23, `-O3 -march=native -ffast-math` (release)
-**CUDA:** nvcc with `compute_120/sm_120`, enabled by default
+**CUDA:** nvcc with multi-architecture support, enabled by default
+
+Target architectures:
+- `sm_75` — Turing (T4, RTX 2000) — scalar flash attention fallback
+- `sm_80` — Ampere (A100, RTX 3000) — TF32 tensor core flash attention
+- `sm_89` — Ada (RTX 4000) — TF32 tensor core flash attention
+- `sm_90` — Hopper (H100) — TF32 tensor core flash attention
+- `sm_120` — Blackwell (RTX 5000, B200) — TF32 tensor core flash attention
 
 ## Project Structure
 
 ```
 caif/
-├── include/caif/           # 83 header files
+├── include/caif/           # 84 header files
 │   ├── Core               # Base, framework, exceptions, constants
 │   ├── Tensor             # DeviceTensor, HostTensor, Tensor (legacy)
 │   ├── Device layers      # 30+ GPU-resident layer implementations
@@ -44,7 +51,7 @@ caif/
 │   ├── Optimizers         # Adam, SGD
 │   ├── Loss functions     # CrossEntropy, MSE, BCE
 │   └── Legacy             # CPU backends, old layer types
-├── src/                    # 69 .cpp files + 1 .cu file
+├── src/                    # 70 .cpp files + 1 .cu file
 ├── tests/                  # 40+ test executables
 ├── benchmarks/             # Performance benchmarks
 ├── legacy/                 # Deprecated implementations
@@ -393,6 +400,8 @@ rotary position embeddings (RoPE).
 
 **Attention computation:**
 - Flash attention for head_dim in {32, 64, 80, 96, 128}
+  - TF32 tensor core forward on sm_80+ (Ampere and later)
+  - Scalar warp-per-row fallback on older GPUs or for backward pass
 - Standard attention fallback for other head_dims (e.g., GLM-4.7's 256)
 - Causal mask applied automatically
 
@@ -739,7 +748,8 @@ Singleton managing cuBLAS and cuDNN handles. Lazy initialization on first
 |----------|---------|
 | Activations | ReLU, Sigmoid, Tanh, LeakyReLU, GELU, Swish (forward + backward) |
 | Gated activations | SwiGLU, GELU-GLU, Swish-GLU merge kernels |
-| Flash attention | Forward + backward (head_dim 32/64/80/96/128 only) |
+| Flash attention (TC) | TF32 tensor core forward (sm_80+, head_dim 32/64/80/96/128) |
+| Flash attention (scalar) | Warp-per-row forward + backward (all GPUs, head_dim 32/64/80/96/128) |
 | Standard attention | Fallback for unsupported head_dims |
 | Softmax | Row-wise with causal masking, numerical stability |
 | RoPE | Rotary position embedding application |
@@ -747,6 +757,7 @@ Singleton managing cuBLAS and cuDNN handles. Lazy initialization on first
 | Quantization | INT4/INT8 dequantization with per-group scales |
 | Element-wise | Vectorized add, mul, etc. |
 | Reductions | Sum, mean, max |
+| Async copy | `cp_async_f4` (16-byte) and `cp_async_f2` (8-byte) global→shared helpers |
 
 **CPU stubs:** `caif_cuda_kernels_cpu.cpp` provides no-op implementations
 for CPU-only builds (`cuda=0`).
@@ -756,6 +767,66 @@ for CPU-only builds (`cuda=0`).
 to standard attention. The previous `default:` case in the flash kernel
 silently dispatched to the `<64>` template, causing out-of-bounds shared
 memory access and NaN gradients. This was fixed by adding explicit fallback.
+
+#### Flash Attention — Dual Kernel Architecture
+
+Two flash attention forward paths are provided, selected at runtime based on
+GPU compute capability and available shared memory:
+
+**1. Tensor Core Path** (`flash_attention_forward_tc_kernel`, sm_80+)
+
+TF32 tensor core fused kernel using `nvcuda::wmma` (16x16x8 tiles). Faster
+than PyTorch SDPA at all production sequence lengths (14-21% faster at
+seq_len 256-2048, batch=1, heads=32, head_dim=128).
+
+Template: `<int D, int BR, int BC>` (head_dim, Q rows per block, KV cols per tile)
+
+Algorithm (online softmax, 4 phases per KV block):
+1. Load K → shared, compute S = Q @ K^T via wmma (col_major load = implicit transpose)
+2. Online softmax: causal mask → row max → rescale O → exp → row sum
+3. Load V → shared (overwrites K), compute O += attn @ V via wmma
+4. Final: normalize O by row_sum, write to global
+
+Key optimizations:
+- **Shared memory bank conflict elimination**: Padded strides (D+2, BC+2) give
+  zero bank conflicts within 16-row wmma tiles. Stride D=128 has 128%32=0
+  (worst-case 32-way conflicts); stride 130 has 130%32=2 (zero conflicts).
+- **cp_async_f2**: 8-byte async global→shared copies (stride 130 is float2-aligned
+  but not float4-aligned). Hides memory latency with compute.
+- **Cooperative loading**: All warps participate in Q, K, V loads; work is
+  distributed evenly across threads.
+- **Persistent O accumulator**: O_tile lives in shared memory, rescaled each
+  KV block iteration. Final normalization on write-out.
+
+Shared memory layout (all buffers coexist):
+```
+Q_tile  [BR * (D+2)]    — loaded once, read during score computation
+KV_buf  [BC * (D+2)]    — K during phase 1, overwritten with V for phase 3
+S_tile  [BR * (BC+2)]   — scores from phase 1, consumed in phases 2+3
+O_tile  [BR * (D+2)]    — persistent accumulator, rescaled each iteration
+row_max [BR]             — online softmax running max
+row_sum [BR]             — online softmax running sum
+```
+
+Default dispatch (D=128): BR=32, BC=64, 4 warps (128 threads), ~100KB smem.
+Requires `cudaFuncSetAttribute` smem optin (Ampere+: 101-163KB available).
+
+**2. Scalar Path** (`flash_attention_forward_kernel`, all GPUs)
+
+Warp-per-row kernel using scalar FMA + warp shuffles. Lower throughput than
+tensor cores (128 vs 512 FP32 ops/cycle/SM) but minimal shared memory footprint
+(only K_tile + V_tile, Q and O in registers).
+
+Used when: sm < 80, insufficient shared memory, or as backward pass kernel
+(backward still uses scalar path for all architectures).
+
+**Runtime dispatch** in `launch_flash_attention_forward()`:
+```
+if (compute_capability_major >= 8 && smem_optin >= required)
+    → tensor core kernel
+else
+    → scalar kernel
+```
 
 ---
 

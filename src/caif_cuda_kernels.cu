@@ -25,6 +25,7 @@
 #include <device_launch_parameters.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,34 @@ extern "C"
 // Each thread processes 4 elements. Tail elements handled by scalar fallback.
 //------------------------------------------------------------------------------
 constexpr int g_act_block_size=256;
+constexpr int g_warp_size=32;
+
+//------------------------------------------------------------------------------
+// Warp-level sum reduction using shuffle intrinsics.
+// Avoids shared memory entirely. Returns the sum in lane 0.
+// All 32 lanes in the warp must call this with their value.
+//------------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_sum(float val)
+{
+  for(int offset=16;offset>0;offset/=2)
+  {
+    val+=__shfl_down_sync(0xffffffff,val,offset);
+  }
+  return val;
+}
+
+//------------------------------------------------------------------------------
+// Warp-level max reduction using shuffle intrinsics.
+// Returns the max in lane 0.
+//------------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_max(float val)
+{
+  for(int offset=16;offset>0;offset/=2)
+  {
+    val=fmaxf(val,__shfl_down_sync(0xffffffff,val,offset));
+  }
+  return val;
+}
 
 //------------------------------------------------------------------------------
 // ReLU Forward: f(x) = max(0, x)
@@ -85,10 +114,38 @@ __global__ void relu_backward_kernel(const float *grad_output,
     const float4 g=reinterpret_cast<const float4 *>(grad_output)[idx];
     const float4 x=reinterpret_cast<const float4 *>(input)[idx];
     float4 r;
-    if(x.x>0.0f){r.x=g.x;}else{r.x=0.0f;}
-    if(x.y>0.0f){r.y=g.y;}else{r.y=0.0f;}
-    if(x.z>0.0f){r.z=g.z;}else{r.z=0.0f;}
-    if(x.w>0.0f){r.w=g.w;}else{r.w=0.0f;}
+    if(x.x>0.0f)
+    {
+      r.x=g.x;
+    }
+    else
+    {
+      r.x=0.0f;
+    }
+    if(x.y>0.0f)
+    {
+      r.y=g.y;
+    }
+    else
+    {
+      r.y=0.0f;
+    }
+    if(x.z>0.0f)
+    {
+      r.z=g.z;
+    }
+    else
+    {
+      r.z=0.0f;
+    }
+    if(x.w>0.0f)
+    {
+      r.w=g.w;
+    }
+    else
+    {
+      r.w=0.0f;
+    }
     reinterpret_cast<float4 *>(grad_input)[idx]=r;
   }
 }
@@ -432,10 +489,38 @@ __global__ void leaky_relu_forward_kernel(const float *input,
   {
     const float4 v=reinterpret_cast<const float4 *>(input)[idx];
     float4 r;
-    if(v.x>0.0f){r.x=v.x;}else{r.x=alpha*v.x;}
-    if(v.y>0.0f){r.y=v.y;}else{r.y=alpha*v.y;}
-    if(v.z>0.0f){r.z=v.z;}else{r.z=alpha*v.z;}
-    if(v.w>0.0f){r.w=v.w;}else{r.w=alpha*v.w;}
+    if(v.x>0.0f)
+    {
+      r.x=v.x;
+    }
+    else
+    {
+      r.x=alpha*v.x;
+    }
+    if(v.y>0.0f)
+    {
+      r.y=v.y;
+    }
+    else
+    {
+      r.y=alpha*v.y;
+    }
+    if(v.z>0.0f)
+    {
+      r.z=v.z;
+    }
+    else
+    {
+      r.z=alpha*v.z;
+    }
+    if(v.w>0.0f)
+    {
+      r.w=v.w;
+    }
+    else
+    {
+      r.w=alpha*v.w;
+    }
     reinterpret_cast<float4 *>(output)[idx]=r;
   }
 }
@@ -476,10 +561,38 @@ __global__ void leaky_relu_backward_kernel(const float *grad_output,
     const float4 g=reinterpret_cast<const float4 *>(grad_output)[idx];
     const float4 x=reinterpret_cast<const float4 *>(input)[idx];
     float4 r;
-    if(x.x>0.0f){r.x=g.x;}else{r.x=alpha*g.x;}
-    if(x.y>0.0f){r.y=g.y;}else{r.y=alpha*g.y;}
-    if(x.z>0.0f){r.z=g.z;}else{r.z=alpha*g.z;}
-    if(x.w>0.0f){r.w=g.w;}else{r.w=alpha*g.w;}
+    if(x.x>0.0f)
+    {
+      r.x=g.x;
+    }
+    else
+    {
+      r.x=alpha*g.x;
+    }
+    if(x.y>0.0f)
+    {
+      r.y=g.y;
+    }
+    else
+    {
+      r.y=alpha*g.y;
+    }
+    if(x.z>0.0f)
+    {
+      r.z=g.z;
+    }
+    else
+    {
+      r.z=alpha*g.z;
+    }
+    if(x.w>0.0f)
+    {
+      r.w=g.w;
+    }
+    else
+    {
+      r.w=alpha*g.w;
+    }
     reinterpret_cast<float4 *>(grad_input)[idx]=r;
   }
 }
@@ -518,10 +631,38 @@ __global__ void elu_forward_kernel(const float *input,
   {
     const float4 v=reinterpret_cast<const float4 *>(input)[idx];
     float4 r;
-    if(v.x>0.0f){r.x=v.x;}else{r.x=alpha*(expf(v.x)-1.0f);}
-    if(v.y>0.0f){r.y=v.y;}else{r.y=alpha*(expf(v.y)-1.0f);}
-    if(v.z>0.0f){r.z=v.z;}else{r.z=alpha*(expf(v.z)-1.0f);}
-    if(v.w>0.0f){r.w=v.w;}else{r.w=alpha*(expf(v.w)-1.0f);}
+    if(v.x>0.0f)
+    {
+      r.x=v.x;
+    }
+    else
+    {
+      r.x=alpha*(expf(v.x)-1.0f);
+    }
+    if(v.y>0.0f)
+    {
+      r.y=v.y;
+    }
+    else
+    {
+      r.y=alpha*(expf(v.y)-1.0f);
+    }
+    if(v.z>0.0f)
+    {
+      r.z=v.z;
+    }
+    else
+    {
+      r.z=alpha*(expf(v.z)-1.0f);
+    }
+    if(v.w>0.0f)
+    {
+      r.w=v.w;
+    }
+    else
+    {
+      r.w=alpha*(expf(v.w)-1.0f);
+    }
     reinterpret_cast<float4 *>(output)[idx]=r;
   }
 }
@@ -564,10 +705,38 @@ __global__ void elu_backward_kernel(const float *grad_output,
     const float4 x=reinterpret_cast<const float4 *>(input)[idx];
     const float4 o=reinterpret_cast<const float4 *>(output)[idx];
     float4 r;
-    if(x.x>0.0f){r.x=g.x;}else{r.x=g.x*(o.x+alpha);}
-    if(x.y>0.0f){r.y=g.y;}else{r.y=g.y*(o.y+alpha);}
-    if(x.z>0.0f){r.z=g.z;}else{r.z=g.z*(o.z+alpha);}
-    if(x.w>0.0f){r.w=g.w;}else{r.w=g.w*(o.w+alpha);}
+    if(x.x>0.0f)
+    {
+      r.x=g.x;
+    }
+    else
+    {
+      r.x=g.x*(o.x+alpha);
+    }
+    if(x.y>0.0f)
+    {
+      r.y=g.y;
+    }
+    else
+    {
+      r.y=g.y*(o.y+alpha);
+    }
+    if(x.z>0.0f)
+    {
+      r.z=g.z;
+    }
+    else
+    {
+      r.z=g.z*(o.z+alpha);
+    }
+    if(x.w>0.0f)
+    {
+      r.w=g.w;
+    }
+    else
+    {
+      r.w=g.w*(o.w+alpha);
+    }
     reinterpret_cast<float4 *>(grad_input)[idx]=r;
   }
 }
@@ -614,8 +783,7 @@ void launch_relu_forward(const float *input,
   }
   if(tail>0)
   {
-    relu_forward_tail_kernel<<<1,tail,0,stream>>>(
-      input,output,n4*4,n);
+    relu_forward_tail_kernel<<<1,tail,0,stream>>>(input,output,n4*4,n);
   }
 }
 
@@ -630,13 +798,11 @@ void launch_relu_backward(const float *grad_output,
   if(n4>0)
   {
     const int num_blocks=(n4+g_act_block_size-1)/g_act_block_size;
-    relu_backward_kernel<<<num_blocks,g_act_block_size,0,stream>>>(
-      grad_output,input,grad_input,n4);
+    relu_backward_kernel<<<num_blocks,g_act_block_size,0,stream>>>(grad_output,input,grad_input,n4);
   }
   if(tail>0)
   {
-    relu_backward_tail_kernel<<<1,tail,0,stream>>>(
-      grad_output,input,grad_input,n4*4,n);
+    relu_backward_tail_kernel<<<1,tail,0,stream>>>(grad_output,input,grad_input,n4*4,n);
   }
 }
 
@@ -650,13 +816,11 @@ void launch_sigmoid_forward(const float *input,
   if(n4>0)
   {
     const int num_blocks=(n4+g_act_block_size-1)/g_act_block_size;
-    sigmoid_forward_kernel<<<num_blocks,g_act_block_size,0,stream>>>(
-      input,output,n4);
+    sigmoid_forward_kernel<<<num_blocks,g_act_block_size,0,stream>>>(input,output,n4);
   }
   if(tail>0)
   {
-    sigmoid_forward_tail_kernel<<<1,tail,0,stream>>>(
-      input,output,n4*4,n);
+    sigmoid_forward_tail_kernel<<<1,tail,0,stream>>>(input,output,n4*4,n);
   }
 }
 
@@ -1071,36 +1235,44 @@ __global__ void reduction_sum_kernel(const float *input,
                                      float *output,
                                      const int n)
 {
-  extern __shared__ float sdata[];
-
   const int tid=threadIdx.x;
   const int idx=blockIdx.x*blockDim.x+threadIdx.x;
 
-  // Load element into shared memory (or 0 if out of bounds)
+  float val=0.0f;
   if(idx<n)
   {
-    sdata[tid]=input[idx];
+    val=input[idx];
   }
-  else
+
+  // Warp shuffle reduction (no shared memory for intra-warp)
+  val=warp_reduce_sum(val);
+
+  // Per-warp partial sums via shared memory
+  __shared__ float warp_sums[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
   {
-    sdata[tid]=0.0f;
+    warp_sums[warp_id]=val;
   }
   __syncthreads();
 
-  // Parallel reduction in shared memory
-  for(int s=blockDim.x/2; s>0; s>>=1)
+  // First warp reduces the per-warp sums
+  if(warp_id==0)
   {
-    if(tid<s)
+    val=0.0f;
+    if(lane<num_warps)
     {
-      sdata[tid]+=sdata[tid+s];
+      val=warp_sums[lane];
     }
-    __syncthreads();
+    val=warp_reduce_sum(val);
   }
 
-  // Write result for this block
   if(tid==0)
   {
-    output[blockIdx.x]=sdata[0];
+    output[blockIdx.x]=val;
   }
 }
 
@@ -1236,8 +1408,7 @@ void launch_reduction_sum(const float *input,
 {
   const int block_size=256;
   const int num_blocks=(n+block_size-1)/block_size;
-  const size_t shared_mem_size=block_size*sizeof(float);
-  reduction_sum_kernel<<<num_blocks,block_size,shared_mem_size,stream>>>(input,output,n);
+  reduction_sum_kernel<<<num_blocks,block_size,0,stream>>>(input,output,n);
 }
 
 //------------------------------------------------------------------------------
@@ -1326,7 +1497,7 @@ __global__ void cross_entropy_loss_index_kernel(const float *predictions,
     return;
   }
   const int cls=target_idx[b];
-  if(cls<0||cls>=num_classes)
+  if(cls<0 || cls>=num_classes)
   {
     loss[b]=0.0f;
     return;
@@ -1375,36 +1546,45 @@ __global__ void mse_loss_reduce_kernel(const float *predictions,
                                        float *loss,
                                        const int n)
 {
-  extern __shared__ float sdata[];
-
   const int tid=threadIdx.x;
   const int idx=blockIdx.x*blockDim.x+threadIdx.x;
 
+  float val=0.0f;
   if(idx<n)
   {
     const float diff=predictions[idx]-targets[idx];
-    sdata[tid]=diff*diff;
+    val=diff*diff;
   }
-  else
+
+  // Warp shuffle reduction
+  val=warp_reduce_sum(val);
+
+  // Per-warp partial sums via shared memory
+  __shared__ float warp_sums[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
   {
-    sdata[tid]=0.0f;
+    warp_sums[warp_id]=val;
   }
   __syncthreads();
 
-  // Block-level parallel reduction in shared memory
-  for(int s=blockDim.x/2; s>0; s>>=1)
+  // First warp reduces the per-warp sums
+  if(warp_id==0)
   {
-    if(tid<s)
+    val=0.0f;
+    if(lane<num_warps)
     {
-      sdata[tid]+=sdata[tid+s];
+      val=warp_sums[lane];
     }
-    __syncthreads();
+    val=warp_reduce_sum(val);
   }
 
-  // Atomic add block partial sum to output scalar
   if(tid==0)
   {
-    atomicAdd(loss,sdata[0]);
+    atomicAdd(loss,val);
   }
 }
 
@@ -1469,7 +1649,12 @@ void launch_cross_entropy_loss_index(const float *predictions,
 {
   const int block_size=256;
   const int num_blocks=(batch_size+block_size-1)/block_size;
-  cross_entropy_loss_index_kernel<<<num_blocks,block_size,0,stream>>>(predictions,target_indices,loss,epsilon,num_classes);
+  cross_entropy_loss_index_kernel
+    <<<num_blocks,block_size,0,stream>>>(predictions,
+                                         target_indices,
+                                         loss,
+                                         epsilon,
+                                         num_classes);
 }
 
 void launch_cross_entropy_gradient_index(const float *predictions,
@@ -1484,7 +1669,14 @@ void launch_cross_entropy_gradient_index(const float *predictions,
   const int block_size=256;
   const int num_blocks=(total+block_size-1)/block_size;
   const float batch_size_inv=1.0f/static_cast<float>(batch_size);
-  cross_entropy_gradient_index_kernel<<<num_blocks,block_size,0,stream>>>(predictions,target_indices,gradient,epsilon,batch_size_inv,num_classes,total);
+  cross_entropy_gradient_index_kernel
+    <<<num_blocks,block_size,0,stream>>>(predictions,
+                                         target_indices,
+                                         gradient,
+                                         epsilon,
+                                         batch_size_inv,
+                                         num_classes,
+                                         total);
 }
 
 void launch_mse_loss(const float *predictions,
@@ -1495,11 +1687,10 @@ void launch_mse_loss(const float *predictions,
 {
   const int block_size=256;
   const int num_blocks=(n+block_size-1)/block_size;
-  const size_t shared_mem_size=block_size*sizeof(float);
-  mse_loss_reduce_kernel<<<num_blocks,block_size,shared_mem_size,stream>>>(predictions,
-                                                                           targets,
-                                                                           loss,
-                                                                           n);
+  mse_loss_reduce_kernel<<<num_blocks,block_size,0,stream>>>(predictions,
+                                                             targets,
+                                                             loss,
+                                                             n);
 }
 
 void launch_mse_gradient(const float *predictions,
@@ -1517,11 +1708,12 @@ void launch_mse_gradient(const float *predictions,
 //------------------------------------------------------------------------------
 // Fused Adam Optimizer Kernel
 // Combines all Adam operations into a single kernel for efficiency:
-// 1. Apply weight decay: g = grad + weight_decay * param
-// 2. Update first moment: m = beta1 * m + (1 - beta1) * g
-// 3. Update second moment: v = beta2 * v + (1 - beta2) * g^2
-// 4. Compute bias-corrected moments
-// 5. Update parameter: param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
+// AdamW (decoupled weight decay, matches PyTorch):
+// 1. Update first moment: m = beta1 * m + (1 - beta1) * g
+// 2. Update second moment: v = beta2 * v + (1 - beta2) * g^2
+// 3. Compute bias-corrected moments
+// 4. Update parameter: param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
+// 5. Apply decoupled weight decay: param = param - lr * weight_decay * param
 //------------------------------------------------------------------------------
 __global__ void fused_adam_kernel(float *param,
                                   const float *grad,
@@ -1547,7 +1739,7 @@ __global__ void fused_adam_kernel(float *param,
     float v_val=v[idx];
 
     // Sanitize gradient: replace NaN/Inf with 0, clamp to [-clip_val, clip_val]
-    if(isnan(g)||isinf(g))
+    if(isnan(g) || isinf(g))
     {
       g=0.0f;
     }
@@ -1558,12 +1750,6 @@ __global__ void fused_adam_kernel(float *param,
     else if(g<-grad_clip_val)
     {
       g=-grad_clip_val;
-    }
-
-    // Apply weight decay (L2 regularization)
-    if(weight_decay>0.0f)
-    {
-      g=g+weight_decay*p;
     }
 
     // Update biased first moment estimate: m = beta1 * m + (1 - beta1) * g
@@ -1580,6 +1766,12 @@ __global__ void fused_adam_kernel(float *param,
 
     // Update parameter: param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
     p=p-lr*m_hat/(sqrtf(v_hat)+epsilon);
+
+    // Decoupled weight decay (AdamW): param = param - lr * wd * param
+    if(weight_decay>0.0f)
+    {
+      p=p-lr*weight_decay*p;
+    }
 
     // Store updated values
     param[idx]=p;
@@ -1615,12 +1807,6 @@ __global__ void fused_adam_clipped_kernel(float *param,
     float m_val=m[idx];
     float v_val=v[idx];
 
-    // Apply weight decay (L2 regularization)
-    if(weight_decay>0.0f)
-    {
-      g=g+weight_decay*p;
-    }
-
     // Update biased first moment estimate
     m_val=beta1*m_val+(1.0f-beta1)*g;
 
@@ -1633,6 +1819,12 @@ __global__ void fused_adam_clipped_kernel(float *param,
 
     // Update parameter
     p=p-lr*m_hat/(sqrtf(v_hat)+epsilon);
+
+    // Decoupled weight decay (AdamW)
+    if(weight_decay>0.0f)
+    {
+      p=p-lr*weight_decay*p;
+    }
 
     // Store updated values
     param[idx]=p;
@@ -1764,32 +1956,52 @@ __global__ void rmsnorm_forward_kernel(const float *input,
 
   const float *x=input+row*dim;
   float *y=output+row*dim;
+  const int tid=threadIdx.x;
 
-  extern __shared__ float sdata[];
-
-  // Phase 1: Compute sum(x^2) using grid-stride loop
+  // Phase 1: Compute sum(x^2) using stride loop
   float local_sum=0.0f;
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float val=x[col];
     local_sum+=val*val;
   }
-  sdata[threadIdx.x]=local_sum;
+
+  // Warp shuffle reduction
+  local_sum=warp_reduce_sum(local_sum);
+
+  // Per-warp partial sums via shared memory
+  __shared__ float warp_sums[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
+  {
+    warp_sums[warp_id]=local_sum;
+  }
   __syncthreads();
 
-  // Parallel reduction in shared memory
-  for(int s=blockDim.x/2;s>0;s>>=1)
+  // First warp reduces the per-warp sums
+  if(warp_id==0)
   {
-    if(threadIdx.x<s)
+    local_sum=0.0f;
+    if(lane<num_warps)
     {
-      sdata[threadIdx.x]+=sdata[threadIdx.x+s];
+      local_sum=warp_sums[lane];
     }
-    __syncthreads();
+    local_sum=warp_reduce_sum(local_sum);
   }
 
+  // Broadcast result to all threads via shared memory
+  if(tid==0)
+  {
+    warp_sums[0]=local_sum;
+  }
+  __syncthreads();
+
   // Compute RMS value
-  const float rms=sqrtf(sdata[0]/static_cast<float>(dim)+epsilon);
-  if(threadIdx.x==0)
+  const float rms=sqrtf(warp_sums[0]/static_cast<float>(dim)+epsilon);
+  if(tid==0)
   {
     rms_cache[row]=rms;
   }
@@ -1797,7 +2009,7 @@ __global__ void rmsnorm_forward_kernel(const float *input,
   const float rstd=1.0f/rms;
 
   // Phase 2: Normalize and scale by gamma
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     y[col]=x[col]*rstd*gamma[col];
   }
@@ -1827,35 +2039,53 @@ __global__ void rmsnorm_backward_kernel(const float *grad_output,
   const float *dy=grad_output+row*dim;
   const float *x=input+row*dim;
   float *dx=grad_input+row*dim;
+  const int tid=threadIdx.x;
 
   const float rstd=1.0f/rms_cache[row];
 
-  extern __shared__ float sdata[];
-
   // Phase 1: Compute sum(dy * gamma * x_hat) where x_hat = x * rstd
   float local_sum=0.0f;
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float x_hat=x[col]*rstd;
     local_sum+=dy[col]*gamma[col]*x_hat;
   }
-  sdata[threadIdx.x]=local_sum;
+
+  // Warp shuffle reduction
+  local_sum=warp_reduce_sum(local_sum);
+
+  __shared__ float warp_sums[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
+  {
+    warp_sums[warp_id]=local_sum;
+  }
   __syncthreads();
 
-  // Parallel reduction
-  for(int s=blockDim.x/2;s>0;s>>=1)
+  if(warp_id==0)
   {
-    if(threadIdx.x<s)
+    local_sum=0.0f;
+    if(lane<num_warps)
     {
-      sdata[threadIdx.x]+=sdata[threadIdx.x+s];
+      local_sum=warp_sums[lane];
     }
-    __syncthreads();
+    local_sum=warp_reduce_sum(local_sum);
   }
 
-  const float sum_term=sdata[0]/static_cast<float>(dim);
+  // Broadcast result
+  if(tid==0)
+  {
+    warp_sums[0]=local_sum;
+  }
+  __syncthreads();
+
+  const float sum_term=warp_sums[0]/static_cast<float>(dim);
 
   // Phase 2: Compute grad_input and accumulate grad_gamma
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float x_hat=x[col]*rstd;
     dx[col]=rstd*(dy[col]*gamma[col]-x_hat*sum_term);
@@ -1887,43 +2117,57 @@ __global__ void layernorm_forward_kernel(const float *input,
 
   const float *x=input+row*dim;
   float *y=output+row*dim;
+  const int tid=threadIdx.x;
 
-  extern __shared__ float sdata[];
-  float *s_sum=sdata;
-  float *s_sum_sq=sdata+blockDim.x;
-
-  // Phase 1: Compute sum(x) and sum(x^2) using grid-stride loop
+  // Phase 1: Compute sum(x) and sum(x^2) using stride loop
   float local_sum=0.0f;
   float local_sum_sq=0.0f;
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float val=x[col];
     local_sum+=val;
     local_sum_sq+=val*val;
   }
-  s_sum[threadIdx.x]=local_sum;
-  s_sum_sq[threadIdx.x]=local_sum_sq;
+
+  // Warp shuffle reduction for both sums
+  local_sum=warp_reduce_sum(local_sum);
+  local_sum_sq=warp_reduce_sum(local_sum_sq);
+
+  // Per-warp partial sums via shared memory (two arrays)
+  __shared__ float ws_sum[g_warp_size];
+  __shared__ float ws_sum_sq[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
+  {
+    ws_sum[warp_id]=local_sum;
+    ws_sum_sq[warp_id]=local_sum_sq;
+  }
   __syncthreads();
 
-  // Parallel reduction in shared memory
-  for(int s=blockDim.x/2;s>0;s>>=1)
+  if(warp_id==0)
   {
-    if(threadIdx.x<s)
+    local_sum=0.0f;
+    local_sum_sq=0.0f;
+    if(lane<num_warps)
     {
-      s_sum[threadIdx.x]+=s_sum[threadIdx.x+s];
-      s_sum_sq[threadIdx.x]+=s_sum_sq[threadIdx.x+s];
+      local_sum=ws_sum[lane];
+      local_sum_sq=ws_sum_sq[lane];
     }
-    __syncthreads();
+    local_sum=warp_reduce_sum(local_sum);
+    local_sum_sq=warp_reduce_sum(local_sum_sq);
   }
 
-  // Compute mean and rstd
+  // Broadcast mean and rstd
   __shared__ float s_mean;
   __shared__ float s_rstd;
-  if(threadIdx.x==0)
+  if(tid==0)
   {
     const float dim_f=static_cast<float>(dim);
-    s_mean=s_sum[0]/dim_f;
-    const float variance=s_sum_sq[0]/dim_f-s_mean*s_mean;
+    s_mean=local_sum/dim_f;
+    const float variance=local_sum_sq/dim_f-s_mean*s_mean;
     s_rstd=rsqrtf(variance+epsilon);
     mean_cache[row]=s_mean;
     rstd_cache[row]=s_rstd;
@@ -1934,7 +2178,7 @@ __global__ void layernorm_forward_kernel(const float *input,
   const float rstd=s_rstd;
 
   // Phase 2: Normalize, scale, and shift
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float x_hat=(x[col]-mean)*rstd;
     y[col]=x_hat*gamma[col]+beta[col];
@@ -1966,45 +2210,66 @@ __global__ void layernorm_backward_kernel(const float *grad_output,
   const float *dy=grad_output+row*dim;
   const float *x=input+row*dim;
   float *dx=grad_input+row*dim;
+  const int tid=threadIdx.x;
 
   const float mean=mean_cache[row];
   const float rstd=rstd_cache[row];
 
-  extern __shared__ float sdata[];
-  float *s_sum1=sdata;
-  float *s_sum2=sdata+blockDim.x;
-
   // Phase 1: Compute S1=sum(dy*gamma) and S2=sum(dy*gamma*x_hat)
   float local_s1=0.0f;
   float local_s2=0.0f;
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float x_hat=(x[col]-mean)*rstd;
     const float dy_gamma=dy[col]*gamma[col];
     local_s1+=dy_gamma;
     local_s2+=dy_gamma*x_hat;
   }
-  s_sum1[threadIdx.x]=local_s1;
-  s_sum2[threadIdx.x]=local_s2;
+
+  // Warp shuffle reduction for both sums
+  local_s1=warp_reduce_sum(local_s1);
+  local_s2=warp_reduce_sum(local_s2);
+
+  __shared__ float ws_s1[g_warp_size];
+  __shared__ float ws_s2[g_warp_size];
+  const int lane=tid&(g_warp_size-1);
+  const int warp_id=tid/g_warp_size;
+  const int num_warps=blockDim.x/g_warp_size;
+
+  if(lane==0)
+  {
+    ws_s1[warp_id]=local_s1;
+    ws_s2[warp_id]=local_s2;
+  }
   __syncthreads();
 
-  // Parallel reduction
-  for(int s=blockDim.x/2;s>0;s>>=1)
+  if(warp_id==0)
   {
-    if(threadIdx.x<s)
+    local_s1=0.0f;
+    local_s2=0.0f;
+    if(lane<num_warps)
     {
-      s_sum1[threadIdx.x]+=s_sum1[threadIdx.x+s];
-      s_sum2[threadIdx.x]+=s_sum2[threadIdx.x+s];
+      local_s1=ws_s1[lane];
+      local_s2=ws_s2[lane];
     }
-    __syncthreads();
+    local_s1=warp_reduce_sum(local_s1);
+    local_s2=warp_reduce_sum(local_s2);
   }
 
+  // Broadcast results
+  if(tid==0)
+  {
+    ws_s1[0]=local_s1;
+    ws_s2[0]=local_s2;
+  }
+  __syncthreads();
+
   const float dim_f=static_cast<float>(dim);
-  const float s1=s_sum1[0]/dim_f;
-  const float s2=s_sum2[0]/dim_f;
+  const float s1=ws_s1[0]/dim_f;
+  const float s2=ws_s2[0]/dim_f;
 
   // Phase 2: Compute grad_input, accumulate grad_gamma and grad_beta
-  for(int col=threadIdx.x;col<dim;col+=blockDim.x)
+  for(int col=tid;col<dim;col+=blockDim.x)
   {
     const float x_hat=(x[col]-mean)*rstd;
     dx[col]=rstd*(dy[col]*gamma[col]-s1-x_hat*s2);
@@ -2027,14 +2292,13 @@ void launch_rmsnorm_forward(const float *input,
                             cudaStream_t stream)
 {
   const int block_size=256;
-  const size_t shared_mem_size=block_size*sizeof(float);
-  rmsnorm_forward_kernel<<<rows,block_size,shared_mem_size,stream>>>(input,
-                                                                      gamma,
-                                                                      output,
-                                                                      rms_cache,
-                                                                      epsilon,
-                                                                      rows,
-                                                                      dim);
+  rmsnorm_forward_kernel<<<rows,block_size,0,stream>>>(input,
+                                                       gamma,
+                                                       output,
+                                                       rms_cache,
+                                                       epsilon,
+                                                       rows,
+                                                       dim);
 }
 
 void launch_rmsnorm_backward(const float *grad_output,
@@ -2049,16 +2313,15 @@ void launch_rmsnorm_backward(const float *grad_output,
                               cudaStream_t stream)
 {
   const int block_size=256;
-  const size_t shared_mem_size=block_size*sizeof(float);
-  rmsnorm_backward_kernel<<<rows,block_size,shared_mem_size,stream>>>(grad_output,
-                                                                       input,
-                                                                       gamma,
-                                                                       rms_cache,
-                                                                       grad_input,
-                                                                       grad_gamma,
-                                                                       epsilon,
-                                                                       rows,
-                                                                       dim);
+  rmsnorm_backward_kernel<<<rows,block_size,0,stream>>>(grad_output,
+                                                        input,
+                                                        gamma,
+                                                        rms_cache,
+                                                        grad_input,
+                                                        grad_gamma,
+                                                        epsilon,
+                                                        rows,
+                                                        dim);
 }
 
 void launch_layernorm_forward(const float *input,
@@ -2073,9 +2336,15 @@ void launch_layernorm_forward(const float *input,
                               cudaStream_t stream)
 {
   const int block_size=256;
-  const size_t shared_mem_size=2*block_size*sizeof(float);
-  layernorm_forward_kernel<<<rows,block_size,shared_mem_size,stream>>>(
-    input,gamma,beta,output,mean_cache,rstd_cache,epsilon,rows,dim);
+  layernorm_forward_kernel<<<rows,block_size,0,stream>>>(input,
+                                                        gamma,
+                                                        beta,
+                                                        output,
+                                                        mean_cache,
+                                                        rstd_cache,
+                                                        epsilon,
+                                                        rows,
+                                                        dim);
 }
 
 void launch_layernorm_backward(const float *grad_output,
@@ -2091,17 +2360,16 @@ void launch_layernorm_backward(const float *grad_output,
                                 cudaStream_t stream)
 {
   const int block_size=256;
-  const size_t shared_mem_size=2*block_size*sizeof(float);
-  layernorm_backward_kernel<<<rows,block_size,shared_mem_size,stream>>>(grad_output,
-                                                                         input,
-                                                                         gamma,
-                                                                         mean_cache,
-                                                                         rstd_cache,
-                                                                         grad_input,
-                                                                         grad_gamma,
-                                                                         grad_beta,
-                                                                         rows,
-                                                                         dim);
+  layernorm_backward_kernel<<<rows,block_size,0,stream>>>(grad_output,
+                                                         input,
+                                                         gamma,
+                                                         mean_cache,
+                                                         rstd_cache,
+                                                         grad_input,
+                                                         grad_gamma,
+                                                         grad_beta,
+                                                         rows,
+                                                         dim);
 }
 
 //------------------------------------------------------------------------------
@@ -2391,7 +2659,14 @@ void launch_attention_softmax(const float *input,
                               const int row_len,
                               cudaStream_t stream)
 {
-  const int block_size=256;
+  // Blackwell (sm_120): shared memory tree reduction with __syncthreads()
+  // produces incorrect results when block_size > 32 (multiple warps).
+  // The memory fence does not fully guarantee visibility across warp
+  // partitions. Single-warp blocks (32 threads) avoid inter-warp shared
+  // memory communication entirely. Verified: -O0 still fails, volatile
+  // doesn't help, printf masks the bug (heisenbug). Each thread handles
+  // ceil(row_len/32) columns via the strided loop.
+  const int block_size=32;
   const size_t shared_mem_size=block_size*sizeof(float);
   attention_softmax_kernel<<<num_rows,block_size,shared_mem_size,stream>>>(
     input,output,num_rows,row_len);
@@ -2404,7 +2679,8 @@ void launch_attention_softmax_backward(const float *grad_output,
                                        const int row_len,
                                        cudaStream_t stream)
 {
-  const int block_size=256;
+  // See launch_attention_softmax comment for Blackwell shared memory issue.
+  const int block_size=32;
   const size_t shared_mem_size=block_size*sizeof(float);
   attention_softmax_backward_kernel<<<num_rows,block_size,shared_mem_size,stream>>>(
     grad_output,output,grad_input,num_rows,row_len);
@@ -2956,7 +3232,7 @@ __global__ void embedding_lookup_kernel(const float *table,
   const int token_idx=blockIdx.x;
   const int d=blockIdx.y*blockDim.x*4+threadIdx.x*4;
 
-  if(token_idx>=num_tokens||d>=dim)
+  if(token_idx>=num_tokens || d>=dim)
   {
     return;
   }
@@ -2972,7 +3248,7 @@ __global__ void embedding_lookup_kernel(const float *table,
   }
   else
   {
-    for(int i=0;i<4&&d+i<dim;++i)
+    for(int i=0;i<4 && d+i<dim;++i)
     {
       dst[i]=src[i];
     }
@@ -2991,7 +3267,7 @@ __global__ void embedding_lookup_float_kernel(const float *table,
   const int token_idx=blockIdx.x;
   const int d=blockIdx.y*blockDim.x*4+threadIdx.x*4;
 
-  if(token_idx>=num_tokens||d>=dim)
+  if(token_idx>=num_tokens || d>=dim)
   {
     return;
   }
@@ -3007,7 +3283,7 @@ __global__ void embedding_lookup_float_kernel(const float *table,
   }
   else
   {
-    for(int i=0;i<4&&d+i<dim;++i)
+    for(int i=0;i<4 && d+i<dim;++i)
     {
       dst[i]=src[i];
     }
@@ -3041,7 +3317,7 @@ __global__ void embedding_backward_kernel(const float *grad_output,
   const int token_idx=blockIdx.x;
   const int d=blockIdx.y*blockDim.x*4+threadIdx.x*4;
 
-  if(token_idx>=num_tokens||d>=dim)
+  if(token_idx>=num_tokens || d>=dim)
   {
     return;
   }
@@ -3060,7 +3336,7 @@ __global__ void embedding_backward_kernel(const float *grad_output,
   }
   else
   {
-    for(int i=0;i<4&&d+i<dim;++i)
+    for(int i=0;i<4 && d+i<dim;++i)
     {
       atomicAdd(&dst[i],src[i]);
     }
@@ -3523,7 +3799,14 @@ __global__ void cross_entropy_logits_forward_kernel(const float *logits,
     const float target_logit=pos_logits[target_id];
     const float raw_loss=log_sum_exp-target_logit;
     // Propagate NaN instead of masking it; clamp tiny negative fp errors to 0
-    losses[pos]=isnan(raw_loss)?raw_loss:fmaxf(0.0f,raw_loss);
+    if(isnan(raw_loss))
+    {
+      losses[pos]=raw_loss;
+    }
+    else
+    {
+      losses[pos]=fmaxf(0.0f,raw_loss);
+    }
   }
 }
 
@@ -3700,12 +3983,9 @@ void launch_cross_entropy_logits_backward(const float *logits,
                                           const int n,
                                           const int vocab_size,
                                           const int ignore_index,
+                                          const float scale,
                                           cudaStream_t stream)
 {
-  // Count valid positions for scale factor
-  // For simplicity, use 1/n as scale (caller should adjust for ignore_index if needed)
-  const float scale=1.0f/static_cast<float>(n);
-
   const int block_size=256;
   const int num_blocks=n;
   const size_t shared_size=2*block_size*sizeof(float);
@@ -3726,6 +4006,240 @@ void launch_cross_entropy_reduce_mean(const float *losses,
   const size_t shared_size=2*block_size*sizeof(float);
   cross_entropy_reduce_mean_kernel<<<num_blocks,block_size,shared_size,stream>>>(
     losses,targets,output,n,ignore_index);
+}
+
+//------------------------------------------------------------------------------
+// Cross-Entropy Fused Kernels
+// Fuses forward loss + backward gradient into a single pass over logits.
+// Eliminates host roundtrip for valid_count and halves logits memory reads.
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Count valid (non-ignored) positions. Writes count to *count_out (pre-zeroed).
+//------------------------------------------------------------------------------
+__global__ void cross_entropy_count_valid_kernel(const float *targets,
+                                                  float *count_out,
+                                                  const int n,
+                                                  const int ignore_index)
+{
+  const int tid=threadIdx.x;
+  const int idx=blockIdx.x*blockDim.x+tid;
+
+  float local_count=0.0f;
+  if(idx<n)
+  {
+    const int target_id=static_cast<int>(targets[idx]);
+    if(target_id!=ignore_index)
+    {
+      local_count=1.0f;
+    }
+  }
+
+  local_count=warp_reduce_sum(local_count);
+
+  if((tid%g_warp_size)==0 && local_count>0.0f)
+  {
+    atomicAdd(count_out,local_count);
+  }
+}
+
+//------------------------------------------------------------------------------
+// Fused forward+backward: one block per position.
+// Reads logits once (3 passes: max, sum_exp, gradient).
+// Reads valid_count from device memory (set by count kernel on same stream).
+// Outputs per-position loss AND scaled gradient.
+//------------------------------------------------------------------------------
+__global__ void cross_entropy_fused_loss_grad_kernel(const float *logits,
+                                                      const float *targets,
+                                                      float *losses,
+                                                      float *grad,
+                                                      const float *valid_count,
+                                                      const int vocab_size,
+                                                      const int ignore_index)
+{
+  const int pos=blockIdx.x;
+  const int tid=threadIdx.x;
+  const int target_id=static_cast<int>(targets[pos]);
+
+  const float *pos_logits=logits+pos*vocab_size;
+  float *pos_grad=grad+pos*vocab_size;
+
+  // Ignored position: zero loss and gradient
+  if(target_id==ignore_index)
+  {
+    if(tid==0)
+    {
+      losses[pos]=0.0f;
+    }
+    for(int v=tid;v<vocab_size;v+=blockDim.x)
+    {
+      pos_grad[v]=0.0f;
+    }
+    return;
+  }
+
+  // Read valid count from device memory and compute gradient scale
+  const float count=*valid_count;
+  float scale=0.0f;
+  if(count>=1.0f)
+  {
+    scale=1.0f/count;
+  }
+
+  // Pass 1: Find max logit (warp shuffle reduction)
+  float local_max=-1e30f;
+  for(int v=tid;v<vocab_size;v+=blockDim.x)
+  {
+    const float val=pos_logits[v];
+    if(val>local_max)
+    {
+      local_max=val;
+    }
+  }
+  local_max=warp_reduce_max(local_max);
+  __shared__ float ws_max[g_warp_size];
+  const int warp_id=tid/g_warp_size;
+  const int lane_id=tid%g_warp_size;
+  if(lane_id==0)
+  {
+    ws_max[warp_id]=local_max;
+  }
+  __syncthreads();
+  if(tid<g_warp_size)
+  {
+    const int num_warps=blockDim.x/g_warp_size;
+    float v=-1e30f;
+    if(tid<num_warps)
+    {
+      v=ws_max[tid];
+    }
+    v=warp_reduce_max(v);
+    ws_max[0]=v;
+  }
+  __syncthreads();
+  const float max_logit=ws_max[0];
+
+  // Pass 2: Compute sum of exp(logit - max) (warp shuffle reduction)
+  float local_sum=0.0f;
+  for(int v=tid;v<vocab_size;v+=blockDim.x)
+  {
+    local_sum+=expf(pos_logits[v]-max_logit);
+  }
+  local_sum=warp_reduce_sum(local_sum);
+  __shared__ float ws_sum[g_warp_size];
+  if(lane_id==0)
+  {
+    ws_sum[warp_id]=local_sum;
+  }
+  __syncthreads();
+  if(tid<g_warp_size)
+  {
+    const int num_warps=blockDim.x/g_warp_size;
+    float v=0.0f;
+    if(tid<num_warps)
+    {
+      v=ws_sum[tid];
+    }
+    v=warp_reduce_sum(v);
+    ws_sum[0]=v;
+  }
+  __syncthreads();
+  const float sum_exp=ws_sum[0];
+
+  // Write per-position loss (thread 0 only)
+  if(tid==0)
+  {
+    const float log_sum_exp=max_logit+logf(fmaxf(1.0f,sum_exp));
+    const float target_logit=pos_logits[target_id];
+    const float raw_loss=log_sum_exp-target_logit;
+    if(isnan(raw_loss)==true)
+    {
+      losses[pos]=raw_loss;
+    }
+    else
+    {
+      losses[pos]=fmaxf(0.0f,raw_loss);
+    }
+  }
+
+  // Pass 3: Compute scaled gradient = (softmax - one_hot) * scale
+  for(int v=tid;v<vocab_size;v+=blockDim.x)
+  {
+    float g=expf(pos_logits[v]-max_logit)/sum_exp;
+    if(v==target_id)
+    {
+      g-=1.0f;
+    }
+    pos_grad[v]=g*scale;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Sum per-position losses (excluding ignored). Writes to *output (pre-zeroed).
+//------------------------------------------------------------------------------
+__global__ void cross_entropy_sum_losses_kernel(const float *losses,
+                                                 const float *targets,
+                                                 float *output,
+                                                 const int n,
+                                                 const int ignore_index)
+{
+  const int tid=threadIdx.x;
+  const int idx=blockIdx.x*blockDim.x+tid;
+
+  float local_sum=0.0f;
+  if(idx<n)
+  {
+    const int target_id=static_cast<int>(targets[idx]);
+    if(target_id!=ignore_index)
+    {
+      local_sum=losses[idx];
+    }
+  }
+
+  local_sum=warp_reduce_sum(local_sum);
+
+  if((tid%g_warp_size)==0 && local_sum!=0.0f)
+  {
+    atomicAdd(output,local_sum);
+  }
+}
+
+//------------------------------------------------------------------------------
+// Fused cross-entropy launcher: count + fused loss/grad + sum losses.
+// All 3 kernels on same stream, no host sync between them.
+// result[0] = valid_count, result[1] = loss_sum (must be pre-zeroed).
+//------------------------------------------------------------------------------
+void launch_cross_entropy_fused(const float *logits,
+                                const float *targets,
+                                float *losses,
+                                float *grad,
+                                float *result,
+                                const int n,
+                                const int vocab_size,
+                                const int ignore_index,
+                                cudaStream_t stream)
+{
+  const int block_size=256;
+
+  // Kernel 1: count valid positions → result[0]
+  {
+    const int num_blocks=(n+block_size-1)/block_size;
+    cross_entropy_count_valid_kernel<<<num_blocks,block_size,0,stream>>>(
+      targets,&result[0],n,ignore_index);
+  }
+
+  // Kernel 2: fused forward+backward (reads result[0] for scale)
+  {
+    cross_entropy_fused_loss_grad_kernel<<<n,block_size,0,stream>>>(
+      logits,targets,losses,grad,&result[0],vocab_size,ignore_index);
+  }
+
+  // Kernel 3: sum per-position losses → result[1]
+  {
+    const int num_blocks=(n+block_size-1)/block_size;
+    cross_entropy_sum_losses_kernel<<<num_blocks,block_size,0,stream>>>(
+      losses,targets,&result[1],n,ignore_index);
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -3851,6 +4365,58 @@ void launch_sum_axis1(const float *input,
   const int block_size=256;
   const int num_blocks=(batch+block_size-1)/block_size;
   sum_axis1_kernel<<<num_blocks,block_size,0,stream>>>(input,output,batch,dim);
+}
+
+//------------------------------------------------------------------------------
+// Sum of Squares Kernel
+// Computes sum(x[i]^2) over all n elements.
+// Uses block-level reduction with atomicAdd to a single output float.
+// Caller must zero the output before launch.
+//------------------------------------------------------------------------------
+__global__ void sum_of_squares_kernel(const float *input,
+                                       float *output,
+                                       const int n)
+{
+  extern __shared__ float shared[];
+  const int tid=threadIdx.x;
+  const int idx=blockIdx.x*blockDim.x+tid;
+
+  float local_sum=0.0f;
+  if(idx<n)
+  {
+    const float val=input[idx];
+    if(isnan(val)==false && isinf(val)==false)
+    {
+      local_sum=val*val;
+    }
+  }
+  shared[tid]=local_sum;
+  __syncthreads();
+
+  for(int stride=blockDim.x/2;stride>0;stride>>=1)
+  {
+    if(tid<stride)
+    {
+      shared[tid]+=shared[tid+stride];
+    }
+    __syncthreads();
+  }
+
+  if(tid==0)
+  {
+    atomicAdd(output,shared[0]);
+  }
+}
+
+void launch_sum_of_squares(const float *input,
+                           float *output,
+                           const int n,
+                           cudaStream_t stream)
+{
+  const int block_size=256;
+  const int num_blocks=(n+block_size-1)/block_size;
+  sum_of_squares_kernel<<<num_blocks,block_size,
+    block_size*sizeof(float),stream>>>(input,output,n);
 }
 
 //------------------------------------------------------------------------------
@@ -4080,7 +4646,7 @@ __global__ void scatter_add_kernel(const float *values,
   {
     const int b=idx/k;
     const int target_idx=indices[idx];
-    if(target_idx>=0&&target_idx<dim)
+    if(target_idx>=0 && target_idx<dim)
     {
       atomicAdd(&output[b*dim+target_idx],values[idx]);
     }
@@ -4132,7 +4698,7 @@ __global__ void moe_dispatch_kernel(const float *input,
     const int expert_idx=static_cast<int>(expert_indices[token_idx*top_k+k_idx]);
     const int pos_in_expert=dispatch_map[token_idx*top_k+k_idx];
 
-    if(expert_idx>=0&&pos_in_expert>=0)
+    if(expert_idx>=0 && pos_in_expert>=0)
     {
       const int expert_start=expert_offsets[expert_idx];
       const int dest_idx=(expert_start+pos_in_expert)*dim+d;
@@ -4195,7 +4761,7 @@ __global__ void moe_combine_kernel(const float *expert_buffer,
       const float weight=expert_weights[token_idx*top_k+k];
       const int pos_in_expert=dispatch_map[token_idx*top_k+k];
 
-      if(expert_idx>=0&&pos_in_expert>=0)
+      if(expert_idx>=0 && pos_in_expert>=0)
       {
         const int expert_start=expert_offsets[expert_idx];
         const int src_idx=(expert_start+pos_in_expert)*dim+d;
@@ -4307,7 +4873,7 @@ __global__ void moe_topk_gating_kernel(const float *router_logits,
   if(tid==0)
   {
     float total_sum=0.0f;
-    for(int i=0;i<blockDim.x&&i<num_experts;++i)
+    for(int i=0;i<blockDim.x && i<num_experts;++i)
     {
       total_sum+=sum_shared[i];
     }
@@ -4346,7 +4912,7 @@ __global__ void moe_topk_gating_kernel(const float *router_logits,
           }
         }
 
-        if(already_selected==false&&probs_shared[e]>max_prob)
+        if(already_selected==false && probs_shared[e]>max_prob)
         {
           max_prob=probs_shared[e];
           max_idx=e;
@@ -4415,7 +4981,7 @@ __global__ void moe_count_per_expert_kernel(const float *expert_indices,
   for(int k=0;k<top_k;++k)
   {
     const int expert_idx=static_cast<int>(expert_indices[token_idx*top_k+k]);
-    if(expert_idx>=0&&expert_idx<num_experts)
+    if(expert_idx>=0 && expert_idx<num_experts)
     {
       const int old_count=atomicAdd(&expert_counts[expert_idx],1);
       // Capacity enforcement happens at dispatch time
@@ -4450,31 +5016,7 @@ void launch_moe_count_per_expert(const float *expert_indices,
 // References: https://arxiv.org/abs/2307.08691
 //------------------------------------------------------------------------------
 
-// Block sizes for FlashAttention - tuned for modern GPUs (RTX 5090)
-// These must fit in shared memory: 2*Br*D + 2*Bc*D + Br*Bc floats
-constexpr int FA_BR=64;   // Q block rows
-constexpr int FA_BC=64;   // K/V block rows
-constexpr int FA_D_MAX=128;  // Max head dimension supported
-
-// Warp reduction for max value
-__device__ __forceinline__ float warp_reduce_max(float val)
-{
-  for(int offset=16;offset>0;offset/=2)
-  {
-    val=fmaxf(val,__shfl_down_sync(0xffffffff,val,offset));
-  }
-  return val;
-}
-
-// Warp reduction for sum
-__device__ __forceinline__ float warp_reduce_sum(float val)
-{
-  for(int offset=16;offset>0;offset/=2)
-  {
-    val+=__shfl_down_sync(0xffffffff,val,offset);
-  }
-  return val;
-}
+// Legacy block sizes removed — forward uses g_fa_fwd_bc, backward uses g_fa_bwd_*
 
 // Block reduction for max (across all warps)
 __device__ __forceinline__ float block_reduce_max(float val,float *shared_mem,int tid,int block_size)
@@ -4540,100 +5082,618 @@ __device__ __forceinline__ float block_reduce_sum(float val,float *shared_mem,in
   return val;
 }
 
-// FlashAttention-2 Forward Kernel
-// Grid: (batch_heads, ceil(seq_len/Br))
-// Block: (Br) threads - each thread handles one row of Q block
-template<int D>
-__global__ void flash_attention_forward_kernel(const float * __restrict__ Q,
-                                                const float * __restrict__ K,
-                                                const float * __restrict__ V,
-                                                float * __restrict__ O,
-                                                float * __restrict__ L,
-                                                const int seq_len,
-                                                const float scale,
-                                                const int causal)
+//------------------------------------------------------------------------------
+// FlashAttention-2 Forward — TF32 Tensor Core Kernel (sm_80+)
+//
+// Uses nvcuda::wmma 16x16x8 TF32 tiles for the two matmuls per KV block:
+//   S = Q @ K^T  (scores)
+//   O += softmax(S) @ V  (output accumulation)
+//
+// Template: D=head_dim, BR=Q rows/block, BC=KV tile cols
+// Grid: (batch_heads, ceil(seq_len/BR))
+// Block: n_warps*32 where n_warps = (BR/16) * (BC/16) / tiles_per_warp_s
+//
+// Shared memory: Q_tile[BR*(D+2)] + KV_buf[BC*(D+2)] + S_tile[BR*(BC+2)]
+//                + row_max[BR] + row_sum[BR]  (padded strides for bank conflicts)
+// O accumulator and S scores live in wmma register fragments.
+// Softmax computed in-register with cross-warp reduce via S_tile[0..NW*16].
+//------------------------------------------------------------------------------
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// Only compile TC kernel for sm_80+
+#define CAIF_HAS_TC_FLASH 1
+#else
+#define CAIF_HAS_TC_FLASH 0
+#endif
+
+using namespace nvcuda;
+
+//------------------------------------------------------------------------------
+// Async copy helpers (cp.async, sm_80+) — global→shared bypassing L1
+//------------------------------------------------------------------------------
+__device__ __forceinline__ void cp_async_f4(void *dst_shared,
+                                            const void *src_global)
 {
-  // Batch-head index
+  const uint32_t dst=static_cast<uint32_t>(__cvta_generic_to_shared(dst_shared));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+               ::"r"(dst),"l"(src_global));
+}
+
+__device__ __forceinline__ void cp_async_f2(void *dst_shared,
+                                            const void *src_global)
+{
+  const uint32_t dst=static_cast<uint32_t>(__cvta_generic_to_shared(dst_shared));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n"
+               ::"r"(dst),"l"(src_global));
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+  asm volatile("cp.async.commit_group;\n");
+}
+
+__device__ __forceinline__ void cp_async_wait()
+{
+  asm volatile("cp.async.wait_group 0;\n");
+}
+
+template<int D,int BR,int BC,int NW>
+__global__ void flash_attention_forward_tc_kernel(const float *__restrict__ Q,
+                                                  const float *__restrict__ K,
+                                                  const float *__restrict__ V,
+                                                  float *__restrict__ O,
+                                                  float *__restrict__ L,
+                                                  const int seq_len,
+                                                  const float scale,
+                                                  const int causal)
+{
+#if CAIF_HAS_TC_FLASH
   const int bh=blockIdx.x;
-  // Q block index
   const int q_block_idx=blockIdx.y;
-  // Thread ID within block (corresponds to row within Q block)
   const int tid=threadIdx.x;
+  const int lane_id=tid%32;
+  const int warp_id=tid/32;
 
-  // Global row index for this thread's Q row
-  const int q_row=q_block_idx*FA_BR+tid;
+  constexpr int n_warps=NW;
+  constexpr int tiles_m=BR/16;
+  constexpr int tiles_n_s=BC/16;
+  constexpr int tiles_n_o=D/16;
+  constexpr int block_threads=n_warps*32;
 
-  // Early exit if this Q row is beyond sequence length
-  if(q_row>=seq_len)
-  {
-    return;
-  }
+  // Smem stride padding: +2 eliminates bank conflicts for wmma loads.
+  // stride % 32 == 2 → each of 16 rows within a wmma tile maps to a
+  // distinct pair of banks, giving zero conflicts on column-parallel access.
+  constexpr int d_pad=D+2;
+  constexpr int bc_pad=BC+2;
+  constexpr int d_f2=D/2;
+  constexpr int d_pad_f2=d_pad/2;
 
-  // Shared memory layout:
-  // [0..FA_BR*D): Q tile
-  // [FA_BR*D..FA_BR*D+FA_BC*D): K tile
-  // [FA_BR*D+FA_BC*D..FA_BR*D+2*FA_BC*D): V tile
-  // [FA_BR*D+2*FA_BC*D..): scratch for reductions
+  // Shared memory layout (O is in registers, not smem)
   extern __shared__ float smem[];
   float *Q_tile=smem;
-  float *K_tile=smem+FA_BR*D;
-  float *V_tile=smem+FA_BR*D+FA_BC*D;
+  float *KV_buf=Q_tile+BR*d_pad;
+  float *S_tile=KV_buf+BC*d_pad;
+  float *row_max_arr=S_tile+BR*bc_pad;
+  float *row_sum_arr=row_max_arr+BR;
 
-  // Pointers to this batch-head's Q, K, V, O
+  // Batch-head pointers
   const float *Q_bh=Q+bh*seq_len*D;
   const float *K_bh=K+bh*seq_len*D;
   const float *V_bh=V+bh*seq_len*D;
   float *O_bh=O+bh*seq_len*D;
   float *L_bh=L+bh*seq_len;
 
-  // Per-row accumulators (registers)
-  float m_i=-INFINITY;  // Running max
-  float l_i=0.0f;        // Running sum of exp
-  float o_i[FA_D_MAX];   // Running output accumulator
-  for(int d=0;d<D;++d)
+  const int q_start=q_block_idx*BR;
+
+  // Warp grouping for register-based softmax.
+  // Each M-tile group's warps collectively cover all N S-tiles, enabling
+  // in-register softmax with cross-warp reduce (no S_tile smem round-trip).
+  constexpr int warps_per_m=n_warps/tiles_m;
+  constexpr int s_tiles_pw=(tiles_n_s>=warps_per_m)*(tiles_n_s/warps_per_m);
+  constexpr int o_tiles_pw=(tiles_n_o>=warps_per_m)*(tiles_n_o/warps_per_m);
+  // Array size must be >=1 for CUDA; loops guard on tile count
+  constexpr int s_arr=s_tiles_pw+(!s_tiles_pw);
+  constexpr int o_arr=o_tiles_pw+(!o_tiles_pw);
+  const int m_idx=warp_id/warps_per_m;
+  const int group_warp=warp_id%warps_per_m;
+  const int n_start_s=group_warp*s_tiles_pw;
+  const int n_start_o=group_warp*o_tiles_pw;
+  const int group_base=m_idx*warps_per_m;
+
+  // Persistent O accumulators in wmma registers
+  wmma::fragment<wmma::accumulator,16,16,8,float> o_frags[o_arr];
+  for(int t=0;t<o_tiles_pw;++t)
   {
-    o_i[d]=0.0f;
+    wmma::fill_fragment(o_frags[t],0.0f);
   }
 
-  // Load Q row for this thread into shared memory
-  // All threads in block load their Q rows cooperatively
-  for(int d=0;d<D;++d)
+  // Cooperative load Q_tile[BR, d_pad] from global memory (padded stride)
+  const int valid_q_rows=min(BR,seq_len-q_start);
   {
-    if(q_row<seq_len)
+    const int valid_q_f2=max(valid_q_rows,0)*d_f2;
+    constexpr int total_q_f2=BR*d_f2;
+    const float2 *Q_src2=reinterpret_cast<const float2 *>(Q_bh+q_start*D);
+    float2 *Q_dst2=reinterpret_cast<float2 *>(Q_tile);
+    for(int i=tid;i<valid_q_f2;i+=block_threads)
     {
-      Q_tile[tid*D+d]=Q_bh[q_row*D+d];
+      const int row=i/d_f2;
+      const int f2c=i-row*d_f2;
+      Q_dst2[row*d_pad_f2+f2c]=Q_src2[i];
     }
-    else
+    const float2 zero2=make_float2(0.0f,0.0f);
+    for(int i=valid_q_f2+tid;i<total_q_f2;i+=block_threads)
     {
-      Q_tile[tid*D+d]=0.0f;
+      const int row=i/d_f2;
+      const int f2c=i-row*d_f2;
+      Q_dst2[row*d_pad_f2+f2c]=zero2;
     }
+  }
+
+  // Init row_max/row_sum
+  for(int i=tid;i<BR;i+=block_threads)
+  {
+    row_max_arr[i]=-INFINITY;
+    row_sum_arr[i]=0.0f;
   }
   __syncthreads();
 
-  // Number of K/V blocks to process
-  int num_kv_blocks=(seq_len+FA_BC-1)/FA_BC;
-
-  // For causal: only process K/V blocks up to and including the block containing q_row
-  if(causal)
+  // Number of KV blocks
+  int num_kv_blocks=(seq_len+BC-1)/BC;
+  if(causal==1)
   {
-    num_kv_blocks=min(num_kv_blocks,(q_row/FA_BC)+1);
+    int max_q=q_start+BR-1;
+    if(max_q>=seq_len)
+    {
+      max_q=seq_len-1;
+    }
+    num_kv_blocks=min(num_kv_blocks,(max_q/BC)+1);
   }
 
-  // Loop over K/V blocks
+  constexpr int kv_f2=BC*d_f2;
+
+  // Pipeline: prefetch K[0] (float2, padded stride)
+  float2 *KV_dst2=reinterpret_cast<float2 *>(KV_buf);
+  if(num_kv_blocks>0)
+  {
+    const int kv0_valid=min(BC,seq_len)*d_f2;
+    const float2 *K0_src2=reinterpret_cast<const float2 *>(K_bh);
+    for(int i=tid;i<kv0_valid;i+=block_threads)
+    {
+      const int row=i/d_f2;
+      const int f2c=i-row*d_f2;
+      cp_async_f2(&KV_dst2[row*d_pad_f2+f2c],&K0_src2[i]);
+    }
+    const float2 zero2=make_float2(0.0f,0.0f);
+    for(int i=kv0_valid+tid;i<kv_f2;i+=block_threads)
+    {
+      const int row=i/d_f2;
+      const int f2c=i-row*d_f2;
+      KV_dst2[row*d_pad_f2+f2c]=zero2;
+    }
+    cp_async_commit();
+  }
+
   for(int kv_block=0;kv_block<num_kv_blocks;++kv_block)
   {
-    // Cooperatively load K and V tiles into shared memory
-    // Each thread loads multiple elements
-    const int kv_start=kv_block*FA_BC;
-    const int elements_per_tile=FA_BC*D;
-    const int threads_in_block=FA_BR;
+    const int kv_start=kv_block*BC;
+    const int valid_kv_rows=min(BC,seq_len-kv_start);
+    const int valid_kv_f2=valid_kv_rows*d_f2;
 
-    for(int i=tid;i<elements_per_tile;i+=threads_in_block)
+    // PHASE 1: Wait for K, compute S = Q @ K^T in wmma registers
+    cp_async_wait();
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator,16,16,8,float> s_accs[s_arr];
+    for(int t=0;t<s_tiles_pw;++t)
+    {
+      const int n=n_start_s+t;
+      wmma::fill_fragment(s_accs[t],0.0f);
+      for(int k=0;k<D/8;++k)
+      {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> k_frag;
+        wmma::load_matrix_sync(q_frag,&Q_tile[m_idx*16*d_pad+k*8],d_pad);
+        wmma::load_matrix_sync(k_frag,&KV_buf[n*16*d_pad+k*8],d_pad);
+        wmma::mma_sync(s_accs[t],q_frag,k_frag,s_accs[t]);
+      }
+      for(int i=0;i<s_accs[t].num_elements;++i)
+      {
+        s_accs[t].x[i]*=scale;
+      }
+    }
+
+    // Sync: all warps done reading KV_buf before V overwrites it
+    __syncthreads();
+
+    // Async V load into KV_buf (overlapped with softmax, float2 padded stride)
+    {
+      const float2 *V_src2=reinterpret_cast<const float2 *>(V_bh+kv_start*D);
+      for(int i=tid;i<valid_kv_f2;i+=block_threads)
+      {
+        const int row=i/d_f2;
+        const int f2c=i-row*d_f2;
+        cp_async_f2(&KV_dst2[row*d_pad_f2+f2c],&V_src2[i]);
+      }
+      const float2 zero2=make_float2(0.0f,0.0f);
+      for(int i=valid_kv_f2+tid;i<kv_f2;i+=block_threads)
+      {
+        const int row=i/d_f2;
+        const int f2c=i-row*d_f2;
+        KV_dst2[row*d_pad_f2+f2c]=zero2;
+      }
+      cp_async_commit();
+    }
+
+    // PHASE 2: Register-based online softmax on s_accs
+    // Fragment layout (stable sm_80-sm_120):
+    //   elements {0,1,4,5} → local_row = lane_id/4       (row_lo)
+    //   elements {2,3,6,7} → local_row = lane_id/4 + 8   (row_hi)
+    //   elem col: 0→(lane_id%4)*2, 1→+1, 4→+8, 5→+9 (same for 2/3/6/7)
+    {
+      const int row_lo=m_idx*16+(lane_id/4);
+      const int row_hi=m_idx*16+(lane_id/4)+8;
+      const int global_q_lo=q_start+row_lo;
+      const int global_q_hi=q_start+row_hi;
+
+      // Apply causal + boundary masks in registers
+      for(int t=0;t<s_tiles_pw;++t)
+      {
+        const int n=n_start_s+t;
+        const int bc0=kv_start+n*16+(lane_id%4)*2;
+        const int bc1=bc0+1;
+        const int bc2=kv_start+n*16+(lane_id%4)*2+8;
+        const int bc3=bc2+1;
+
+        if(causal==1)
+        {
+          if(bc0>global_q_lo) { s_accs[t].x[0]=-INFINITY; }
+          if(bc1>global_q_lo) { s_accs[t].x[1]=-INFINITY; }
+          if(bc0>global_q_hi) { s_accs[t].x[2]=-INFINITY; }
+          if(bc1>global_q_hi) { s_accs[t].x[3]=-INFINITY; }
+          if(bc2>global_q_lo) { s_accs[t].x[4]=-INFINITY; }
+          if(bc3>global_q_lo) { s_accs[t].x[5]=-INFINITY; }
+          if(bc2>global_q_hi) { s_accs[t].x[6]=-INFINITY; }
+          if(bc3>global_q_hi) { s_accs[t].x[7]=-INFINITY; }
+        }
+        if(global_q_lo>=seq_len)
+        {
+          s_accs[t].x[0]=-INFINITY;
+          s_accs[t].x[1]=-INFINITY;
+          s_accs[t].x[4]=-INFINITY;
+          s_accs[t].x[5]=-INFINITY;
+        }
+        if(global_q_hi>=seq_len)
+        {
+          s_accs[t].x[2]=-INFINITY;
+          s_accs[t].x[3]=-INFINITY;
+          s_accs[t].x[6]=-INFINITY;
+          s_accs[t].x[7]=-INFINITY;
+        }
+      }
+
+      // Local max across this warp's S tiles
+      float max_lo=-INFINITY;
+      float max_hi=-INFINITY;
+      for(int t=0;t<s_tiles_pw;++t)
+      {
+        max_lo=fmaxf(max_lo,fmaxf(s_accs[t].x[0],s_accs[t].x[1]));
+        max_lo=fmaxf(max_lo,fmaxf(s_accs[t].x[4],s_accs[t].x[5]));
+        max_hi=fmaxf(max_hi,fmaxf(s_accs[t].x[2],s_accs[t].x[3]));
+        max_hi=fmaxf(max_hi,fmaxf(s_accs[t].x[6],s_accs[t].x[7]));
+      }
+
+      // Reduce max within 4-thread row group (lane_id%4 groups)
+      max_lo=fmaxf(max_lo,__shfl_xor_sync(0xffffffff,max_lo,1));
+      max_lo=fmaxf(max_lo,__shfl_xor_sync(0xffffffff,max_lo,2));
+      max_hi=fmaxf(max_hi,__shfl_xor_sync(0xffffffff,max_hi,1));
+      max_hi=fmaxf(max_hi,__shfl_xor_sync(0xffffffff,max_hi,2));
+
+      // Cross-warp max reduce via S_tile[0..NW*16] temporary
+      float *reduce_buf=S_tile;
+      if(lane_id%4==0)
+      {
+        reduce_buf[warp_id*16+(lane_id/4)]=max_lo;
+        reduce_buf[warp_id*16+(lane_id/4)+8]=max_hi;
+      }
+      __syncthreads();
+
+      float full_max_lo=-INFINITY;
+      float full_max_hi=-INFINITY;
+      for(int w=group_base;w<group_base+warps_per_m;++w)
+      {
+        full_max_lo=fmaxf(full_max_lo,reduce_buf[w*16+(lane_id/4)]);
+        full_max_hi=fmaxf(full_max_hi,reduce_buf[w*16+(lane_id/4)+8]);
+      }
+
+      // Online correction factor
+      const float old_max_lo=row_max_arr[row_lo];
+      const float old_max_hi=row_max_arr[row_hi];
+      const float new_max_lo=fmaxf(old_max_lo,full_max_lo);
+      const float new_max_hi=fmaxf(old_max_hi,full_max_hi);
+      const float corr_lo=__expf(old_max_lo-new_max_lo);
+      const float corr_hi=__expf(old_max_hi-new_max_hi);
+
+      // Compute exp(S - new_max) in place, accumulate local sum
+      float sum_lo=0.0f;
+      float sum_hi=0.0f;
+      for(int t=0;t<s_tiles_pw;++t)
+      {
+        s_accs[t].x[0]=__expf(s_accs[t].x[0]-new_max_lo);
+        sum_lo+=s_accs[t].x[0];
+        s_accs[t].x[1]=__expf(s_accs[t].x[1]-new_max_lo);
+        sum_lo+=s_accs[t].x[1];
+        s_accs[t].x[4]=__expf(s_accs[t].x[4]-new_max_lo);
+        sum_lo+=s_accs[t].x[4];
+        s_accs[t].x[5]=__expf(s_accs[t].x[5]-new_max_lo);
+        sum_lo+=s_accs[t].x[5];
+        s_accs[t].x[2]=__expf(s_accs[t].x[2]-new_max_hi);
+        sum_hi+=s_accs[t].x[2];
+        s_accs[t].x[3]=__expf(s_accs[t].x[3]-new_max_hi);
+        sum_hi+=s_accs[t].x[3];
+        s_accs[t].x[6]=__expf(s_accs[t].x[6]-new_max_hi);
+        sum_hi+=s_accs[t].x[6];
+        s_accs[t].x[7]=__expf(s_accs[t].x[7]-new_max_hi);
+        sum_hi+=s_accs[t].x[7];
+      }
+
+      // Reduce sum within 4-thread row group
+      sum_lo+=__shfl_xor_sync(0xffffffff,sum_lo,1);
+      sum_lo+=__shfl_xor_sync(0xffffffff,sum_lo,2);
+      sum_hi+=__shfl_xor_sync(0xffffffff,sum_hi,1);
+      sum_hi+=__shfl_xor_sync(0xffffffff,sum_hi,2);
+
+      // Cross-warp sum reduce
+      if(lane_id%4==0)
+      {
+        reduce_buf[warp_id*16+(lane_id/4)]=sum_lo;
+        reduce_buf[warp_id*16+(lane_id/4)+8]=sum_hi;
+      }
+      __syncthreads();
+
+      float full_sum_lo=0.0f;
+      float full_sum_hi=0.0f;
+      for(int w=group_base;w<group_base+warps_per_m;++w)
+      {
+        full_sum_lo+=reduce_buf[w*16+(lane_id/4)];
+        full_sum_hi+=reduce_buf[w*16+(lane_id/4)+8];
+      }
+
+      // Update row state (one warp per group writes)
+      if(group_warp==0 && lane_id%4==0)
+      {
+        row_sum_arr[row_lo]=corr_lo*row_sum_arr[row_lo]+full_sum_lo;
+        row_sum_arr[row_hi]=corr_hi*row_sum_arr[row_hi]+full_sum_hi;
+        row_max_arr[row_lo]=new_max_lo;
+        row_max_arr[row_hi]=new_max_hi;
+      }
+
+      // Rescale O fragments by correction (all O tiles share this warp's m_idx)
+      for(int t=0;t<o_tiles_pw;++t)
+      {
+        o_frags[t].x[0]*=corr_lo;
+        o_frags[t].x[1]*=corr_lo;
+        o_frags[t].x[2]*=corr_hi;
+        o_frags[t].x[3]*=corr_hi;
+        o_frags[t].x[4]*=corr_lo;
+        o_frags[t].x[5]*=corr_lo;
+        o_frags[t].x[6]*=corr_hi;
+        o_frags[t].x[7]*=corr_hi;
+      }
+    }
+
+    // Store exp(S) to S_tile for Phase 3 (single write, padded stride)
+    for(int t=0;t<s_tiles_pw;++t)
+    {
+      const int n=n_start_s+t;
+      wmma::store_matrix_sync(
+        &S_tile[m_idx*16*bc_pad+n*16],s_accs[t],bc_pad,wmma::mem_row_major);
+    }
+
+    // Wait for V + ensure S_tile writes visible
+    cp_async_wait();
+    __syncthreads();
+
+    // PHASE 3: Accumulate O += softmax(S) @ V using tensor cores (padded strides)
+    for(int t=0;t<o_tiles_pw;++t)
+    {
+      const int n=n_start_o+t;
+      for(int k=0;k<BC/8;++k)
+      {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> s_frag;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> v_frag;
+        wmma::load_matrix_sync(s_frag,&S_tile[m_idx*16*bc_pad+k*8],bc_pad);
+        wmma::load_matrix_sync(v_frag,&KV_buf[k*8*d_pad+n*16],d_pad);
+        wmma::mma_sync(o_frags[t],s_frag,v_frag,o_frags[t]);
+      }
+    }
+    __syncthreads();
+
+    // Pipeline: prefetch K[next] into KV_buf (float2 padded stride)
+    if(kv_block+1<num_kv_blocks)
+    {
+      const int next_start=(kv_block+1)*BC;
+      const int next_valid=min(BC,seq_len-next_start)*d_f2;
+      const float2 *K_next2=reinterpret_cast<const float2 *>(K_bh+next_start*D);
+      for(int i=tid;i<next_valid;i+=block_threads)
+      {
+        const int row=i/d_f2;
+        const int f2c=i-row*d_f2;
+        cp_async_f2(&KV_dst2[row*d_pad_f2+f2c],&K_next2[i]);
+      }
+      const float2 zero2=make_float2(0.0f,0.0f);
+      for(int i=next_valid+tid;i<kv_f2;i+=block_threads)
+      {
+        const int row=i/d_f2;
+        const int f2c=i-row*d_f2;
+        KV_dst2[row*d_pad_f2+f2c]=zero2;
+      }
+      cp_async_commit();
+    }
+  }
+
+  // Final: store O fragments to smem (reuse Q_tile, padded stride), normalize, write
+  __syncthreads();
+  float *O_smem=Q_tile;
+  for(int t=0;t<o_tiles_pw;++t)
+  {
+    const int n=n_start_o+t;
+    wmma::store_matrix_sync(&O_smem[m_idx*16*d_pad+n*16],o_frags[t],d_pad,wmma::mem_row_major);
+  }
+  __syncthreads();
+
+  for(int i=tid;i<BR*D;i+=block_threads)
+  {
+    const int row=i/D;
+    const int col=i-row*D;
+    const int global_row=q_start+row;
+    if(global_row<seq_len)
+    {
+      float inv_l=0.0f;
+      if(row_sum_arr[row]>0.0f)
+      {
+        inv_l=1.0f/row_sum_arr[row];
+      }
+      O_bh[global_row*D+col]=O_smem[row*d_pad+col]*inv_l;
+    }
+  }
+
+  // Write logsumexp (one per Q row)
+  for(int r=tid;r<BR;r+=block_threads)
+  {
+    const int global_row=q_start+r;
+    if(global_row<seq_len)
+    {
+      L_bh[global_row]=row_max_arr[r]+logf(row_sum_arr[r]+1e-10f);
+    }
+  }
+#endif  // CAIF_HAS_TC_FLASH
+}
+
+template<int D,int BR,int BC,int NW>
+static void launch_fa_fwd_tc(const float *Q,
+                             const float *K,
+                             const float *V,
+                             float *O,
+                             float *L,
+                             const int batch_heads,
+                             const int seq_len,
+                             const float scale,
+                             const int causal,
+                             cudaStream_t stream)
+{
+  const int num_q_blocks=(seq_len+BR-1)/BR;
+  dim3 grid(batch_heads,num_q_blocks);
+  dim3 block(NW*32);
+  constexpr size_t smem_size=(BR*(D+2)+BC*(D+2)+BR*(BC+2)+2*BR)*sizeof(float);
+
+  if(smem_size>49152)
+  {
+    cudaFuncSetAttribute(
+      (void *)flash_attention_forward_tc_kernel<D,BR,BC,NW>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_size));
+  }
+  flash_attention_forward_tc_kernel<D,BR,BC,NW>
+    <<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+}
+
+//------------------------------------------------------------------------------
+// FlashAttention-2 Forward Kernel — Warp-Per-Row (Memory-Efficient Fallback)
+//
+// Each warp (32 threads) processes one Q row. Lanes parallelize across
+// head_dim D. BR warps per block = BR Q rows per block.
+//
+// Grid: (batch_heads, ceil(seq_len / BR))
+// Block: (BR * 32) threads
+//
+// Template: D = head_dim, BR = Q rows per block
+// KV tile size is g_fa_fwd_bc (constexpr below).
+//
+// Q lives in registers (no Q tile in shared memory).
+// Two-pass score computation eliminates S_local register array:
+//   Pass 1: dot products via warp reduce, find row_max
+//   Pass 2: recompute dots, compute exp, accumulate V
+constexpr int g_fa_fwd_bc=64;  // K/V block size for forward kernel
+
+template<int D,int BR>
+__global__ void flash_attention_forward_kernel(const float *__restrict__ Q,
+                                               const float *__restrict__ K,
+                                               const float *__restrict__ V,
+                                               float *__restrict__ O,
+                                               float *__restrict__ L,
+                                               const int seq_len,
+                                               const float scale,
+                                               const int causal)
+{
+  const int bh=blockIdx.x;
+  const int q_block_idx=blockIdx.y;
+  const int tid=threadIdx.x;
+  const int warp_id=tid/32;
+  const int lane_id=tid%32;
+
+  const int q_row=q_block_idx*BR+warp_id;
+  const bool q_valid=(q_row<seq_len);
+
+  // Shared memory: K tile + V tile (Q is in registers)
+  extern __shared__ float smem[];
+  float *K_tile=smem;
+  float *V_tile=smem+g_fa_fwd_bc*D;
+
+  // Batch-head pointers
+  const float *Q_bh=Q+bh*seq_len*D;
+  const float *K_bh=K+bh*seq_len*D;
+  const float *V_bh=V+bh*seq_len*D;
+  float *O_bh=O+bh*seq_len*D;
+  float *L_bh=L+bh*seq_len;
+
+  // Load Q row into registers — each lane holds ceil(D/32) elements
+  constexpr int elems=(D+31)/32;
+  float q_reg[elems];
+  for(int dd=lane_id,e=0;dd<D;dd+=32,++e)
+  {
+    if(q_valid==true)
+    {
+      q_reg[e]=Q_bh[q_row*D+dd];
+    }
+    else
+    {
+      q_reg[e]=0.0f;
+    }
+  }
+
+  // Output accumulators in registers
+  float m_i=-INFINITY;
+  float l_i=0.0f;
+  float o_reg[elems];
+  for(int e=0;e<elems;++e)
+  {
+    o_reg[e]=0.0f;
+  }
+
+  // Number of KV blocks — uniform across block for cooperative loads
+  int num_kv_blocks=(seq_len+g_fa_fwd_bc-1)/g_fa_fwd_bc;
+  if(causal==1)
+  {
+    int max_q=q_block_idx*BR+BR-1;
+    if(max_q>=seq_len)
+    {
+      max_q=seq_len-1;
+    }
+    num_kv_blocks=min(num_kv_blocks,(max_q/g_fa_fwd_bc)+1);
+  }
+
+  const int block_threads=BR*32;
+
+  for(int kv_block=0;kv_block<num_kv_blocks;++kv_block)
+  {
+    const int kv_start=kv_block*g_fa_fwd_bc;
+
+    // Cooperative K/V tile load — all threads in block participate
+    const int tile_elems=g_fa_fwd_bc*D;
+    for(int i=tid;i<tile_elems;i+=block_threads)
     {
       const int row=i/D;
       const int col=i%D;
       const int global_row=kv_start+row;
-
       if(global_row<seq_len)
       {
         K_tile[row*D+col]=K_bh[global_row*D+col];
@@ -4647,105 +5707,294 @@ __global__ void flash_attention_forward_kernel(const float * __restrict__ Q,
     }
     __syncthreads();
 
-    // Compute S[tid, :] = Q[tid, :] @ K[:, :]^T * scale
-    // This is a row of the attention scores for this Q row
-    float S_row[FA_BC];
+    // Single pass: compute scores, find max, then exp + accumulate V
+    float s_local[g_fa_fwd_bc];
     float row_max=-INFINITY;
+    int num_valid=0;
 
-    for(int j=0;j<FA_BC;++j)
+    for(int j=0;j<g_fa_fwd_bc;++j)
     {
       const int k_row=kv_start+j;
-
-      // Apply causal mask: if k_row > q_row, mask with -inf
-      if(causal&&k_row>q_row)
+      if(k_row>=seq_len || (causal==1 && k_row>q_row))
       {
-        S_row[j]=-INFINITY;
-      }
-      else if(k_row>=seq_len)
-      {
-        S_row[j]=-INFINITY;
-      }
-      else
-      {
-        // Dot product of Q[tid, :] and K[j, :]
-        float dot=0.0f;
-        for(int d=0;d<D;++d)
-        {
-          dot+=Q_tile[tid*D+d]*K_tile[j*D+d];
-        }
-        S_row[j]=dot*scale;
+        break;
       }
 
-      if(S_row[j]>row_max)
+      float dot=0.0f;
+      for(int dd=lane_id,e=0;dd<D;dd+=32,++e)
       {
-        row_max=S_row[j];
+        dot+=q_reg[e]*K_tile[j*D+dd];
       }
+      // Warp reduce sum
+      for(int offset=16;offset>0;offset/=2)
+      {
+        dot+=__shfl_down_sync(0xffffffff,dot,offset);
+      }
+      // Broadcast from lane 0
+      dot=__shfl_sync(0xffffffff,dot,0);
+      s_local[j]=dot*scale;
+      if(s_local[j]>row_max)
+      {
+        row_max=s_local[j];
+      }
+      num_valid=j+1;
     }
 
-    // Online softmax update
-    // m_new = max(m_i, row_max)
+    // Online softmax rescale
     const float m_new=fmaxf(m_i,row_max);
-
-    // Compute sum of exp(S_row - row_max) for this block
-    float block_sum=0.0f;
-    for(int j=0;j<FA_BC;++j)
-    {
-      if(S_row[j]>-INFINITY)
-      {
-        block_sum+=expf(S_row[j]-m_new);
-      }
-    }
-
-    // Rescale previous accumulator and add new contribution
-    // l_new = exp(m_i - m_new) * l_i + sum(exp(S_row - m_new))
     const float scale_old=expf(m_i-m_new);
-    const float l_new=scale_old*l_i+block_sum;
-
-    // Update output accumulator
-    // o_new = (scale_old * l_i * o_i + sum(exp(S_row - m_new) * V)) / l_new
-    // But we defer the division until the end
-
-    // Scale old output
-    for(int d=0;d<D;++d)
+    for(int e=0;e<elems;++e)
     {
-      o_i[d]*=scale_old;
+      o_reg[e]*=scale_old;
     }
 
-    // Add new contribution: sum over j of exp(S_row[j] - m_new) * V[j, :]
-    for(int j=0;j<FA_BC;++j)
+    // Exp + V accumulation from stored scores
+    float block_sum=0.0f;
+    for(int j=0;j<num_valid;++j)
     {
-      if(S_row[j]>-INFINITY)
+      const float p=expf(s_local[j]-m_new);
+      block_sum+=p;
+      for(int dd=lane_id,e=0;dd<D;dd+=32,++e)
       {
-        const float p=expf(S_row[j]-m_new);
-        for(int d=0;d<D;++d)
-        {
-          o_i[d]+=p*V_tile[j*D+d];
-        }
+        o_reg[e]+=p*V_tile[j*D+dd];
       }
     }
 
-    // Update running state
+    l_i=scale_old*l_i+block_sum;
     m_i=m_new;
-    l_i=l_new;
-
     __syncthreads();
   }
 
-  // Final normalization and write output
-  if(q_row<seq_len)
+  // Final normalization and output
+  if(q_valid==true)
   {
     float inv_l=0.0f;
     if(l_i>0.0f)
     {
       inv_l=1.0f/l_i;
     }
-    for(int d=0;d<D;++d)
+    for(int dd=lane_id,e=0;dd<D;dd+=32,++e)
     {
-      O_bh[q_row*D+d]=o_i[d]*inv_l;
+      O_bh[q_row*D+dd]=o_reg[e]*inv_l;
     }
+    // Only lane 0 writes logsumexp (one value per Q row)
+    if(lane_id==0)
+    {
+      L_bh[q_row]=m_i+logf(l_i+1e-10f);
+    }
+  }
+}
 
-    // Store logsumexp for backward pass: L = m + log(l)
-    L_bh[q_row]=m_i+logf(l_i+1e-10f);
+// Helper: launch a specific <D,BR> instantiation with opt-in shared memory
+template<int D,int BR>
+static void launch_fa_fwd(const float *Q,
+                          const float *K,
+                          const float *V,
+                          float *O,
+                          float *L,
+                          const int batch_heads,
+                          const int seq_len,
+                          const float scale,
+                          const int causal,
+                          cudaStream_t stream)
+{
+  const int num_q_blocks=(seq_len+BR-1)/BR;
+  dim3 grid(batch_heads,num_q_blocks);
+  dim3 block(BR*32);
+  const size_t smem_size=2*g_fa_fwd_bc*D*sizeof(float);
+
+  if(smem_size>49152)
+  {
+    cudaFuncSetAttribute(
+      (void *)flash_attention_forward_kernel<D,BR>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_size));
+  }
+  flash_attention_forward_kernel<D,BR>
+    <<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+}
+
+//------------------------------------------------------------------------------
+// Adaptive TC/scalar dispatch for flash attention forward.
+// Computes smem from formula for each (BR,BC) candidate and picks the
+// largest BC that fits in the GPU's optin shared memory limit.
+//------------------------------------------------------------------------------
+static constexpr size_t fa_tc_smem(int d,int br,int bc)
+{
+  // Padded strides (+2) to eliminate smem bank conflicts for wmma loads.
+  // Q_tile[BR*(D+2)] + KV_buf[BC*(D+2)] + S_tile[BR*(BC+2)] + row_max/sum[2*BR]
+  const int d_pad=d+2;
+  const int bc_pad=bc+2;
+  return static_cast<size_t>(br*d_pad+bc*d_pad+br*bc_pad+2*br)*sizeof(float);
+}
+
+static constexpr size_t fa_scalar_smem(int d)
+{
+  return static_cast<size_t>(2*g_fa_fwd_bc*d)*sizeof(float);
+}
+
+// Compute optimal number of warps for a given TC tile configuration.
+// max_tiles: largest of S-tiles and O-tiles that warps must cover.
+// blocks_from_smem: how many blocks the SM can hold from shared memory alone.
+// If 2+ blocks fit, halve warps per block to double occupancy.
+static int fa_tc_optimal_nw(int max_tiles,
+                            int blocks_from_smem,
+                            int tiles_m,
+                            int tiles_n_s,
+                            int tiles_n_o)
+{
+  int nw;
+  if(blocks_from_smem>=2 && max_tiles>=4)
+  {
+    nw=max_tiles/2;
+    if(nw<2)
+    {
+      nw=2;
+    }
+  }
+  else if(max_tiles>8)
+  {
+    nw=8;
+  }
+  else if(max_tiles<2)
+  {
+    nw=2;
+  }
+  else
+  {
+    nw=max_tiles;
+  }
+
+  // Ensure register softmax constraints:
+  // nw % tiles_m == 0, tiles_n_s and tiles_n_o divisible by warps_per_m
+  while(nw>2)
+  {
+    if(nw%tiles_m==0)
+    {
+      const int wpm=nw/tiles_m;
+      if(tiles_n_s%wpm==0 && tiles_n_o%wpm==0)
+      {
+        break;
+      }
+    }
+    nw/=2;
+  }
+
+  return nw;
+}
+
+// Dispatch helper that selects NW from the computed optimal value.
+// Instantiates NW=4 and NW=8; runtime picks the closer one.
+template<int D,int BR,int BC>
+static void dispatch_fa_fwd_tc_nw(const float *Q,
+                                  const float *K,
+                                  const float *V,
+                                  float *O,
+                                  float *L,
+                                  const int batch_heads,
+                                  const int seq_len,
+                                  const float scale,
+                                  const int causal,
+                                  cudaStream_t stream,
+                                  const int nw)
+{
+  if(nw<=2)
+  {
+    launch_fa_fwd_tc<D,BR,BC,2>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
+  }
+  else if(nw<=4)
+  {
+    launch_fa_fwd_tc<D,BR,BC,4>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
+  }
+  else
+  {
+    launch_fa_fwd_tc<D,BR,BC,8>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
+  }
+}
+
+template<int D>
+static void dispatch_fa_fwd_tc(const float *Q,
+                               const float *K,
+                               const float *V,
+                               float *O,
+                               float *L,
+                               const int batch_heads,
+                               const int seq_len,
+                               const float scale,
+                               const int causal,
+                               cudaStream_t stream,
+                               const int cc_major,
+                               const size_t smem_limit,
+                               const size_t smem_per_sm,
+                               const int max_threads)
+{
+  // TC path (sm_80+): try largest BC first, then largest BR.
+  // For each candidate, compute smem and optimal NW from GPU properties.
+  if(cc_major>=8)
+  {
+    // Candidate tile sizes in priority order (largest BC first)
+    constexpr int br_opts[]={32,16,32,16};
+    constexpr int bc_opts[]={128,128,64,64};
+
+    for(int c=0;c<4;++c)
+    {
+      const int br=br_opts[c];
+      const int bc=bc_opts[c];
+      const size_t smem=fa_tc_smem(D,br,bc);
+      if(smem>smem_limit)
+      {
+        continue;
+      }
+
+      const int tiles_s=(br/16)*(bc/16);
+      const int tiles_o=(br/16)*(D/16);
+      int max_tiles=tiles_s;
+      if(tiles_o>tiles_s)
+      {
+        max_tiles=tiles_o;
+      }
+      const int blocks_from_smem=static_cast<int>(smem_per_sm/smem);
+      const int tiles_m=br/16;
+      const int tiles_n_s=bc/16;
+      const int tiles_n_o=D/16;
+      const int nw=fa_tc_optimal_nw(max_tiles,blocks_from_smem,tiles_m,tiles_n_s,tiles_n_o);
+
+      // Dispatch to the matching (BR,BC) template with computed NW
+      if(br==32 && bc==128)
+      {
+        dispatch_fa_fwd_tc_nw<D,32,128>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,nw);
+        return;
+      }
+      if(br==16 && bc==128)
+      {
+        dispatch_fa_fwd_tc_nw<D,16,128>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,nw);
+        return;
+      }
+      if(br==32 && bc==64)
+      {
+        dispatch_fa_fwd_tc_nw<D,32,64>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,nw);
+        return;
+      }
+      if(br==16 && bc==64)
+      {
+        dispatch_fa_fwd_tc_nw<D,16,64>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,nw);
+        return;
+      }
+    }
+  }
+
+  // Scalar warp-per-row fallback (all architectures)
+  if(fa_scalar_smem(D)<=smem_limit && max_threads>=256)
+  {
+    launch_fa_fwd<D,8>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
+  }
+  else if(fa_scalar_smem(D)<=smem_limit && max_threads>=128)
+  {
+    launch_fa_fwd<D,4>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
+  }
+  else
+  {
+    launch_fa_fwd<D,2>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream);
   }
 }
 
@@ -4754,6 +6003,7 @@ extern "C"
 {
 
 // Launch wrapper for FlashAttention forward
+// Queries GPU shared memory limit to select optimal tiling
 void launch_flash_attention_forward(const float *Q,
                                     const float *K,
                                     const float *V,
@@ -4766,44 +6016,49 @@ void launch_flash_attention_forward(const float *Q,
                                     const int causal,
                                     cudaStream_t stream)
 {
-  // Grid: (batch_heads, num_q_blocks)
-  const int num_q_blocks=(seq_len+FA_BR-1)/FA_BR;
-  dim3 grid(batch_heads,num_q_blocks);
-  dim3 block(FA_BR);
+  // Query GPU properties for adaptive kernel selection
+  int device_id=0;
+  cudaGetDevice(&device_id);
+  int max_smem_optin=49152;
+  cudaDeviceGetAttribute(&max_smem_optin,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                         device_id);
+  int smem_per_sm_int=49152;
+  cudaDeviceGetAttribute(&smem_per_sm_int,
+                         cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                         device_id);
+  int max_threads=1024;
+  cudaDeviceGetAttribute(&max_threads,
+                         cudaDevAttrMaxThreadsPerBlock,
+                         device_id);
+  int cc_major=0;
+  cudaDeviceGetAttribute(&cc_major,
+                         cudaDevAttrComputeCapabilityMajor,
+                         device_id);
 
-  // Shared memory: Q tile + K tile + V tile + scratch
-  const size_t smem_size=(FA_BR*head_dim+2*FA_BC*head_dim+32)*sizeof(float);
+  // Adaptive dispatch: compute smem from formula for each (BR,BC) candidate,
+  // pick the largest BC that fits in the GPU's optin smem.
+  // NW (warps per block) is computed from smem_per_sm to maximize occupancy.
 
-  // Dispatch based on head dimension
-  // Note: head_dim >= 64 needs > 48KB shared memory; opt-in via cudaFuncSetAttribute
+  const size_t smem_limit=static_cast<size_t>(max_smem_optin);
+  const size_t smem_per_sm=static_cast<size_t>(smem_per_sm_int);
+
   switch(head_dim)
   {
     case 32:
-      flash_attention_forward_kernel<32><<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+      dispatch_fa_fwd_tc<32>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,cc_major,smem_limit,smem_per_sm,max_threads);
       break;
     case 64:
-      cudaFuncSetAttribute((void *)flash_attention_forward_kernel<64>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem_size));
-      flash_attention_forward_kernel<64><<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+      dispatch_fa_fwd_tc<64>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,cc_major,smem_limit,smem_per_sm,max_threads);
       break;
     case 80:
-      cudaFuncSetAttribute((void *)flash_attention_forward_kernel<80>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem_size));
-      flash_attention_forward_kernel<80><<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+      dispatch_fa_fwd_tc<80>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,cc_major,smem_limit,smem_per_sm,max_threads);
       break;
     case 96:
-      cudaFuncSetAttribute((void *)flash_attention_forward_kernel<96>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem_size));
-      flash_attention_forward_kernel<96><<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+      dispatch_fa_fwd_tc<96>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,cc_major,smem_limit,smem_per_sm,max_threads);
       break;
     case 128:
-      cudaFuncSetAttribute((void *)flash_attention_forward_kernel<128>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem_size));
-      flash_attention_forward_kernel<128><<<grid,block,smem_size,stream>>>(Q,K,V,O,L,seq_len,scale,causal);
+      dispatch_fa_fwd_tc<128>(Q,K,V,O,L,batch_heads,seq_len,scale,causal,stream,cc_major,smem_limit,smem_per_sm,max_threads);
       break;
     default:
       fprintf(stderr,
@@ -4820,9 +6075,9 @@ void launch_flash_attention_forward(const float *Q,
 // FlashAttention-2 Backward: Precompute Di = dot(dO, O) per row
 //------------------------------------------------------------------------------
 template<int D>
-__global__ void flash_attention_precompute_di_kernel(const float * __restrict__ dO,
-                                                      const float * __restrict__ O,
-                                                      float * __restrict__ Di,
+__global__ void flash_attention_precompute_di_kernel(const float *__restrict__ dO,
+                                                      const float *__restrict__ O,
+                                                      float *__restrict__ Di,
                                                       const int seq_len)
 {
   const int bh=blockIdx.x;
@@ -4848,20 +6103,20 @@ __global__ void flash_attention_precompute_di_kernel(const float * __restrict__ 
 // FlashAttention-2 Backward Kernel - dK/dV (optimized)
 // Uses precomputed Di, template-sized register arrays, 128 thread blocks
 //------------------------------------------------------------------------------
-constexpr int FA_BWD_BR=64;     // Q tile rows for dK/dV kernel
-constexpr int FA_BWD_BC=128;    // K/V block size (threads per block)
-constexpr int FA_BWD_DQ_BR=128; // Q block size for dQ kernel
-constexpr int FA_BWD_DQ_BC=64;  // K/V tile rows for dQ kernel
+constexpr int g_fa_bwd_br=64;     // Q tile rows for dK/dV kernel
+constexpr int g_fa_bwd_bc=128;    // K/V block size (threads per block)
+constexpr int g_fa_bwd_dq_br=128; // Q block size for dQ kernel
+constexpr int g_fa_bwd_dq_bc=64;  // K/V tile rows for dQ kernel
 
 template<int D>
-__global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
-                                                 const float * __restrict__ K,
-                                                 const float * __restrict__ V,
-                                                 const float * __restrict__ dO,
-                                                 const float * __restrict__ L,
-                                                 const float * __restrict__ Di,
-                                                 float * __restrict__ dK,
-                                                 float * __restrict__ dV,
+__global__ void flash_attention_backward_kernel(const float *__restrict__ Q,
+                                                 const float *__restrict__ K,
+                                                 const float *__restrict__ V,
+                                                 const float *__restrict__ dO,
+                                                 const float *__restrict__ L,
+                                                 const float *__restrict__ Di,
+                                                 float *__restrict__ dK,
+                                                 float *__restrict__ dV,
                                                  const int seq_len,
                                                  const float scale,
                                                  const int causal)
@@ -4870,18 +6125,14 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
   const int kv_block_idx=blockIdx.y;
   const int tid=threadIdx.x;
 
-  const int kv_row=kv_block_idx*FA_BWD_BC+tid;
-
-  if(kv_row>=seq_len)
-  {
-    return;
-  }
+  const int kv_row=kv_block_idx*g_fa_bwd_bc+tid;
+  const int active=(kv_row<seq_len);
 
   extern __shared__ float smem[];
   float *Q_tile=smem;
-  float *dO_tile=smem+FA_BWD_BR*D;
-  float *L_tile=smem+2*FA_BWD_BR*D;
-  float *Di_tile=smem+2*FA_BWD_BR*D+FA_BWD_BR;
+  float *dO_tile=smem+g_fa_bwd_br*D;
+  float *L_tile=smem+2*g_fa_bwd_br*D;
+  float *Di_tile=smem+2*g_fa_bwd_br*D+g_fa_bwd_br;
 
   const float *Q_bh=Q+bh*seq_len*D;
   const float *K_bh=K+bh*seq_len*D;
@@ -4895,10 +6146,13 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
   // Load K and V rows into registers (sized exactly to D)
   float K_row[D];
   float V_row[D];
-  for(int d=0;d<D;++d)
+  if(active)
   {
-    K_row[d]=K_bh[kv_row*D+d];
-    V_row[d]=V_bh[kv_row*D+d];
+    for(int d=0;d<D;++d)
+    {
+      K_row[d]=K_bh[kv_row*D+d];
+      V_row[d]=V_bh[kv_row*D+d];
+    }
   }
 
   float dK_acc[D];
@@ -4909,20 +6163,20 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
     dV_acc[d]=0.0f;
   }
 
-  const int num_q_blocks=(seq_len+FA_BWD_BR-1)/FA_BWD_BR;
+  const int num_q_blocks=(seq_len+g_fa_bwd_br-1)/g_fa_bwd_br;
 
   int start_q_block=0;
-  if(causal)
+  if(causal && active)
   {
-    start_q_block=kv_row/FA_BWD_BR;
+    start_q_block=kv_row/g_fa_bwd_br;
   }
 
   for(int q_block=start_q_block;q_block<num_q_blocks;++q_block)
   {
-    const int q_start=q_block*FA_BWD_BR;
+    const int q_start=q_block*g_fa_bwd_br;
 
-    // Cooperatively load Q tile and dO tile
-    for(int i=tid;i<FA_BWD_BR*D;i+=FA_BWD_BC)
+    // Cooperatively load Q tile and dO tile (all threads participate)
+    for(int i=tid;i<g_fa_bwd_br*D;i+=g_fa_bwd_bc)
     {
       const int row=i/D;
       const int col=i%D;
@@ -4941,7 +6195,7 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
     }
 
     // Load L and precomputed Di
-    if(tid<FA_BWD_BR)
+    if(tid<g_fa_bwd_br)
     {
       const int global_row=q_start+tid;
       if(global_row<seq_len)
@@ -4957,50 +6211,53 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
     }
     __syncthreads();
 
-    for(int qi=0;qi<FA_BWD_BR;++qi)
+    if(active)
     {
-      const int q_row=q_start+qi;
-
-      if(causal&&kv_row>q_row)
+      for(int qi=0;qi<g_fa_bwd_br;++qi)
       {
-        continue;
-      }
+        const int q_row=q_start+qi;
 
-      if(q_row>=seq_len)
-      {
-        continue;
-      }
+        if(causal && kv_row>q_row)
+        {
+          continue;
+        }
 
-      float dot=0.0f;
-      for(int d=0;d<D;++d)
-      {
-        dot+=Q_tile[qi*D+d]*K_row[d];
-      }
-      const float S_val=dot*scale;
-      const float P_val=expf(fminf(S_val-L_tile[qi],0.0f));
+        if(q_row>=seq_len)
+        {
+          continue;
+        }
 
-      for(int d=0;d<D;++d)
-      {
-        dV_acc[d]+=P_val*dO_tile[qi*D+d];
-      }
+        float dot=0.0f;
+        for(int d=0;d<D;++d)
+        {
+          dot+=Q_tile[qi*D+d]*K_row[d];
+        }
+        const float S_val=dot*scale;
+        const float P_val=expf(fminf(S_val-L_tile[qi],0.0f));
 
-      float dP=0.0f;
-      for(int d=0;d<D;++d)
-      {
-        dP+=dO_tile[qi*D+d]*V_row[d];
-      }
+        for(int d=0;d<D;++d)
+        {
+          dV_acc[d]+=P_val*dO_tile[qi*D+d];
+        }
 
-      const float dS=P_val*(dP-Di_tile[qi])*scale;
+        float dP=0.0f;
+        for(int d=0;d<D;++d)
+        {
+          dP+=dO_tile[qi*D+d]*V_row[d];
+        }
 
-      for(int d=0;d<D;++d)
-      {
-        dK_acc[d]+=dS*Q_tile[qi*D+d];
+        const float dS=P_val*(dP-Di_tile[qi])*scale;
+
+        for(int d=0;d<D;++d)
+        {
+          dK_acc[d]+=dS*Q_tile[qi*D+d];
+        }
       }
     }
     __syncthreads();
   }
 
-  if(kv_row<seq_len)
+  if(active)
   {
     for(int d=0;d<D;++d)
     {
@@ -5015,13 +6272,13 @@ __global__ void flash_attention_backward_kernel(const float * __restrict__ Q,
 // Uses precomputed Di, template-sized register arrays, 128 thread blocks
 //------------------------------------------------------------------------------
 template<int D>
-__global__ void flash_attention_backward_dq_kernel(const float * __restrict__ Q,
-                                                    const float * __restrict__ K,
-                                                    const float * __restrict__ V,
-                                                    const float * __restrict__ dO,
-                                                    const float * __restrict__ L,
-                                                    const float * __restrict__ Di,
-                                                    float * __restrict__ dQ,
+__global__ void flash_attention_backward_dq_kernel(const float *__restrict__ Q,
+                                                    const float *__restrict__ K,
+                                                    const float *__restrict__ V,
+                                                    const float *__restrict__ dO,
+                                                    const float *__restrict__ L,
+                                                    const float *__restrict__ Di,
+                                                    float *__restrict__ dQ,
                                                     const int seq_len,
                                                     const float scale,
                                                     const int causal)
@@ -5030,16 +6287,12 @@ __global__ void flash_attention_backward_dq_kernel(const float * __restrict__ Q,
   const int q_block_idx=blockIdx.y;
   const int tid=threadIdx.x;
 
-  const int q_row=q_block_idx*FA_BWD_DQ_BR+tid;
-
-  if(q_row>=seq_len)
-  {
-    return;
-  }
+  const int q_row=q_block_idx*g_fa_bwd_dq_br+tid;
+  const int active=(q_row<seq_len);
 
   extern __shared__ float smem[];
   float *K_tile=smem;
-  float *V_tile=smem+FA_BWD_DQ_BC*D;
+  float *V_tile=smem+g_fa_bwd_dq_bc*D;
 
   const float *Q_bh=Q+bh*seq_len*D;
   const float *K_bh=K+bh*seq_len*D;
@@ -5050,16 +6303,20 @@ __global__ void flash_attention_backward_dq_kernel(const float * __restrict__ Q,
   float *dQ_bh=dQ+bh*seq_len*D;
 
   // Load Q row and dO row (sized exactly to D)
-  float Q_row[D];
+  float Q_row_reg[D];
   float dO_row[D];
-  for(int d=0;d<D;++d)
+  float L_val=0.0f;
+  float Di_val=0.0f;
+  if(active)
   {
-    Q_row[d]=Q_bh[q_row*D+d];
-    dO_row[d]=dO_bh[q_row*D+d];
+    for(int d=0;d<D;++d)
+    {
+      Q_row_reg[d]=Q_bh[q_row*D+d];
+      dO_row[d]=dO_bh[q_row*D+d];
+    }
+    L_val=L_bh[q_row];
+    Di_val=Di_bh[q_row];
   }
-
-  const float L_val=L_bh[q_row];
-  const float Di_val=Di_bh[q_row];
 
   float dQ_acc[D];
   for(int d=0;d<D;++d)
@@ -5067,18 +6324,18 @@ __global__ void flash_attention_backward_dq_kernel(const float * __restrict__ Q,
     dQ_acc[d]=0.0f;
   }
 
-  int num_kv_blocks=(seq_len+FA_BWD_DQ_BC-1)/FA_BWD_DQ_BC;
-  if(causal)
+  int num_kv_blocks=(seq_len+g_fa_bwd_dq_bc-1)/g_fa_bwd_dq_bc;
+  if(causal && active)
   {
-    num_kv_blocks=min(num_kv_blocks,(q_row/FA_BWD_DQ_BC)+1);
+    num_kv_blocks=min(num_kv_blocks,(q_row/g_fa_bwd_dq_bc)+1);
   }
 
   for(int kv_block=0;kv_block<num_kv_blocks;++kv_block)
   {
-    const int kv_start=kv_block*FA_BWD_DQ_BC;
+    const int kv_start=kv_block*g_fa_bwd_dq_bc;
 
-    // Load K and V tiles cooperatively
-    for(int i=tid;i<FA_BWD_DQ_BC*D;i+=FA_BWD_DQ_BR)
+    // Load K and V tiles cooperatively (all threads participate)
+    for(int i=tid;i<g_fa_bwd_dq_bc*D;i+=g_fa_bwd_dq_br)
     {
       const int row=i/D;
       const int col=i%D;
@@ -5097,47 +6354,53 @@ __global__ void flash_attention_backward_dq_kernel(const float * __restrict__ Q,
     }
     __syncthreads();
 
-    for(int j=0;j<FA_BWD_DQ_BC;++j)
+    if(active)
     {
-      const int k_row=kv_start+j;
-
-      if(causal&&k_row>q_row)
+      for(int j=0;j<g_fa_bwd_dq_bc;++j)
       {
-        continue;
-      }
+        const int k_row=kv_start+j;
 
-      if(k_row>=seq_len)
-      {
-        continue;
-      }
+        if(causal && k_row>q_row)
+        {
+          continue;
+        }
 
-      float dot=0.0f;
-      for(int d=0;d<D;++d)
-      {
-        dot+=Q_row[d]*K_tile[j*D+d];
-      }
-      const float S_val=dot*scale;
-      const float P_val=expf(fminf(S_val-L_val,0.0f));
+        if(k_row>=seq_len)
+        {
+          continue;
+        }
 
-      float dP=0.0f;
-      for(int d=0;d<D;++d)
-      {
-        dP+=dO_row[d]*V_tile[j*D+d];
-      }
+        float dot=0.0f;
+        for(int d=0;d<D;++d)
+        {
+          dot+=Q_row_reg[d]*K_tile[j*D+d];
+        }
+        const float S_val=dot*scale;
+        const float P_val=expf(fminf(S_val-L_val,0.0f));
 
-      const float dS=P_val*(dP-Di_val)*scale;
+        float dP=0.0f;
+        for(int d=0;d<D;++d)
+        {
+          dP+=dO_row[d]*V_tile[j*D+d];
+        }
 
-      for(int d=0;d<D;++d)
-      {
-        dQ_acc[d]+=dS*K_tile[j*D+d];
+        const float dS=P_val*(dP-Di_val)*scale;
+
+        for(int d=0;d<D;++d)
+        {
+          dQ_acc[d]+=dS*K_tile[j*D+d];
+        }
       }
     }
     __syncthreads();
   }
 
-  for(int d=0;d<D;++d)
+  if(active)
   {
-    dQ_bh[q_row*D+d]=dQ_acc[d];
+    for(int d=0;d<D;++d)
+    {
+      dQ_bh[q_row*D+d]=dQ_acc[d];
+    }
   }
 }
 
@@ -5199,36 +6462,91 @@ void launch_flash_attention_backward(const float *Q,
 
   // Kernel 1: Compute dK and dV (128 threads/block)
   {
-    const int num_kv_blocks=(seq_len+FA_BWD_BC-1)/FA_BWD_BC;
+    const int num_kv_blocks=(seq_len+g_fa_bwd_bc-1)/g_fa_bwd_bc;
     dim3 grid(batch_heads,num_kv_blocks);
-    dim3 block(FA_BWD_BC);
-    const size_t smem_size=(2*FA_BWD_BR*head_dim+2*FA_BWD_BR)*sizeof(float);
+    dim3 block(g_fa_bwd_bc);
+    const size_t smem_size=(2*g_fa_bwd_br*head_dim+2*g_fa_bwd_br)*sizeof(float);
 
     switch(head_dim)
     {
       case 32:
-        flash_attention_backward_kernel<32><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dK,dV,seq_len,scale,causal);
+        flash_attention_backward_kernel<32>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dK,
+                                            dV,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 64:
-        flash_attention_backward_kernel<64><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dK,dV,seq_len,scale,causal);
+        flash_attention_backward_kernel<64>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dK,
+                                            dV,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 80:
         cudaFuncSetAttribute((void *)flash_attention_backward_kernel<80>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_kernel<80><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dK,dV,seq_len,scale,causal);
+        flash_attention_backward_kernel<80>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dK,
+                                            dV,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 96:
         cudaFuncSetAttribute((void *)flash_attention_backward_kernel<96>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_kernel<96><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dK,dV,seq_len,scale,causal);
+        flash_attention_backward_kernel<96>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dK,
+                                            dV,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 128:
         cudaFuncSetAttribute((void *)flash_attention_backward_kernel<128>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_kernel<128><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dK,dV,seq_len,scale,causal);
+        flash_attention_backward_kernel<128>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dK,
+                                            dV,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       default:
         fprintf(stderr,
@@ -5240,36 +6558,86 @@ void launch_flash_attention_backward(const float *Q,
 
   // Kernel 2: Compute dQ (128 threads/block)
   {
-    const int num_q_blocks=(seq_len+FA_BWD_DQ_BR-1)/FA_BWD_DQ_BR;
+    const int num_q_blocks=(seq_len+g_fa_bwd_dq_br-1)/g_fa_bwd_dq_br;
     dim3 grid(batch_heads,num_q_blocks);
-    dim3 block(FA_BWD_DQ_BR);
-    const size_t smem_size=2*FA_BWD_DQ_BC*head_dim*sizeof(float);
+    dim3 block(g_fa_bwd_dq_br);
+    const size_t smem_size=2*g_fa_bwd_dq_bc*head_dim*sizeof(float);
 
     switch(head_dim)
     {
       case 32:
-        flash_attention_backward_dq_kernel<32><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dQ,seq_len,scale,causal);
+        flash_attention_backward_dq_kernel<32>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dQ,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 64:
-        flash_attention_backward_dq_kernel<64><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dQ,seq_len,scale,causal);
+        flash_attention_backward_dq_kernel<64>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dQ,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 80:
         cudaFuncSetAttribute((void *)flash_attention_backward_dq_kernel<80>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_dq_kernel<80><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dQ,seq_len,scale,causal);
+        flash_attention_backward_dq_kernel<80>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dQ,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 96:
         cudaFuncSetAttribute((void *)flash_attention_backward_dq_kernel<96>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_dq_kernel<96><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dQ,seq_len,scale,causal);
+        flash_attention_backward_dq_kernel<96>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dQ,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       case 128:
         cudaFuncSetAttribute((void *)flash_attention_backward_dq_kernel<128>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(smem_size));
-        flash_attention_backward_dq_kernel<128><<<grid,block,smem_size,stream>>>(Q,K,V,dO,L,Di_buf,dQ,seq_len,scale,causal);
+        flash_attention_backward_dq_kernel<128>
+          <<<grid,block,smem_size,stream>>>(Q,
+                                            K,
+                                            V,
+                                            dO,
+                                            L,
+                                            Di_buf,
+                                            dQ,
+                                            seq_len,
+                                            scale,
+                                            causal);
         break;
       default:
         fprintf(stderr,

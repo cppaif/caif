@@ -391,7 +391,7 @@ CAIF_Tensor CAIF_DenseLayer::Backward(const CAIF_Tensor &gradient)
     
     return input_gradient;
   }
-  CCAIF_CATCH_BLOCK();
+  CAIF_CATCH_BLOCK();
 }
 
 void CAIF_DenseLayer::Initialize( const std::vector<uint32_t> &input_shape, const uint32_t seed)
@@ -513,7 +513,7 @@ CAIF_Tensor &CAIF_DenseLayer::ParameterRef(const size_t index)
     }
     THROW_CAIFE("Parameter index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_Tensor &CAIF_DenseLayer::ParameterRef(const size_t index)const
@@ -530,7 +530,7 @@ const CAIF_Tensor &CAIF_DenseLayer::ParameterRef(const size_t index)const
     }
     THROW_CAIFE("Parameter index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor &CAIF_DenseLayer::GradientRef(const size_t index)
@@ -547,7 +547,7 @@ CAIF_Tensor &CAIF_DenseLayer::GradientRef(const size_t index)
     }
     THROW_CAIFE("Gradient index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_Tensor &CAIF_DenseLayer::GradientRef(const size_t index)const
@@ -564,7 +564,7 @@ const CAIF_Tensor &CAIF_DenseLayer::GradientRef(const size_t index)const
     }
     THROW_CAIFE("Gradient index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DenseLayer::UpdateParameters(const std::vector<CAIF_Tensor> &new_parameters)

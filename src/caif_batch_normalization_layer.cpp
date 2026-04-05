@@ -320,7 +320,7 @@ namespace instance
       }
       THROW_CAIFE("Parameter index out of range");
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   const CAIF_Tensor &CAIF_BatchNormalizationLayer::ParameterRef(const size_t index)const
@@ -341,7 +341,7 @@ namespace instance
       }
       THROW_CAIFE("Parameter index out of range");
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   CAIF_Tensor &CAIF_BatchNormalizationLayer::GradientRef(const size_t index)
@@ -362,7 +362,7 @@ namespace instance
       }
       THROW_CAIFE("Gradient index out of range");
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   const CAIF_Tensor &CAIF_BatchNormalizationLayer::GradientRef(const size_t index)const
@@ -383,7 +383,7 @@ namespace instance
       }
       THROW_CAIFE("Gradient index out of range");
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   void CAIF_BatchNormalizationLayer::UpdateParameters(

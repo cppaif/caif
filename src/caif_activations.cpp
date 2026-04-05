@@ -34,7 +34,7 @@ CAIF_Tensor CAIF_ReLU::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ReLU::Backward(const CAIF_Tensor &input,const CAIF_Tensor &grad_output)
@@ -50,7 +50,7 @@ CAIF_Tensor CAIF_ReLU::Backward(const CAIF_Tensor &input,const CAIF_Tensor &grad
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -65,7 +65,7 @@ CAIF_Tensor CAIF_Sigmoid::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Sigmoid::Backward(const CAIF_Tensor &output,const CAIF_Tensor &grad_output)
@@ -81,7 +81,7 @@ CAIF_Tensor CAIF_Sigmoid::Backward(const CAIF_Tensor &output,const CAIF_Tensor &
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -96,7 +96,7 @@ CAIF_Tensor CAIF_Tanh::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Tanh::Backward(const CAIF_Tensor &output,const CAIF_Tensor &grad_output)
@@ -112,7 +112,7 @@ CAIF_Tensor CAIF_Tanh::Backward(const CAIF_Tensor &output,const CAIF_Tensor &gra
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -127,7 +127,7 @@ CAIF_Tensor CAIF_LeakyReLU::Forward(const CAIF_Tensor &input,const float alpha)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements(),alpha);
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_LeakyReLU::Backward(const CAIF_Tensor &input,const CAIF_Tensor &grad_output,const float alpha)
@@ -144,7 +144,7 @@ CAIF_Tensor CAIF_LeakyReLU::Backward(const CAIF_Tensor &input,const CAIF_Tensor 
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -159,7 +159,7 @@ CAIF_Tensor CAIF_ELU::Forward(const CAIF_Tensor &input,const float alpha)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements(),alpha);
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ELU::Backward(
@@ -182,7 +182,7 @@ CAIF_Tensor CAIF_ELU::Backward(
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -197,7 +197,7 @@ CAIF_Tensor CAIF_GELU::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_GELU::Backward(const CAIF_Tensor &input,const CAIF_Tensor &grad_output)
@@ -213,7 +213,7 @@ CAIF_Tensor CAIF_GELU::Backward(const CAIF_Tensor &input,const CAIF_Tensor &grad
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -228,7 +228,7 @@ CAIF_Tensor CAIF_Swish::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),input.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Swish::Backward(const CAIF_Tensor &input,const CAIF_Tensor &output,const CAIF_Tensor &grad_output)
@@ -245,7 +245,7 @@ CAIF_Tensor CAIF_Swish::Backward(const CAIF_Tensor &input,const CAIF_Tensor &out
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -273,7 +273,7 @@ CAIF_Tensor CAIF_Softmax::Forward(const CAIF_Tensor &input)
     Forward(input.ConstData<float>(),result.MutableData<float>(),batch_size,num_classes);
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Softmax::Backward(const CAIF_Tensor &output,const CAIF_Tensor &grad_output)
@@ -303,6 +303,6 @@ CAIF_Tensor CAIF_Softmax::Backward(const CAIF_Tensor &output,const CAIF_Tensor &
             );
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

@@ -132,7 +132,8 @@ class CAIF_DeviceNetwork:public CAIF_Base
     void InitializeAdam(float lr=0.001f,
                         float beta1=0.9f,
                         float beta2=0.999f,
-                        float epsilon=1e-8f);
+                        float epsilon=1e-8f,
+                        float weight_decay=0.0f);
 
     /**
      * @brief Perform one Adam optimizer update step
@@ -141,6 +142,23 @@ class CAIF_DeviceNetwork:public CAIF_Base
      * Must call InitializeAdam before first use.
      */
     void AdamStep();
+
+    /**
+     * @brief Set Adam learning rate (for LR scheduling)
+     */
+    void SetLearningRate(float lr){_adam_lr=lr;}
+
+    /**
+     * @brief Clip gradient norm across all trainable parameters
+     *
+     * Computes the global L2 norm of all trainable gradients and
+     * scales them so the total norm does not exceed max_norm.
+     * Equivalent to torch.nn.utils.clip_grad_norm_.
+     *
+     * @param max_norm Maximum allowed gradient norm
+     * @return The total gradient norm before clipping
+     */
+    float ClipGradientNorm(float max_norm);
 
     /**
      * @brief Get the number of layers
@@ -172,6 +190,11 @@ class CAIF_DeviceNetwork:public CAIF_Base
      * @param trainable Whether the layer should be trained
      */
     void SetLayerTrainable(size_t index,bool trainable);
+
+    /**
+     * @brief Check if a layer is trainable
+     */
+    bool IsLayerTrainable(size_t index)const;
 
     /**
      * @brief Get total parameter count across all layers
@@ -273,6 +296,7 @@ class CAIF_DeviceNetwork:public CAIF_Base
     float _adam_beta1;
     float _adam_beta2;
     float _adam_epsilon;
+    float _adam_weight_decay;
     int _adam_t;  // Timestep
 
     // Adam moment estimates (one pair per parameter tensor)

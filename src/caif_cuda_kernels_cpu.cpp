@@ -707,7 +707,7 @@ void launch_cross_entropy_logits_forward(const float *logits, const float *targe
   (void)stream;
 }
 
-void launch_cross_entropy_logits_backward(const float *logits, const float *targets, float *grad, int n, int vocab_size, int ignore_index, cudaStream_t stream)
+void launch_cross_entropy_logits_backward(const float *logits, const float *targets, float *grad, int n, int vocab_size, int ignore_index, float scale, cudaStream_t stream)
 {
   (void)logits;
   (void)targets;
@@ -715,6 +715,7 @@ void launch_cross_entropy_logits_backward(const float *logits, const float *targ
   (void)n;
   (void)vocab_size;
   (void)ignore_index;
+  (void)scale;
   (void)stream;
 }
 
@@ -724,6 +725,27 @@ void launch_cross_entropy_reduce_mean(const float *losses, const float *targets,
   (void)targets;
   (void)output;
   (void)n;
+  (void)ignore_index;
+  (void)stream;
+}
+
+void launch_cross_entropy_fused(const float *logits,
+                                const float *targets,
+                                float *losses,
+                                float *grad,
+                                float *result,
+                                int n,
+                                int vocab_size,
+                                int ignore_index,
+                                cudaStream_t stream)
+{
+  (void)logits;
+  (void)targets;
+  (void)losses;
+  (void)grad;
+  (void)result;
+  (void)n;
+  (void)vocab_size;
   (void)ignore_index;
   (void)stream;
 }
@@ -752,6 +774,17 @@ void launch_sum_axis1(const float *input, float *output, int batch, int dim, cud
   (void)output;
   (void)batch;
   (void)dim;
+  (void)stream;
+}
+
+void launch_sum_of_squares(const float *input,
+                           float *output,
+                           int n,
+                           cudaStream_t stream)
+{
+  (void)input;
+  (void)output;
+  (void)n;
   (void)stream;
 }
 

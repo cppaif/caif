@@ -113,7 +113,7 @@ void CAIF_BatchNorm::Forward(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_BatchNorm::Backward(
@@ -183,7 +183,7 @@ void CAIF_BatchNorm::Backward(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_BatchNorm::Forward(
@@ -229,7 +229,7 @@ CAIF_Tensor CAIF_BatchNorm::Forward(
     
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_BatchNorm::Backward(
@@ -271,7 +271,7 @@ CAIF_Tensor CAIF_BatchNorm::Backward(
     
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -319,7 +319,7 @@ void CAIF_Dropout::Forward(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Dropout::Backward(
@@ -340,7 +340,7 @@ void CAIF_Dropout::Backward(
       grad_input[i]=grad_output[i]*mask[i];
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Dropout::Forward(
@@ -371,7 +371,7 @@ CAIF_Tensor CAIF_Dropout::Forward(
     
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Dropout::Backward(
@@ -394,6 +394,6 @@ CAIF_Tensor CAIF_Dropout::Backward(
     
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

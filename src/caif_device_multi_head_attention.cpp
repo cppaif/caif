@@ -100,7 +100,7 @@ CAIF_DeviceMultiHeadAttention::CAIF_DeviceMultiHeadAttention(
     // Initialize weights
     InitializeWeights(0);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMultiHeadAttention::CAIF_DeviceMultiHeadAttention(
@@ -163,7 +163,7 @@ CAIF_DeviceMultiHeadAttention::CAIF_DeviceMultiHeadAttention(
     // by the projection layers (FrozenLinear/LoRAAdapter). No internal
     // weight matrices needed.
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMultiHeadAttention::CAIF_DeviceMultiHeadAttention(
@@ -238,7 +238,7 @@ CAIF_DeviceMultiHeadAttention &CAIF_DeviceMultiHeadAttention::operator=(
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::Forward(
@@ -535,7 +535,7 @@ CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::Forward(
 
     return output_flat;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::Backward(
@@ -637,7 +637,10 @@ CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::Backward(
     CAIF_DeviceTensor grad_v_heads;
 
     const size_t attn_matrix_bytes=static_cast<size_t>(bh)*seq_len*seq_len*sizeof(float);
-    const bool use_naive_backward=(attn_matrix_bytes<FLASH_ATTN_THRESHOLD_BYTES);
+    size_t free_mem=0;
+    size_t total_mem=0;
+    cudaMemGetInfo(&free_mem,&total_mem);
+    const bool use_naive_backward=(attn_matrix_bytes*2<=free_mem);
 
     if(use_naive_backward==true)
     {
@@ -874,7 +877,7 @@ CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::Backward(
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMultiHeadAttention::ZeroGradients()
@@ -896,7 +899,7 @@ void CAIF_DeviceMultiHeadAttention::ZeroGradients()
       _grad_w_o.Fill(0.0f);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMultiHeadAttention::ParameterTensorCount()const
@@ -912,7 +915,7 @@ size_t CAIF_DeviceMultiHeadAttention::ParameterTensorCount()const
     }
     return g_caif_attention_weight_count;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::ParameterTensor(size_t index)
@@ -955,7 +958,7 @@ CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::ParameterTensor(size_t index)
     }
     THROW_CAIFE("DeviceMultiHeadAttention::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::ParameterTensor(
@@ -999,7 +1002,7 @@ const CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::ParameterTensor(
     }
     THROW_CAIFE("DeviceMultiHeadAttention::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::GradientTensor(size_t index)
@@ -1042,7 +1045,7 @@ CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::GradientTensor(size_t index)
     }
     THROW_CAIFE("DeviceMultiHeadAttention::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::GradientTensor(
@@ -1086,7 +1089,7 @@ const CAIF_DeviceTensor &CAIF_DeviceMultiHeadAttention::GradientTensor(
     }
     THROW_CAIFE("DeviceMultiHeadAttention::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMultiHeadAttention::TotalParameterCount()const
@@ -1105,7 +1108,7 @@ size_t CAIF_DeviceMultiHeadAttention::TotalParameterCount()const
            _w_v.TotalElements()+
            _w_o.TotalElements();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceMultiHeadAttention::Description()const
@@ -1140,7 +1143,7 @@ std::string CAIF_DeviceMultiHeadAttention::Description()const
     desc+=")";
     return desc;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceMultiHeadAttention::ParameterNames(
@@ -1169,7 +1172,7 @@ std::vector<std::string> CAIF_DeviceMultiHeadAttention::ParameterNames(
     names.push_back(prefix+"o_proj.weight");
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMultiHeadAttention::InitializeWeights(uint32_t seed)
@@ -1226,7 +1229,7 @@ void CAIF_DeviceMultiHeadAttention::InitializeWeights(uint32_t seed)
     }
     _w_o.CopyFromHost(wo_data.data(),wo_data.size());
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMultiHeadAttention::EnableKVCache(uint32_t batch_size,
@@ -1252,7 +1255,7 @@ void CAIF_DeviceMultiHeadAttention::EnableKVCache(uint32_t batch_size,
     _kv_cache_batch=batch_size;
     _kv_cache_enabled=true;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMultiHeadAttention::DisableKVCache()
@@ -1266,7 +1269,7 @@ void CAIF_DeviceMultiHeadAttention::DisableKVCache()
     _kv_cache_batch=0;
     _kv_cache_enabled=false;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMultiHeadAttention::ResetKVCache()
@@ -1280,7 +1283,7 @@ void CAIF_DeviceMultiHeadAttention::ResetKVCache()
     _kv_cache_len=0;
     // Keep allocated tensors, just reset length
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::ForwardCached(
@@ -1602,7 +1605,7 @@ CAIF_DeviceTensor CAIF_DeviceMultiHeadAttention::ForwardCached(
 
     return output_flat;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

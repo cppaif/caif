@@ -90,7 +90,7 @@ void CAIF_Pooling::MaxPool2D(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Pooling::MaxPool2DBackward(
@@ -116,7 +116,7 @@ void CAIF_Pooling::MaxPool2DBackward(
       grad_input[indices[i]]+=grad_output[i];
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Pooling::AvgPool2D(
@@ -184,7 +184,7 @@ void CAIF_Pooling::AvgPool2D(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Pooling::AvgPool2DBackward(
@@ -262,7 +262,7 @@ void CAIF_Pooling::AvgPool2DBackward(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -318,7 +318,7 @@ CAIF_Tensor CAIF_Pooling::MaxPool2D(
     
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Pooling::MaxPool2DBackward(
@@ -352,7 +352,7 @@ CAIF_Tensor CAIF_Pooling::MaxPool2DBackward(
     
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Pooling::AvgPool2D(
@@ -394,7 +394,7 @@ CAIF_Tensor CAIF_Pooling::AvgPool2D(
     
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Pooling::AvgPool2DBackward(
@@ -427,6 +427,6 @@ CAIF_Tensor CAIF_Pooling::AvgPool2DBackward(
     
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

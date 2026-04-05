@@ -85,6 +85,9 @@ class CAIF_DevicePreNormBlock:public CAIF_DeviceLayer
 
     size_t SubLayerCount()const{return _sub_layers.size();}
 
+    void SetNormsTrainable(bool trainable){_norms_trainable=trainable;}
+    bool NormsTrainable()const{return _norms_trainable;}
+
   protected:
 
   private:
@@ -101,6 +104,7 @@ class CAIF_DevicePreNormBlock:public CAIF_DeviceLayer
     const CAIF_DeviceLayer &LayerByMapping(const SubLayerMapping_t &mapping)const;
 
     SubLayerVec_t _sub_layers;
+    bool _norms_trainable;
 };
 
 }//end instance namespace

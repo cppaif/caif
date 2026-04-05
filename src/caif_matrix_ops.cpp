@@ -55,7 +55,7 @@ void CAIF_MatrixOps::Multiply(
                 static_cast<int>(n)
                );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_MatrixOps::MultiplyEx(
@@ -94,7 +94,7 @@ void CAIF_MatrixOps::MultiplyEx(
                 static_cast<int>(ldc)
                );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_MatrixOps::Multiply(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -122,7 +122,7 @@ CAIF_Tensor CAIF_MatrixOps::Multiply(const CAIF_Tensor &a,const CAIF_Tensor &b)
     
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_MatrixOps::MultiplyEx(
@@ -194,7 +194,7 @@ CAIF_Tensor CAIF_MatrixOps::MultiplyEx(
     
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_MatrixOps::Multiply(CAIF_Framework &framework,const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -230,7 +230,7 @@ CAIF_Tensor CAIF_MatrixOps::Multiply(CAIF_Framework &framework,const CAIF_Tensor
     backend->MatrixMultiply(*a.TensorData(),*b.TensorData(),*result.TensorData());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_MatrixOps::MultiplyEx(
@@ -278,5 +278,5 @@ CAIF_Tensor CAIF_MatrixOps::MultiplyEx(
     backend->MatrixMultiplyEx(*a.TensorData(),*b.TensorData(),*result.TensorData(),trans_a,trans_b);
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

@@ -1300,6 +1300,7 @@ void AdamUpdate(CAIF_DeviceTensor &param,
                 float beta1,
                 float beta2,
                 float epsilon,
+                float weight_decay,
                 int t)
 {
 #ifdef USE_CAIF_CUDA
@@ -1316,12 +1317,8 @@ void AdamUpdate(CAIF_DeviceTensor &param,
     return;
   }
 
-  // Compute bias correction factors
   const float bias_correction1=1.0f-std::pow(beta1,static_cast<float>(t));
   const float bias_correction2=1.0f-std::pow(beta2,static_cast<float>(t));
-
-  // No weight decay for this simplified version
-  const float weight_decay=0.0f;
 
   launch_fused_adam(param.DevicePtr(),
                     grad.DevicePtr(),
@@ -1345,6 +1342,7 @@ void AdamUpdate(CAIF_DeviceTensor &param,
   (void)beta1;
   (void)beta2;
   (void)epsilon;
+  (void)weight_decay;
   (void)t;
   THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif

@@ -68,7 +68,7 @@ CAIF_FlattenLayer &CAIF_FlattenLayer::operator=(const CAIF_FlattenLayer &other)
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 
 CAIF_FlattenLayer &CAIF_FlattenLayer::operator=(CAIF_FlattenLayer &&other)
@@ -85,7 +85,7 @@ CAIF_FlattenLayer &CAIF_FlattenLayer::operator=(CAIF_FlattenLayer &&other)
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 
 CAIF_Tensor CAIF_FlattenLayer::Forward(
@@ -126,9 +126,9 @@ CAIF_Tensor CAIF_FlattenLayer::Forward(
       _last_output=input.Reshape(target_shape);
       return _last_output;
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_FlattenLayer::Backward(const CAIF_Tensor &gradient)
@@ -150,9 +150,9 @@ CAIF_Tensor CAIF_FlattenLayer::Backward(const CAIF_Tensor &gradient)
       // Reshape returns a new tensor directly
       return gradient.Reshape(_original_shape);
     }
-    CCAIF_CATCH_BLOCK();
+    CAIF_CATCH_BLOCK();
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 
 void CAIF_FlattenLayer::Initialize(const std::vector<uint32_t> &input_shape,[[maybe_unused]] const uint32_t seed)
@@ -188,7 +188,7 @@ void CAIF_FlattenLayer::Initialize(const std::vector<uint32_t> &input_shape,[[ma
     
     return;
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 
 std::vector<uint32_t> CAIF_FlattenLayer::CalculateOutputShape(const std::vector<uint32_t> &input_shape)const
@@ -255,7 +255,7 @@ std::vector<uint32_t> CAIF_FlattenLayer::CalculateOutputShape(const std::vector<
       return result;
     }
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 
 std::unique_ptr<CAIF_Layer> CAIF_FlattenLayer::Clone()const
@@ -292,6 +292,6 @@ std::string CAIF_FlattenLayer::Description()const
     }
     return oss.str();
   }
-  CCAIF_CATCH_BLOCK(); 
+  CAIF_CATCH_BLOCK(); 
 }
 }//end instance namespace

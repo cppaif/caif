@@ -1726,12 +1726,6 @@ void CAIF_EigenBackend::FusedAdamUpdate(
     float p=param_data[i];
     float g=grad_data[i];
 
-    // Apply weight decay
-    if(weight_decay>0.0f)
-    {
-      g=g+weight_decay*p;
-    }
-
     // Update biased first moment estimate
     float m_val=beta1*m_data[i]+(1.0f-beta1)*g;
     m_data[i]=m_val;
@@ -1745,7 +1739,15 @@ void CAIF_EigenBackend::FusedAdamUpdate(
     const float v_hat=v_val/bias_correction2;
 
     // Update parameter
-    param_data[i]=p-lr*m_hat/(std::sqrt(v_hat)+epsilon);
+    p=p-lr*m_hat/(std::sqrt(v_hat)+epsilon);
+
+    // Decoupled weight decay (AdamW)
+    if(weight_decay>0.0f)
+    {
+      p=p-lr*weight_decay*p;
+    }
+
+    param_data[i]=p;
   }
 }
 

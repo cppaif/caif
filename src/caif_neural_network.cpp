@@ -1992,7 +1992,7 @@ void CAIF_NeuralNetwork::UpdateNetworkParameters()
     
     return;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 uint32_t CAIF_NeuralNetwork::CalculateAccuracy(

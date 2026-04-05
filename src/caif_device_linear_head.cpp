@@ -67,7 +67,7 @@ CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(const CAIF_DeviceLinearHead::Config
       _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(const CAIF_DeviceLinearHead::Config_t &config,
@@ -115,7 +115,7 @@ CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(const CAIF_DeviceLinearHead::Config
       _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(CAIF_DeviceLinearHead &&other)noexcept:
@@ -226,7 +226,7 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Forward(const CAIF_DeviceTensor &input,
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceLinearHead::Backward(const CAIF_DeviceTensor &grad_output)
@@ -309,7 +309,7 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Backward(const CAIF_DeviceTensor &grad_
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceLinearHead::ZeroGradients()
@@ -327,7 +327,7 @@ void CAIF_DeviceLinearHead::ZeroGradients()
       _bias_grad.Fill(0.0f);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLinearHead::ParameterTensorCount()const
@@ -345,7 +345,7 @@ size_t CAIF_DeviceLinearHead::ParameterTensorCount()const
     }
     return count;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)
@@ -372,7 +372,7 @@ CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)
     }
     THROW_CAIFE("DeviceLinearHead::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)const
@@ -399,7 +399,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)con
     }
     THROW_CAIFE("DeviceLinearHead::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)
@@ -426,7 +426,7 @@ CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)
     }
     THROW_CAIFE("DeviceLinearHead::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)const
@@ -453,7 +453,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)cons
     }
     THROW_CAIFE("DeviceLinearHead::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLinearHead::TotalParameterCount()const
@@ -471,7 +471,7 @@ size_t CAIF_DeviceLinearHead::TotalParameterCount()const
     }
     return total;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceLinearHead::Description()const
@@ -488,7 +488,7 @@ std::string CAIF_DeviceLinearHead::Description()const
     }
     return desc;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceLinearHead::ParameterNames(const std::string &prefix)const
@@ -506,7 +506,7 @@ std::vector<std::string> CAIF_DeviceLinearHead::ParameterNames(const std::string
     }
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

@@ -20,6 +20,7 @@
 #define CAIF_DEVICE_CONTEXT_H
 
 #include "caif_base.h"
+#include "caif_device_properties.h"
 
 #ifdef USE_CAIF_CUDA
 #include "cuda/cuda_runtime_api.h"
@@ -97,6 +98,12 @@ class CAIF_DeviceContext:public CAIF_Base
 #else
     void *CudnnHandle(){return nullptr;}
 #endif
+
+    /**
+     * @brief Get device properties for the active device
+     * @return Reference to cached properties
+     */
+    CAIF_DeviceProperties &DeviceProperties();
 
     /**
      * @brief Check if CUDA is initialized

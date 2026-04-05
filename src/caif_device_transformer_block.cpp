@@ -80,7 +80,7 @@ CAIF_DeviceTransformerBlock::CAIF_DeviceTransformerBlock(const TransformerBlockC
     ffn_config.ffn_dim=_effective_ffn_dim;
     _ffn=std::make_unique<CAIF_DeviceFFN>(ffn_config,std::move(activation),stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTransformerBlock::CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,
@@ -118,7 +118,7 @@ CAIF_DeviceTransformerBlock &CAIF_DeviceTransformerBlock::operator=(CAIF_DeviceT
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceTransformerBlock::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -144,7 +144,7 @@ CAIF_DeviceTensor CAIF_DeviceTransformerBlock::Forward(const CAIF_DeviceTensor &
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceTransformerBlock::Backward(const CAIF_DeviceTensor &grad_output)
@@ -170,7 +170,7 @@ CAIF_DeviceTensor CAIF_DeviceTransformerBlock::Backward(const CAIF_DeviceTensor 
 
     return d_x;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceTransformerBlock::ZeroGradients()
@@ -182,7 +182,7 @@ void CAIF_DeviceTransformerBlock::ZeroGradients()
     _norm2->ZeroGradients();
     _ffn->ZeroGradients();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceTransformerBlock::ParameterTensorCount()const
@@ -194,7 +194,7 @@ size_t CAIF_DeviceTransformerBlock::ParameterTensorCount()const
            _norm2->ParameterTensorCount()+
            _ffn->ParameterTensorCount();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTransformerBlock::SubLayerMapping_t
@@ -259,7 +259,7 @@ CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::ParameterTensor(size_t index)
     }
     return _ffn->ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::ParameterTensor(size_t index)const
@@ -281,7 +281,7 @@ const CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::ParameterTensor(size_t ind
     }
     return _ffn->ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::GradientTensor(size_t index)
@@ -303,7 +303,7 @@ CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::GradientTensor(size_t index)
     }
     return _ffn->GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::GradientTensor(size_t index)const
@@ -325,7 +325,7 @@ const CAIF_DeviceTensor &CAIF_DeviceTransformerBlock::GradientTensor(size_t inde
     }
     return _ffn->GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceTransformerBlock::TotalParameterCount()const
@@ -337,7 +337,7 @@ size_t CAIF_DeviceTransformerBlock::TotalParameterCount()const
            _norm2->TotalParameterCount()+
            _ffn->TotalParameterCount();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceTransformerBlock::Description()const
@@ -359,7 +359,7 @@ std::string CAIF_DeviceTransformerBlock::Description()const
            ",ffn_dim="+std::to_string(_effective_ffn_dim)+
            ",causal="+causal_str+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceTransformerBlock::ParameterNames(const std::string &prefix)const
@@ -382,7 +382,7 @@ std::vector<std::string> CAIF_DeviceTransformerBlock::ParameterNames(const std::
 
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 uint32_t CAIF_DeviceTransformerBlock::ComputeDefaultFFNDim(uint32_t dim)

@@ -54,7 +54,7 @@ CAIF_DeviceTabularEmbedding::CAIF_DeviceTabularEmbedding(const Config_t &config,
     // Initialize weights with Xavier uniform
     InitializeWeights(0);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTabularEmbedding::CAIF_DeviceTabularEmbedding(
@@ -156,7 +156,7 @@ CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Forward(const CAIF_DeviceTensor &
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
@@ -209,7 +209,7 @@ CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Backward(const CAIF_DeviceTensor 
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceTabularEmbedding::ZeroGradients()
@@ -219,7 +219,7 @@ void CAIF_DeviceTabularEmbedding::ZeroGradients()
     _grad_w_proj.Fill(0.0f);
     _grad_b_proj.Fill(0.0f);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceTabularEmbedding::ParameterTensorCount()const
@@ -291,7 +291,7 @@ std::string CAIF_DeviceTabularEmbedding::Description()const
     return "TabularEmbedding(features="+std::to_string(_config.num_features)+
            ",dim="+std::to_string(_config.dim)+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceTabularEmbedding::ParameterNames(const std::string &prefix)const
@@ -303,7 +303,7 @@ std::vector<std::string> CAIF_DeviceTabularEmbedding::ParameterNames(const std::
     names.push_back(prefix+"proj.bias");
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceTabularEmbedding::InitializeWeights(uint32_t seed)
@@ -325,7 +325,7 @@ void CAIF_DeviceTabularEmbedding::InitializeWeights(uint32_t seed)
 
     // Bias initialized to zero (already done)
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

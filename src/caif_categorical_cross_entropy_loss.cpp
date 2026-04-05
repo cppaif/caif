@@ -137,7 +137,7 @@ namespace instance
       
       return loss_tensor;
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   CAIF_Tensor CAIF_CategoricalCrossEntropyLoss::ComputeGradient(
@@ -232,7 +232,7 @@ namespace instance
 
       return gradient_tensor;
     }
-    CCAIF_CATCH_BLOCK()
+    CAIF_CATCH_BLOCK()
   }
 
   CAIF_LossType_e CAIF_CategoricalCrossEntropyLoss::LossType()const

@@ -71,7 +71,7 @@ CAIF_Framework::CAIF_Framework():_backend_type(CAIF_TensorBackend::BackendType_e
       AutoSelectBackend();
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Framework::CAIF_Framework(const CAIF_Framework &other):CAIF_Base(other),
@@ -84,7 +84,7 @@ CAIF_Framework::CAIF_Framework(const CAIF_Framework &other):CAIF_Base(other),
       _current_backend=CreateBackend(_backend_type);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -98,7 +98,7 @@ void CAIF_Framework::SetBackend(const CAIF_TensorBackend::BackendType_e backend)
     _backend_type=backend;
     _current_backend=CreateBackend(backend);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Framework::AutoSelectBackend()
@@ -108,7 +108,7 @@ void CAIF_Framework::AutoSelectBackend()
     // GPU training uses CAIF_DeviceNetwork directly, not CAIF_Framework backends
     SetBackend(CAIF_TensorBackend::BackendType_e::BLAS);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_TensorBackend::BackendType_e CAIF_Framework::CurrentBackend()const
@@ -135,7 +135,7 @@ std::unique_ptr<CAIF_TensorData> CAIF_Framework::CreateTensor(
     }
     return _current_backend->CreateTensor(shape,dtype);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::unique_ptr<CAIF_TensorBackend> CAIF_Framework::CreateBackend(
@@ -165,7 +165,7 @@ std::unique_ptr<CAIF_TensorBackend> CAIF_Framework::CreateBackend(
         THROW_CAIFE("Unknown backend type");
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -194,7 +194,7 @@ CAIF_Tensor CAIF_Framework::MatrixMultiply(const CAIF_Tensor &a,const CAIF_Tenso
   {
     return CAIF_MatrixOps::Multiply(*this,a,b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::MatrixMultiplyEx(
@@ -208,7 +208,7 @@ CAIF_Tensor CAIF_Framework::MatrixMultiplyEx(
   {
     return CAIF_MatrixOps::MultiplyEx(*this,a,b,trans_a,trans_b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Framework::MatrixMultiply(const CAIF_TensorData &a,const CAIF_TensorData &b,CAIF_TensorData &result)
@@ -221,7 +221,7 @@ void CAIF_Framework::MatrixMultiply(const CAIF_TensorData &a,const CAIF_TensorDa
     }
     _current_backend->MatrixMultiply(a,b,result);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -234,7 +234,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseAdd(const CAIF_Tensor &a,const CAIF_Tenso
   {
     return CAIF_ElementOps::Add(a,b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseAddScalar(const CAIF_Tensor &a,const float scalar)
@@ -243,7 +243,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseAddScalar(const CAIF_Tensor &a,const floa
   {
     return CAIF_ElementOps::AddScalar(a,scalar);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseSub(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -252,7 +252,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseSub(const CAIF_Tensor &a,const CAIF_Tenso
   {
     return CAIF_ElementOps::Sub(a,b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseSubScalar(const CAIF_Tensor &a,const float scalar)
@@ -261,7 +261,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseSubScalar(const CAIF_Tensor &a,const floa
   {
     return CAIF_ElementOps::SubScalar(a,scalar);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseMul(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -270,7 +270,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseMul(const CAIF_Tensor &a,const CAIF_Tenso
   {
     return CAIF_ElementOps::Mul(a,b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseMulScalar(const CAIF_Tensor &a,const float scalar)
@@ -279,7 +279,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseMulScalar(const CAIF_Tensor &a,const floa
   {
     return CAIF_ElementOps::MulScalar(a,scalar);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseDiv(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -288,7 +288,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseDiv(const CAIF_Tensor &a,const CAIF_Tenso
   {
     return CAIF_ElementOps::Div(a,b);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseDivScalar(const CAIF_Tensor &a,const float scalar)
@@ -297,7 +297,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseDivScalar(const CAIF_Tensor &a,const floa
   {
     return CAIF_ElementOps::DivScalar(a,scalar);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ElementwiseSqrt(const CAIF_Tensor &a)
@@ -306,7 +306,7 @@ CAIF_Tensor CAIF_Framework::ElementwiseSqrt(const CAIF_Tensor &a)
   {
     return CAIF_ElementOps::Sqrt(a);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_Framework::ReduceSum(const CAIF_Tensor &a)
@@ -315,7 +315,7 @@ float CAIF_Framework::ReduceSum(const CAIF_Tensor &a)
   {
     return CAIF_ElementOps::Sum(a);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_Framework::ReduceMean(const CAIF_Tensor &a)
@@ -324,7 +324,7 @@ float CAIF_Framework::ReduceMean(const CAIF_Tensor &a)
   {
     return CAIF_ElementOps::Mean(a);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -370,7 +370,7 @@ CAIF_Tensor CAIF_Framework::ActivationForward(
         return input;
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::ActivationBackward(
@@ -422,7 +422,7 @@ CAIF_Tensor CAIF_Framework::ActivationBackward(
         return grad_output;
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::SoftmaxForward(const CAIF_Tensor &input)
@@ -431,7 +431,7 @@ CAIF_Tensor CAIF_Framework::SoftmaxForward(const CAIF_Tensor &input)
   {
     return CAIF_Softmax::Forward(input);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::SoftmaxBackward(const CAIF_Tensor &grad_output,const CAIF_Tensor &output)
@@ -440,7 +440,7 @@ CAIF_Tensor CAIF_Framework::SoftmaxBackward(const CAIF_Tensor &grad_output,const
   {
     return CAIF_Softmax::Backward(output,grad_output);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -459,7 +459,7 @@ CAIF_Tensor CAIF_Framework::MaxPooling2D(
   {
     return CAIF_Pooling::MaxPool2D(input,pool_size,stride,padding,indices);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::AveragePooling2D(
@@ -473,7 +473,7 @@ CAIF_Tensor CAIF_Framework::AveragePooling2D(
   {
     return CAIF_Pooling::AvgPool2D(input,pool_size,stride,padding);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::MaxPooling2DBackward(
@@ -489,7 +489,7 @@ CAIF_Tensor CAIF_Framework::MaxPooling2DBackward(
   {
     return CAIF_Pooling::MaxPool2DBackward(grad_output,indices,input,pool_size,stride,padding);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::AveragePooling2DBackward(
@@ -504,7 +504,7 @@ CAIF_Tensor CAIF_Framework::AveragePooling2DBackward(
   {
     return CAIF_Pooling::AvgPool2DBackward(grad_output,input_shape,pool_size,stride,padding);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -562,7 +562,7 @@ void CAIF_Framework::FusedAdamUpdate(
                                  bias_correction2
                                 );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Framework::FusedSGDMomentumUpdate(
@@ -600,7 +600,7 @@ void CAIF_Framework::FusedSGDMomentumUpdate(
                                         weight_decay
                                        );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -620,7 +620,7 @@ CAIF_Tensor CAIF_Framework::Convolution2D(
   {
     return CAIF_ConvolutionOps::Conv2DForward(*this,input,kernel,stride_y,stride_x,padding_y,padding_x);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Framework::Convolution2D(
@@ -638,7 +638,7 @@ void CAIF_Framework::Convolution2D(
     }
     _current_backend->Convolution2D(input,kernel,output,params);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //==============================================================================
@@ -663,7 +663,7 @@ CAIF_Tensor CAIF_Framework::BatchNormForward(
     return CAIF_BatchNorm::Forward(input,scale,bias,running_mean,running_var,epsilon,momentum,training,
                                   saved_mean,saved_inv_var);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::BatchNormBackward(
@@ -682,7 +682,7 @@ CAIF_Tensor CAIF_Framework::BatchNormBackward(
     return CAIF_BatchNorm::Backward(grad_output,input,scale,saved_mean,saved_inv_var,epsilon,
                                    grad_scale,grad_bias);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::DropoutForward(
@@ -696,7 +696,7 @@ CAIF_Tensor CAIF_Framework::DropoutForward(
   {
     return CAIF_Dropout::Forward(input,dropout_rate,training,mask);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_Framework::DropoutBackward(
@@ -709,5 +709,5 @@ CAIF_Tensor CAIF_Framework::DropoutBackward(
   {
     return CAIF_Dropout::Backward(grad_output,mask,dropout_rate);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

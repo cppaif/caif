@@ -52,7 +52,7 @@ CAIF_DeviceLayerNorm::CAIF_DeviceLayerNorm(uint32_t dim,
     _gamma_grad=CAIF_DeviceTensor::Zeros({dim},stream);
     _beta_grad=CAIF_DeviceTensor::Zeros({dim},stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceLayerNorm::CAIF_DeviceLayerNorm(CAIF_DeviceLayerNorm &&other):CAIF_DeviceLayer(std::move(other)),
@@ -91,7 +91,7 @@ CAIF_DeviceLayerNorm &CAIF_DeviceLayerNorm::operator=(CAIF_DeviceLayerNorm &&oth
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceLayerNorm::Forward(const CAIF_DeviceTensor &input,
@@ -151,7 +151,7 @@ CAIF_DeviceTensor CAIF_DeviceLayerNorm::Forward(const CAIF_DeviceTensor &input,
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceLayerNorm::Backward(const CAIF_DeviceTensor &grad_output)
@@ -199,7 +199,7 @@ CAIF_DeviceTensor CAIF_DeviceLayerNorm::Backward(const CAIF_DeviceTensor &grad_o
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceLayerNorm::ZeroGradients()
@@ -209,7 +209,7 @@ void CAIF_DeviceLayerNorm::ZeroGradients()
     _gamma_grad.Fill(0.0f);
     _beta_grad.Fill(0.0f);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLayerNorm::ParameterTensorCount()const
@@ -218,7 +218,7 @@ size_t CAIF_DeviceLayerNorm::ParameterTensorCount()const
   {
     return 2;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceLayerNorm::ParameterTensor(size_t index)
@@ -235,7 +235,7 @@ CAIF_DeviceTensor &CAIF_DeviceLayerNorm::ParameterTensor(size_t index)
     }
     THROW_CAIFE("DeviceLayerNorm::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLayerNorm::ParameterTensor(size_t index)const
@@ -252,7 +252,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLayerNorm::ParameterTensor(size_t index)cons
     }
     THROW_CAIFE("DeviceLayerNorm::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceLayerNorm::GradientTensor(size_t index)
@@ -269,7 +269,7 @@ CAIF_DeviceTensor &CAIF_DeviceLayerNorm::GradientTensor(size_t index)
     }
     THROW_CAIFE("DeviceLayerNorm::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLayerNorm::GradientTensor(size_t index)const
@@ -286,7 +286,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLayerNorm::GradientTensor(size_t index)const
     }
     THROW_CAIFE("DeviceLayerNorm::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLayerNorm::TotalParameterCount()const
@@ -295,7 +295,7 @@ size_t CAIF_DeviceLayerNorm::TotalParameterCount()const
   {
     return static_cast<size_t>(_dim)*2;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceLayerNorm::Description()const
@@ -304,7 +304,7 @@ std::string CAIF_DeviceLayerNorm::Description()const
   {
     return "LayerNorm("+std::to_string(_dim)+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceLayerNorm::ParameterNames(const std::string &prefix)const
@@ -316,7 +316,7 @@ std::vector<std::string> CAIF_DeviceLayerNorm::ParameterNames(const std::string 
     names.push_back(prefix+"bias");
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

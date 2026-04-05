@@ -112,7 +112,7 @@ CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(const Config_t &config,CAIF_CudaStream 
 
     _stream->Synchronize();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(const Config_t &config,
@@ -160,7 +160,7 @@ CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(const Config_t &config,
 
     _stream->Synchronize();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(CAIF_DeviceMoELayer &&other)
@@ -362,7 +362,7 @@ CAIF_DeviceMoELayer::MoEOutput_t CAIF_DeviceMoELayer::ForwardMoE(const CAIF_Devi
 
     return moe_output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoELayer::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -372,7 +372,7 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer::Forward(const CAIF_DeviceTensor &input,bo
     MoEOutput_t output=ForwardMoE(input,training);
     return std::move(output.output);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<CAIF_DeviceTensor> CAIF_DeviceMoELayer::DispatchTokens(const CAIF_DeviceTensor &input,
@@ -470,7 +470,7 @@ std::vector<CAIF_DeviceTensor> CAIF_DeviceMoELayer::DispatchTokens(const CAIF_De
 
     return expert_inputs;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoELayer::CombineOutputs(const std::vector<CAIF_DeviceTensor> &expert_outputs,
@@ -494,7 +494,7 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer::CombineOutputs(const std::vector<CAIF_Dev
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_DeviceMoELayer::ComputeBalanceLoss(const CAIF_DeviceTensor &router_probs,
@@ -539,7 +539,7 @@ float CAIF_DeviceMoELayer::ComputeBalanceLoss(const CAIF_DeviceTensor &router_pr
 
     return _config.balance_loss_weight*static_cast<float>(_config.num_experts)*loss;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_DeviceMoELayer::ComputeZLoss(const CAIF_DeviceTensor &router_logits)
@@ -568,7 +568,7 @@ float CAIF_DeviceMoELayer::ComputeZLoss(const CAIF_DeviceTensor &router_logits)
 
     return _config.z_loss_weight*total_host/static_cast<float>(num_tokens);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoELayer::Backward(const CAIF_DeviceTensor &grad_output)
@@ -660,7 +660,7 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer::Backward(const CAIF_DeviceTensor &grad_ou
     }
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMoELayer::ZeroGradients()
@@ -677,7 +677,7 @@ void CAIF_DeviceMoELayer::ZeroGradients()
       shared->ZeroGradients();
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMoELayer::ParameterTensorCount()const

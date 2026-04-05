@@ -235,4 +235,13 @@ void CAIF_DeviceContext::SetCudnnStream(cudaStream_t stream)
 }
 #endif
 
+CAIF_DeviceProperties &CAIF_DeviceContext::DeviceProperties()
+{
+  if(_initialized==false)
+  {
+    Initialize();
+  }
+  return CAIF_DeviceProperties::ForDevice(_device_id);
+}
+
 }//end instance namespace

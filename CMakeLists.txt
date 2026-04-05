@@ -611,7 +611,7 @@ function(caif_link_cuda target_name)
   # System libraries required when statically linking CUDA runtime
   target_link_libraries(${target_name} PUBLIC rt dl pthread)
 
-  set_target_properties(${target_name} PROPERTIES CUDA_ARCHITECTURES "120")
+  set_target_properties(${target_name} PROPERTIES CUDA_ARCHITECTURES "75;80;89;90;120")
 endfunction()
 
 # --- Static library (libcaif.a) ---

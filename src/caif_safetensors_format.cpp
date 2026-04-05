@@ -807,7 +807,7 @@ void CAIF_SafeTensorsFormat::Save(const std::string &path,
 
     out.close();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -845,7 +845,7 @@ CAIF_SafeTensorsFormat::Load(const std::string &path,CAIF_CudaStream &stream)con
 
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -861,7 +861,7 @@ CAIF_SafeTensorsFormat::TensorInfos(const std::string &path)const
     std::string json_header=ReadHeader(path,data_start);
     return ParseTensorInfos(json_header);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -876,7 +876,7 @@ std::map<std::string,std::string> CAIF_SafeTensorsFormat::Metadata(const std::st
     std::string json_header=ReadHeader(path,data_start);
     return ParseMetadata(json_header);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -937,7 +937,7 @@ CAIF_SafeTensorsFormat::LoadSharded(const std::string &directory,CAIF_CudaStream
 
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -999,7 +999,7 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadTensorByName(const std::string &di
 
     return LoadSingleTensor(shard_path,data_start,tensor_it->second,stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

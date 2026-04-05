@@ -110,7 +110,7 @@ CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,CAIF_CudaStrea
 
     _stream->Synchronize();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,
@@ -143,7 +143,7 @@ CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,
       THROW_CAIFE("MoEExpert: gate projection required for gated mode");
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(CAIF_DeviceMoEExpert &&other)
@@ -327,7 +327,7 @@ CAIF_DeviceTensor CAIF_DeviceMoEExpert::Forward(const CAIF_DeviceTensor &input,b
       return output;
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoEExpert::Backward(const CAIF_DeviceTensor &grad_output)
@@ -452,7 +452,7 @@ CAIF_DeviceTensor CAIF_DeviceMoEExpert::Backward(const CAIF_DeviceTensor &grad_o
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMoEExpert::ZeroGradients()
@@ -489,7 +489,7 @@ void CAIF_DeviceMoEExpert::ZeroGradients()
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMoEExpert::ParameterTensorCount()const

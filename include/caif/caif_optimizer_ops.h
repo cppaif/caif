@@ -72,21 +72,23 @@ class CAIF_OptimizerOps
         for(size_t i=0;i<n;++i)
         {
           float g=grad[i];
-          if(weight_decay>0.0f)
-          {
-            g+=weight_decay*param[i];
-          }
-          
+
           m[i]=beta1*m[i]+(1.0f-beta1)*g;
           v[i]=beta2*v[i]+(1.0f-beta2)*g*g;
-          
+
           const float m_hat=m[i]/bias_correction1;
           const float v_hat=v[i]/bias_correction2;
-          
+
           param[i]-=lr*m_hat/(std::sqrt(v_hat)+epsilon);
+
+          // Decoupled weight decay (AdamW)
+          if(weight_decay>0.0f)
+          {
+            param[i]-=lr*weight_decay*param[i];
+          }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -140,7 +142,7 @@ class CAIF_OptimizerOps
           param[i]+=velocity[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**

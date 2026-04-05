@@ -62,7 +62,7 @@ class CAIF_ReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Forward(const float *input,float *output,const size_t n)
@@ -84,7 +84,7 @@ class CAIF_ReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(const float *input,const float *grad_output,float *grad_input,const size_t n)
@@ -106,7 +106,7 @@ class CAIF_ReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);
@@ -134,7 +134,7 @@ class CAIF_Sigmoid
           data[i]=1.0f/(1.0f+std::exp(-data[i]));
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Forward(const float *input,float *output,const size_t n)
@@ -149,7 +149,7 @@ class CAIF_Sigmoid
           output[i]=1.0f/(1.0f+std::exp(-input[i]));
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(const float *output,const float *grad_output,float *grad_input,const size_t n)
@@ -164,7 +164,7 @@ class CAIF_Sigmoid
           grad_input[i]=grad_output[i]*output[i]*(1.0f-output[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);
@@ -192,7 +192,7 @@ class CAIF_Tanh
           data[i]=std::tanh(data[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Forward(const float *input,float *output,const size_t n)
@@ -207,7 +207,7 @@ class CAIF_Tanh
           output[i]=std::tanh(input[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(const float *output,const float *grad_output,float *grad_input,const size_t n)
@@ -222,7 +222,7 @@ class CAIF_Tanh
           grad_input[i]=grad_output[i]*(1.0f-output[i]*output[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);
@@ -255,7 +255,7 @@ class CAIF_LeakyReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Forward(const float *input,float *output,const size_t n,const float alpha=g_default_alpha)
@@ -277,7 +277,7 @@ class CAIF_LeakyReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(
@@ -305,7 +305,7 @@ class CAIF_LeakyReLU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input,const float alpha=g_default_alpha);
@@ -346,7 +346,7 @@ class CAIF_ELU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(
@@ -375,7 +375,7 @@ class CAIF_ELU
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input,const float alpha=g_default_alpha);
@@ -413,7 +413,7 @@ class CAIF_GELU
           output[i]=x*cdf;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(const float *input,const float *grad_output,float *grad_input,const size_t n)
@@ -435,7 +435,7 @@ class CAIF_GELU
           grad_input[i]=grad_output[i]*(cdf+x*pdf);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);
@@ -464,7 +464,7 @@ class CAIF_Swish
           output[i]=input[i]*sigmoid;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(
@@ -487,7 +487,7 @@ class CAIF_Swish
           grad_input[i]=grad_output[i]*(output[i]+sigmoid*(1.0f-output[i]));
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);
@@ -541,7 +541,7 @@ class CAIF_Softmax
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static void Backward(
@@ -575,7 +575,7 @@ class CAIF_Softmax
           }
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     static CAIF_Tensor Forward(const CAIF_Tensor &input);

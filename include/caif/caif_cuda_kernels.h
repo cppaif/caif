@@ -751,6 +751,7 @@ void launch_cross_entropy_logits_backward(const float *logits,
                                           int n,
                                           int vocab_size,
                                           int ignore_index,
+                                          float scale,
                                           cudaStream_t stream);
 
 /**
@@ -763,6 +764,22 @@ void launch_cross_entropy_reduce_mean(const float *losses,
                                       int n,
                                       int ignore_index,
                                       cudaStream_t stream);
+
+/**
+ * Fused cross-entropy forward+backward. Computes loss AND gradient in one pass.
+ * Eliminates host roundtrip for valid_count and halves logits memory reads.
+ * logits: [N, vocab_size], targets: [N], losses: [N], grad: [N, vocab_size]
+ * result: [2] floats (must be pre-zeroed) — result[0]=valid_count, result[1]=loss_sum
+ */
+void launch_cross_entropy_fused(const float *logits,
+                                const float *targets,
+                                float *losses,
+                                float *grad,
+                                float *result,
+                                int n,
+                                int vocab_size,
+                                int ignore_index,
+                                cudaStream_t stream);
 
 //------------------------------------------------------------------------------
 // SiLU backward kernel
@@ -798,6 +815,15 @@ void launch_sum_axis1(const float *input,
                       int batch,
                       int dim,
                       cudaStream_t stream);
+
+/**
+ * Sum of squares: output[0] += sum(input[i]^2).
+ * Caller must zero output before launch.
+ */
+void launch_sum_of_squares(const float *input,
+                           float *output,
+                           int n,
+                           cudaStream_t stream);
 
 /**
  * Log-sum-exp along last axis: output[b] = log(sum_d exp(input[b,d]))

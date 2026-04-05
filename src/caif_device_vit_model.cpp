@@ -100,7 +100,7 @@ CAIF_DeviceViTModel::CAIF_DeviceViTModel(const Config_t &config,
     head_config.use_bias=true;
     _classification_head=std::make_unique<CAIF_DeviceLinearHead>(head_config,stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceViTModel::CAIF_DeviceViTModel(CAIF_DeviceViTModel &&other):CAIF_DeviceLayer(std::move(other)),
@@ -213,7 +213,7 @@ CAIF_DeviceTensor CAIF_DeviceViTModel::Forward(const CAIF_DeviceTensor &input,
 
     return logits;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceViTModel::Backward(const CAIF_DeviceTensor &grad_output)
@@ -270,7 +270,7 @@ CAIF_DeviceTensor CAIF_DeviceViTModel::Backward(const CAIF_DeviceTensor &grad_ou
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceViTModel::ZeroGradients()
@@ -286,7 +286,7 @@ void CAIF_DeviceViTModel::ZeroGradients()
     _final_norm->ZeroGradients();
     _classification_head->ZeroGradients();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceViTModel::ParameterTensorCount()const
@@ -488,7 +488,7 @@ std::string CAIF_DeviceViTModel::Description()const
            ",heads="+std::to_string(_config.num_heads)+
            ",classes="+std::to_string(_config.num_classes)+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceViTModel::ParameterNames(const std::string &prefix)const
@@ -523,7 +523,7 @@ std::vector<std::string> CAIF_DeviceViTModel::ParameterNames(const std::string &
 
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 uint32_t CAIF_DeviceViTModel::NumPatches()const
@@ -546,7 +546,7 @@ void CAIF_DeviceViTModel::InitializeWeights(uint32_t seed)
     // For reproducibility, we could pass different seeds to each
     (void)seed;  // Currently each sublayer uses its default initialization
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTransformerBlock &CAIF_DeviceViTModel::TransformerBlock(size_t index)

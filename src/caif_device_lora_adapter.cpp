@@ -72,7 +72,7 @@ CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
 
     // B is already zeros (LoRA starts as identity)
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(CAIF_DeviceLoRAAdapter &&other):CAIF_DeviceLayer(std::move(other)),
@@ -105,7 +105,7 @@ CAIF_DeviceLoRAAdapter &CAIF_DeviceLoRAAdapter::operator=(CAIF_DeviceLoRAAdapter
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input,
@@ -178,7 +178,7 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Backward(const CAIF_DeviceTensor &grad_output)
@@ -245,7 +245,7 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Backward(const CAIF_DeviceTensor &grad
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceLoRAAdapter::ZeroGradients()
@@ -256,7 +256,7 @@ void CAIF_DeviceLoRAAdapter::ZeroGradients()
     _grad_lora_b.Fill(0.0f);
     _base_layer->ZeroGradients();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLoRAAdapter::ParameterTensorCount()const
@@ -278,7 +278,7 @@ CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)
     }
     THROW_CAIFE("LoRAAdapter::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)const
@@ -295,7 +295,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)co
     }
     THROW_CAIFE("LoRAAdapter::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)
@@ -312,7 +312,7 @@ CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)
     }
     THROW_CAIFE("LoRAAdapter::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)const
@@ -329,7 +329,7 @@ const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)con
     }
     THROW_CAIFE("LoRAAdapter::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceLoRAAdapter::TotalParameterCount()const
@@ -339,7 +339,7 @@ size_t CAIF_DeviceLoRAAdapter::TotalParameterCount()const
     return static_cast<size_t>(_config.rank)*_config.input_dim+
            static_cast<size_t>(_config.output_dim)*_config.rank;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceLoRAAdapter::Description()const
@@ -356,7 +356,7 @@ std::string CAIF_DeviceLoRAAdapter::Description()const
     }
     return desc;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceLoRAAdapter::ParameterNames(
@@ -369,5 +369,5 @@ std::vector<std::string> CAIF_DeviceLoRAAdapter::ParameterNames(
     names.push_back(prefix+"lora_b.weight");
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

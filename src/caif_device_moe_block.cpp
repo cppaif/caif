@@ -103,7 +103,7 @@ CAIF_DeviceMoEBlock::CAIF_DeviceMoEBlock(const Config_t &config,
 
     _moe=std::make_unique<CAIF_DeviceMoELayer>(moe_config,stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoEBlock::CAIF_DeviceMoEBlock(
@@ -137,7 +137,7 @@ CAIF_DeviceMoEBlock &CAIF_DeviceMoEBlock::operator=(CAIF_DeviceMoEBlock &&other)
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoEBlock::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -168,7 +168,7 @@ CAIF_DeviceTensor CAIF_DeviceMoEBlock::Forward(const CAIF_DeviceTensor &input,bo
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceMoEBlock::Backward(const CAIF_DeviceTensor &grad_output)
@@ -194,7 +194,7 @@ CAIF_DeviceTensor CAIF_DeviceMoEBlock::Backward(const CAIF_DeviceTensor &grad_ou
 
     return d_x;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMoEBlock::ZeroGradients()
@@ -206,7 +206,7 @@ void CAIF_DeviceMoEBlock::ZeroGradients()
     _norm2->ZeroGradients();
     _moe->ZeroGradients();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMoEBlock::ParameterTensorCount()const
@@ -218,7 +218,7 @@ size_t CAIF_DeviceMoEBlock::ParameterTensorCount()const
            _norm2->ParameterTensorCount()+
            _moe->ParameterTensorCount();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceMoEBlock::SubLayerMapping_t CAIF_DeviceMoEBlock::MapIndex(size_t index)const
@@ -282,7 +282,7 @@ CAIF_DeviceTensor &CAIF_DeviceMoEBlock::ParameterTensor(size_t index)
     }
     return _moe->ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceMoEBlock::ParameterTensor(size_t index)const
@@ -304,7 +304,7 @@ const CAIF_DeviceTensor &CAIF_DeviceMoEBlock::ParameterTensor(size_t index)const
     }
     return _moe->ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceMoEBlock::GradientTensor(size_t index)
@@ -326,7 +326,7 @@ CAIF_DeviceTensor &CAIF_DeviceMoEBlock::GradientTensor(size_t index)
     }
     return _moe->GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceMoEBlock::GradientTensor(size_t index)const
@@ -348,7 +348,7 @@ const CAIF_DeviceTensor &CAIF_DeviceMoEBlock::GradientTensor(size_t index)const
     }
     return _moe->GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceMoEBlock::TotalParameterCount()const
@@ -360,7 +360,7 @@ size_t CAIF_DeviceMoEBlock::TotalParameterCount()const
            _norm2->TotalParameterCount()+
            _moe->TotalParameterCount();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceMoEBlock::Description()const
@@ -382,7 +382,7 @@ std::string CAIF_DeviceMoEBlock::Description()const
            ",top_k="+std::to_string(_config.top_k)+
            ",causal="+causal_str+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceMoEBlock::ParameterNames(const std::string &prefix)const
@@ -405,5 +405,5 @@ std::vector<std::string> CAIF_DeviceMoEBlock::ParameterNames(const std::string &
 
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

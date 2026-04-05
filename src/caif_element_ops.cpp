@@ -35,7 +35,7 @@ CAIF_Tensor CAIF_ElementOps::Add(const CAIF_Tensor &a,const CAIF_Tensor &b)
     Add(a.ConstData<float>(),b.ConstData<float>(),result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::AddScalar(const CAIF_Tensor &a,const float scalar)
@@ -46,7 +46,7 @@ CAIF_Tensor CAIF_ElementOps::AddScalar(const CAIF_Tensor &a,const float scalar)
     AddScalar(a.ConstData<float>(),scalar,result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::Sub(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -62,7 +62,7 @@ CAIF_Tensor CAIF_ElementOps::Sub(const CAIF_Tensor &a,const CAIF_Tensor &b)
     Sub(a.ConstData<float>(),b.ConstData<float>(),result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::SubScalar(const CAIF_Tensor &a,const float scalar)
@@ -73,7 +73,7 @@ CAIF_Tensor CAIF_ElementOps::SubScalar(const CAIF_Tensor &a,const float scalar)
     SubScalar(a.ConstData<float>(),scalar,result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::Mul(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -89,7 +89,7 @@ CAIF_Tensor CAIF_ElementOps::Mul(const CAIF_Tensor &a,const CAIF_Tensor &b)
     Mul(a.ConstData<float>(),b.ConstData<float>(),result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::MulScalar(const CAIF_Tensor &a,const float scalar)
@@ -100,7 +100,7 @@ CAIF_Tensor CAIF_ElementOps::MulScalar(const CAIF_Tensor &a,const float scalar)
     MulScalar(a.ConstData<float>(),scalar,result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::Div(const CAIF_Tensor &a,const CAIF_Tensor &b)
@@ -116,7 +116,7 @@ CAIF_Tensor CAIF_ElementOps::Div(const CAIF_Tensor &a,const CAIF_Tensor &b)
     Div(a.ConstData<float>(),b.ConstData<float>(),result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::DivScalar(const CAIF_Tensor &a,const float scalar)
@@ -127,7 +127,7 @@ CAIF_Tensor CAIF_ElementOps::DivScalar(const CAIF_Tensor &a,const float scalar)
     DivScalar(a.ConstData<float>(),scalar,result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ElementOps::Sqrt(const CAIF_Tensor &a)
@@ -138,7 +138,7 @@ CAIF_Tensor CAIF_ElementOps::Sqrt(const CAIF_Tensor &a)
     Sqrt(a.ConstData<float>(),result.MutableData<float>(),a.NumElements());
     return result;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_ElementOps::Sum(const CAIF_Tensor &a)
@@ -147,7 +147,7 @@ float CAIF_ElementOps::Sum(const CAIF_Tensor &a)
   {
     return Sum(a.ConstData<float>(),a.NumElements());
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 float CAIF_ElementOps::Mean(const CAIF_Tensor &a)
@@ -156,6 +156,6 @@ float CAIF_ElementOps::Mean(const CAIF_Tensor &a)
   {
     return Mean(a.ConstData<float>(),a.NumElements());
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

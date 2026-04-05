@@ -90,7 +90,7 @@ void CAIF_ConvolutionOps::Conv2DForward(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_ConvolutionOps::Conv2DBackwardInput(
@@ -163,7 +163,7 @@ void CAIF_ConvolutionOps::Conv2DBackwardInput(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_ConvolutionOps::Conv2DBackwardWeight(
@@ -235,7 +235,7 @@ void CAIF_ConvolutionOps::Conv2DBackwardWeight(
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ConvolutionOps::Conv2DForward(
@@ -290,7 +290,7 @@ CAIF_Tensor CAIF_ConvolutionOps::Conv2DForward(
     
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor CAIF_ConvolutionOps::Conv2DForward(
@@ -310,6 +310,6 @@ CAIF_Tensor CAIF_ConvolutionOps::Conv2DForward(
     // For now, use CPU implementation for all backends
     return Conv2DForward(input,kernel,stride_h,stride_w,pad_h,pad_w);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

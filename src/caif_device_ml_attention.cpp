@@ -74,7 +74,7 @@ CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
 
     InitializeWeights(0);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -113,7 +113,7 @@ CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
     _q_norm_gamma.Fill(1.0f);
     _kv_norm_gamma.Fill(1.0f);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -519,7 +519,7 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::Forward(const CAIF_DeviceTensor &input
     output.Reshape({batch,seq_len,_config.dim});
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -873,7 +873,7 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::Backward(const CAIF_DeviceTensor &grad
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -1163,7 +1163,7 @@ void CAIF_DeviceMLAttention::InitializeWeights(uint32_t seed)
 
     // Gamma stays at 1.0 (set in constructor)
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -1183,7 +1183,7 @@ void CAIF_DeviceMLAttention::EnableKVCache(uint32_t batch_size,uint32_t max_seq_
     _kv_cache_batch=batch_size;
     _kv_cache_enabled=true;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceMLAttention::DisableKVCache()
@@ -1492,5 +1492,5 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::ForwardCached(const CAIF_DeviceTensor 
     output.Reshape({batch,new_len,_config.dim});
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

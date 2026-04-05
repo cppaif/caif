@@ -53,7 +53,7 @@ void CAIF_OptimizerOps::AdamUpdate(
                bias_correction2
               );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_OptimizerOps::SGDMomentumUpdate(
@@ -77,6 +77,6 @@ void CAIF_OptimizerOps::SGDMomentumUpdate(
                       weight_decay
                      );
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 

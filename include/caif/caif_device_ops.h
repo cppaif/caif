@@ -545,6 +545,7 @@ namespace CAIF_DeviceOps
                   float beta1,
                   float beta2,
                   float epsilon,
+                  float weight_decay,
                   int t);
 
   //----------------------------------------------------------------------------

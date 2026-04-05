@@ -29,7 +29,8 @@ using namespace instance;
 
 CAIF_DevicePreNormBlock::CAIF_DevicePreNormBlock(SubLayerVec_t sub_layers,
                                                CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
-                                                                        _sub_layers(std::move(sub_layers))
+                                                                        _sub_layers(std::move(sub_layers)),
+                                                                        _norms_trainable(true)
 {
   try
   {
@@ -47,7 +48,7 @@ CAIF_DevicePreNormBlock::CAIF_DevicePreNormBlock(SubLayerVec_t sub_layers,
       }
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -56,7 +57,8 @@ CAIF_DevicePreNormBlock::CAIF_DevicePreNormBlock(SubLayerVec_t sub_layers,
 
 CAIF_DevicePreNormBlock::CAIF_DevicePreNormBlock(
   CAIF_DevicePreNormBlock &&other):CAIF_DeviceLayer(std::move(other)),
-                                  _sub_layers(std::move(other._sub_layers))
+                                  _sub_layers(std::move(other._sub_layers)),
+                                  _norms_trainable(other._norms_trainable)
 {
 }
 
@@ -66,6 +68,7 @@ CAIF_DevicePreNormBlock &CAIF_DevicePreNormBlock::operator=(CAIF_DevicePreNormBl
   {
     CAIF_DeviceLayer::operator=(std::move(other));
     _sub_layers=std::move(other._sub_layers);
+    _norms_trainable=other._norms_trainable;
   }
   return *this;
 }
@@ -101,7 +104,7 @@ CAIF_DeviceTensor CAIF_DevicePreNormBlock::Forward(const CAIF_DeviceTensor &inpu
 
     return x;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -137,7 +140,7 @@ CAIF_DeviceTensor CAIF_DevicePreNormBlock::Backward(const CAIF_DeviceTensor &gra
 
     return grad;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -157,7 +160,7 @@ void CAIF_DevicePreNormBlock::ZeroGradients()
       _sub_layers[i].layer->ZeroGradients();
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DevicePreNormBlock::ParameterTensorCount()const
@@ -165,7 +168,7 @@ size_t CAIF_DevicePreNormBlock::ParameterTensorCount()const
   size_t total=0;
   for(size_t i=0;i<_sub_layers.size();++i)
   {
-    if(_sub_layers[i].norm!=nullptr)
+    if(_sub_layers[i].norm!=nullptr && _norms_trainable==true)
     {
       total+=_sub_layers[i].norm->ParameterTensorCount();
     }
@@ -179,7 +182,7 @@ CAIF_DevicePreNormBlock::SubLayerMapping_t CAIF_DevicePreNormBlock::MapIndex(siz
   size_t remaining=index;
   for(size_t i=0;i<_sub_layers.size();++i)
   {
-    if(_sub_layers[i].norm!=nullptr)
+    if(_sub_layers[i].norm!=nullptr && _norms_trainable==true)
     {
       const size_t norm_count=_sub_layers[i].norm->ParameterTensorCount();
       if(remaining<norm_count)
@@ -233,7 +236,7 @@ CAIF_DeviceTensor &CAIF_DevicePreNormBlock::ParameterTensor(size_t index)
     const auto mapping=MapIndex(index);
     return LayerByMapping(mapping).ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DevicePreNormBlock::ParameterTensor(size_t index)const
@@ -243,7 +246,7 @@ const CAIF_DeviceTensor &CAIF_DevicePreNormBlock::ParameterTensor(size_t index)c
     const auto mapping=MapIndex(index);
     return LayerByMapping(mapping).ParameterTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DevicePreNormBlock::GradientTensor(size_t index)
@@ -253,7 +256,7 @@ CAIF_DeviceTensor &CAIF_DevicePreNormBlock::GradientTensor(size_t index)
     const auto mapping=MapIndex(index);
     return LayerByMapping(mapping).GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DevicePreNormBlock::GradientTensor(size_t index)const
@@ -263,7 +266,7 @@ const CAIF_DeviceTensor &CAIF_DevicePreNormBlock::GradientTensor(size_t index)co
     const auto mapping=MapIndex(index);
     return LayerByMapping(mapping).GradientTensor(mapping.local_idx);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DevicePreNormBlock::TotalParameterCount()const
@@ -298,7 +301,7 @@ std::vector<std::string> CAIF_DevicePreNormBlock::ParameterNames(const std::stri
     std::vector<std::string> names;
     for(size_t i=0;i<_sub_layers.size();++i)
     {
-      if(_sub_layers[i].norm!=nullptr)
+      if(_sub_layers[i].norm!=nullptr && _norms_trainable==true)
       {
         auto norm_names=_sub_layers[i].norm->ParameterNames(prefix+_sub_layers[i].norm_prefix);
         names.insert(names.end(),norm_names.begin(),norm_names.end());
@@ -309,5 +312,5 @@ std::vector<std::string> CAIF_DevicePreNormBlock::ParameterNames(const std::stri
     }
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }

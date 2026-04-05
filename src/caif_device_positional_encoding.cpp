@@ -79,7 +79,7 @@ CAIF_DevicePositionalEncoding::CAIF_DevicePositionalEncoding(const CAIF_DevicePo
       _sinusoidal_table.CopyFromHost(table.data(),table_size);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DevicePositionalEncoding::CAIF_DevicePositionalEncoding(CAIF_DevicePositionalEncoding &&other):
@@ -109,7 +109,7 @@ CAIF_DevicePositionalEncoding &CAIF_DevicePositionalEncoding::operator=(CAIF_Dev
     }
     return *this;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DevicePositionalEncoding::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -183,7 +183,7 @@ CAIF_DeviceTensor CAIF_DevicePositionalEncoding::Forward(const CAIF_DeviceTensor
 
     return output;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DevicePositionalEncoding::Backward(const CAIF_DeviceTensor &grad_output)
@@ -219,7 +219,7 @@ CAIF_DeviceTensor CAIF_DevicePositionalEncoding::Backward(const CAIF_DeviceTenso
 
     return grad_input;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DevicePositionalEncoding::ZeroGradients()
@@ -231,7 +231,7 @@ void CAIF_DevicePositionalEncoding::ZeroGradients()
       _pe_table_grad.Fill(0.0f);
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DevicePositionalEncoding::ParameterTensorCount()const
@@ -247,7 +247,7 @@ size_t CAIF_DevicePositionalEncoding::ParameterTensorCount()const
       return 0;
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::ParameterTensor(size_t index)
@@ -260,7 +260,7 @@ CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::ParameterTensor(size_t index)
     }
     THROW_CAIFE("DevicePositionalEncoding::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::ParameterTensor(size_t index)const
@@ -273,7 +273,7 @@ const CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::ParameterTensor(size_t i
     }
     THROW_CAIFE("DevicePositionalEncoding::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::GradientTensor(size_t index)
@@ -286,7 +286,7 @@ CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::GradientTensor(size_t index)
     }
     THROW_CAIFE("DevicePositionalEncoding::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::GradientTensor(size_t index)const
@@ -299,7 +299,7 @@ const CAIF_DeviceTensor &CAIF_DevicePositionalEncoding::GradientTensor(size_t in
     }
     THROW_CAIFE("DevicePositionalEncoding::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DevicePositionalEncoding::TotalParameterCount()const
@@ -315,7 +315,7 @@ size_t CAIF_DevicePositionalEncoding::TotalParameterCount()const
       return 0;
     }
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DevicePositionalEncoding::Description()const
@@ -335,7 +335,7 @@ std::string CAIF_DevicePositionalEncoding::Description()const
            ",dim="+std::to_string(_config.dim)+
            ",mode="+mode_str+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DevicePositionalEncoding::ParameterNames(const std::string &prefix)const
@@ -349,7 +349,7 @@ std::vector<std::string> CAIF_DevicePositionalEncoding::ParameterNames(const std
     }
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

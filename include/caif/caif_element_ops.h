@@ -66,7 +66,7 @@ class CAIF_ElementOps
           a[i]+=b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -84,7 +84,7 @@ class CAIF_ElementOps
           a[i]+=scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -102,7 +102,7 @@ class CAIF_ElementOps
           a[i]-=b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -120,7 +120,7 @@ class CAIF_ElementOps
           a[i]-=scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -138,7 +138,7 @@ class CAIF_ElementOps
           a[i]*=b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -156,7 +156,7 @@ class CAIF_ElementOps
           a[i]*=scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -174,7 +174,7 @@ class CAIF_ElementOps
           a[i]/=b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -193,7 +193,7 @@ class CAIF_ElementOps
           a[i]*=inv;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -211,7 +211,7 @@ class CAIF_ElementOps
           a[i]=std::sqrt(a[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     //--------------------------------------------------------------------------
@@ -233,7 +233,7 @@ class CAIF_ElementOps
           out[i]=a[i]+b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -251,7 +251,7 @@ class CAIF_ElementOps
           out[i]=a[i]+scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -269,7 +269,7 @@ class CAIF_ElementOps
           out[i]=a[i]-b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -287,7 +287,7 @@ class CAIF_ElementOps
           out[i]=a[i]-scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -305,7 +305,7 @@ class CAIF_ElementOps
           out[i]=a[i]*b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -323,7 +323,7 @@ class CAIF_ElementOps
           out[i]=a[i]*scalar;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -341,7 +341,7 @@ class CAIF_ElementOps
           out[i]=a[i]/b[i];
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -360,7 +360,7 @@ class CAIF_ElementOps
           out[i]=a[i]*inv;
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -378,7 +378,7 @@ class CAIF_ElementOps
           out[i]=std::sqrt(a[i]);
         }
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     //--------------------------------------------------------------------------
@@ -402,7 +402,7 @@ class CAIF_ElementOps
         }
         return sum;
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -414,7 +414,7 @@ class CAIF_ElementOps
       {
         return Sum(a,n)/static_cast<float>(n);
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -437,7 +437,7 @@ class CAIF_ElementOps
         }
         return max_val;
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     /**
@@ -460,7 +460,7 @@ class CAIF_ElementOps
         }
         return min_val;
       }
-      CCAIF_CATCH_BLOCK()
+      CAIF_CATCH_BLOCK()
     }
     
     //--------------------------------------------------------------------------

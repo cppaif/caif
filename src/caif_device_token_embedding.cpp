@@ -66,7 +66,7 @@ CAIF_DeviceTokenEmbedding::CAIF_DeviceTokenEmbedding(const CAIF_DeviceTokenEmbed
 
     _embedding_table_grad=CAIF_DeviceTensor::Zeros({config.vocab_size,config.dim},stream);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTokenEmbedding::~CAIF_DeviceTokenEmbedding()
@@ -192,7 +192,7 @@ CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::ForwardFromIds(const uint32_t *host
 
     return _output_buffer.Clone();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Forward(const CAIF_DeviceTensor &input,bool training)
@@ -237,7 +237,7 @@ CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Forward(const CAIF_DeviceTensor &in
 
     return _output_buffer.Clone();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
@@ -267,7 +267,7 @@ CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Backward(const CAIF_DeviceTensor &g
     // Return empty tensor (input is non-differentiable discrete token IDs)
     return CAIF_DeviceTensor();
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_DeviceTokenEmbedding::ZeroGradients()
@@ -276,7 +276,7 @@ void CAIF_DeviceTokenEmbedding::ZeroGradients()
   {
     _embedding_table_grad.Fill(0.0f);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceTokenEmbedding::ParameterTensorCount()const
@@ -285,7 +285,7 @@ size_t CAIF_DeviceTokenEmbedding::ParameterTensorCount()const
   {
     return g_caif_embedding_parameter_count;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index)
@@ -298,7 +298,7 @@ CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index)
     }
     THROW_CAIFE("DeviceTokenEmbedding::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index)const
@@ -311,7 +311,7 @@ const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index
     }
     THROW_CAIFE("DeviceTokenEmbedding::ParameterTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
@@ -324,7 +324,7 @@ CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
     }
     THROW_CAIFE("DeviceTokenEmbedding::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)const
@@ -337,7 +337,7 @@ const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
     }
     THROW_CAIFE("DeviceTokenEmbedding::GradientTensor: index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 size_t CAIF_DeviceTokenEmbedding::TotalParameterCount()const
@@ -346,7 +346,7 @@ size_t CAIF_DeviceTokenEmbedding::TotalParameterCount()const
   {
     return static_cast<size_t>(_config.vocab_size)*_config.dim;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::string CAIF_DeviceTokenEmbedding::Description()const
@@ -356,7 +356,7 @@ std::string CAIF_DeviceTokenEmbedding::Description()const
     return "TokenEmbedding(vocab="+std::to_string(_config.vocab_size)+
            ",dim="+std::to_string(_config.dim)+")";
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 std::vector<std::string> CAIF_DeviceTokenEmbedding::ParameterNames(const std::string &prefix)const
@@ -367,7 +367,7 @@ std::vector<std::string> CAIF_DeviceTokenEmbedding::ParameterNames(const std::st
     names.push_back(prefix+"weight");
     return names;
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 }//end instance namespace

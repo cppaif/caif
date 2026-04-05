@@ -527,7 +527,7 @@ CAIF_Tensor &CAIF_Convolution2DLayer::ParameterRef(const size_t index)
     }
     THROW_CAIFE("Parameter index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_Tensor &CAIF_Convolution2DLayer::ParameterRef(const size_t index)const
@@ -544,7 +544,7 @@ const CAIF_Tensor &CAIF_Convolution2DLayer::ParameterRef(const size_t index)cons
     }
     THROW_CAIFE("Parameter index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 CAIF_Tensor &CAIF_Convolution2DLayer::GradientRef(const size_t index)
@@ -561,7 +561,7 @@ CAIF_Tensor &CAIF_Convolution2DLayer::GradientRef(const size_t index)
     }
     THROW_CAIFE("Gradient index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 const CAIF_Tensor &CAIF_Convolution2DLayer::GradientRef(const size_t index)const
@@ -578,7 +578,7 @@ const CAIF_Tensor &CAIF_Convolution2DLayer::GradientRef(const size_t index)const
     }
     THROW_CAIFE("Gradient index out of range");
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 void CAIF_Convolution2DLayer::UpdateParameters(const std::vector<CAIF_Tensor> &new_parameters)
