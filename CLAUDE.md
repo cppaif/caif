@@ -1,5 +1,8 @@
 # CAIF Public — GitHub Release Repository
 
+**WARNING: This file (CLAUDE.md) must NEVER be pushed to GitHub.
+Add it to .gitignore on the github-release branch. It is internal only.**
+
 This is the public release repo. Do NOT develop here.
 
 ## Workflow
