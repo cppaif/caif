@@ -13,10 +13,20 @@
 // limitations under the License.
 
 #include "caif_device_ffn.h"
-#include "caif_device_pointwise_activations.h"
-#include "caif_device_gated_activations.h"
+#include "caif_test_harness.h"
+#include "caif_device_gelu_activation.h"
+#include "caif_device_swiglu_activation.h"
+#include "caif_device_geglu_activation.h"
+#include "caif_device_reglu_activation.h"
+#include "caif_device_glu_activation.h"
+#include "caif_device_bilinear_activation.h"
+#include "caif_device_network.h"
+#include "caif_run_context.h"
+#include "caif_settings.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_cpu_reference/caif_cpu_matmul.h"
+#include "caif_cpu_reference/caif_cpu_activations.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -24,75 +34,31 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
+struct GradMode_t
+{
+  bool precise;
+  float tol;
+  const char *label;
+};
+
+static const GradMode_t kGradModePrecise={true, 8e-2f, "Precise"};
+static const GradMode_t kGradModeTF32=   {false,1.5e-1f,"TF32"};
 
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
 
 //------------------------------------------------------------------------------
-// CPU reference functions
+// CPU reference composites (primitives come from caif_cpu_reference/*.h)
 //------------------------------------------------------------------------------
-
-static void CpuMatMul(const float *a,const float *b,float *c,
-                       int m,int k,int n)
-{
-  for(int i=0;i<m;++i)
-  {
-    for(int j=0;j<n;++j)
-    {
-      float sum=0.0f;
-      for(int p=0;p<k;++p)
-      {
-        sum+=a[i*k+p]*b[p*n+j];
-      }
-      c[i*n+j]=sum;
-    }
-  }
-}
-
-static void CpuGELU(float *data,int n)
-{
-  const float sqrt_2_over_pi=0.7978845608f;
-  const float coeff=0.044715f;
-  for(int i=0;i<n;++i)
-  {
-    const float x=data[i];
-    const float inner=sqrt_2_over_pi*(x+coeff*x*x*x);
-    data[i]=0.5f*x*(1.0f+std::tanh(inner));
-  }
-}
-
-static float CpuSwish(float x)
-{
-  return x/(1.0f+std::exp(-x));
-}
-
-static void CpuSwiGLU(const float *gate,const float *up,float *out,int n)
-{
-  for(int i=0;i<n;++i)
-  {
-    out[i]=CpuSwish(gate[i])*up[i];
-  }
-}
 
 // CPU pointwise FFN: output = GELU(input @ W1) @ W2
 static void CpuFFNPointwise(const float *input,
@@ -105,13 +71,13 @@ static void CpuFFNPointwise(const float *input,
 {
   // hidden = input @ W1 -> [n_rows, ffn_dim]
   std::vector<float> hidden(n_rows*ffn_dim);
-  CpuMatMul(input,w1,hidden.data(),n_rows,dim,ffn_dim);
+  CAIF_CpuMatMul::Apply(input,w1,hidden.data(),n_rows,dim,ffn_dim);
 
   // activation
-  CpuGELU(hidden.data(),n_rows*ffn_dim);
+  CAIF_CpuActivations::GELUArray(hidden.data(),n_rows*ffn_dim);
 
   // output = hidden @ W2 -> [n_rows, dim]
-  CpuMatMul(hidden.data(),w2,output,n_rows,ffn_dim,dim);
+  CAIF_CpuMatMul::Apply(hidden.data(),w2,output,n_rows,ffn_dim,dim);
 }
 
 // CPU gated FFN: output = SwiGLU(input @ W_gate, input @ W_up) @ W_down
@@ -126,18 +92,18 @@ static void CpuFFNGated(const float *input,
 {
   // gate = input @ W_gate -> [n_rows, ffn_dim]
   std::vector<float> gate(n_rows*ffn_dim);
-  CpuMatMul(input,w_gate,gate.data(),n_rows,dim,ffn_dim);
+  CAIF_CpuMatMul::Apply(input,w_gate,gate.data(),n_rows,dim,ffn_dim);
 
   // up = input @ W_up -> [n_rows, ffn_dim]
   std::vector<float> up(n_rows*ffn_dim);
-  CpuMatMul(input,w_up,up.data(),n_rows,dim,ffn_dim);
+  CAIF_CpuMatMul::Apply(input,w_up,up.data(),n_rows,dim,ffn_dim);
 
   // act = SwiGLU(gate, up) -> [n_rows, ffn_dim]
   std::vector<float> act(n_rows*ffn_dim);
-  CpuSwiGLU(gate.data(),up.data(),act.data(),n_rows*ffn_dim);
+  CAIF_CpuActivations::SwiGLU(gate.data(),up.data(),act.data(),n_rows*ffn_dim);
 
   // output = act @ W_down -> [n_rows, dim]
-  CpuMatMul(act.data(),w_down,output,n_rows,ffn_dim,dim);
+  CAIF_CpuMatMul::Apply(act.data(),w_down,output,n_rows,ffn_dim,dim);
 }
 
 //------------------------------------------------------------------------------
@@ -153,18 +119,22 @@ static void TestPointwiseForwardShape()
     const uint32_t ffn_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -186,11 +156,7 @@ static void TestPointwiseForwardShape()
 
     ReportResult("FFN::PointwiseForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::PointwiseForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::PointwiseForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -206,18 +172,22 @@ static void TestGatedForwardShape()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -239,11 +209,7 @@ static void TestGatedForwardShape()
 
     ReportResult("FFN::GatedForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::GatedForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::GatedForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -260,12 +226,14 @@ static void TestPointwiseForwardValues()
     const int n_rows=static_cast<int>(batch*seq_len);
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     // Get weights for CPU reference
     CAIF_HostTensor h_w1=ffn.ParameterTensor(0).ToHost();
@@ -282,7 +250,9 @@ static void TestPointwiseForwardValues()
                              host_input.data(),{batch,seq_len,dim},stream);
 
     // GPU forward
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // CPU reference
@@ -309,11 +279,7 @@ static void TestPointwiseForwardValues()
 
     ReportResult("FFN::PointwiseForwardValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::PointwiseForwardValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::PointwiseForwardValues")
 }
 
 //------------------------------------------------------------------------------
@@ -330,12 +296,14 @@ static void TestGatedForwardValues()
     const int n_rows=static_cast<int>(batch*seq_len);
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     // Get weights for CPU reference
     CAIF_HostTensor h_wg=ffn.ParameterTensor(0).ToHost();
@@ -352,9 +320,15 @@ static void TestGatedForwardValues()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    // GPU forward
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    // GPU forward — compare GPU algorithm to CPU reference in full FP32
+    // (three matmuls: Wg, Wu, Wd, so TF32 drift exceeds 1e-3 tolerance).
+    const bool prev_precise=CAIF_Settings::PreciseGradients();
+    CAIF_Settings::SetPreciseGradients(true);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
+    CAIF_Settings::SetPreciseGradients(prev_precise);
 
     // CPU reference
     std::vector<float> expected(batch*seq_len*dim);
@@ -380,29 +354,31 @@ static void TestGatedForwardValues()
 
     ReportResult("FFN::GatedForwardValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::GatedForwardValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::GatedForwardValues")
 }
 
 //------------------------------------------------------------------------------
 // Test 5: Pointwise backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestPointwiseBackwardGrad()
+static void TestPointwiseBackwardGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("FFN::PointwiseBackwardGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=2;
     const uint32_t dim=4;
     const uint32_t ffn_dim=8;
     const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
@@ -414,8 +390,8 @@ static void TestPointwiseBackwardGrad()
     }
 
     // Get analytical gradient
-    auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     // Save weights
     CAIF_HostTensor h_w1=ffn.ParameterTensor(0).ToHost();
@@ -423,16 +399,20 @@ static void TestPointwiseBackwardGrad()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    ffn.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    ffn.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
 
+    ctx.SetTraining(false);
     for(size_t i=0;i<host_input.size()&&passed==true;++i)
     {
       std::vector<float> input_plus(host_input);
@@ -441,14 +421,14 @@ static void TestPointwiseBackwardGrad()
       input_minus[i]-=h;
 
       // Forward with +h
-      auto act_p=std::make_unique<CAIF_DeviceGELUActivation>();
-      CAIF_DeviceFFN ffn_p(config,std::move(act_p),stream);
+      auto act_p=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_p(config,std::move(act_p),stream);
       ffn_p.ParameterTensor(0).CopyFromHost(h_w1.Data(),h_w1.TotalElements());
       ffn_p.ParameterTensor(1).CopyFromHost(h_w2.Data(),h_w2.TotalElements());
 
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_plus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -457,14 +437,14 @@ static void TestPointwiseBackwardGrad()
       }
 
       // Forward with -h
-      auto act_m=std::make_unique<CAIF_DeviceGELUActivation>();
-      CAIF_DeviceFFN ffn_m(config,std::move(act_m),stream);
+      auto act_m=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_m(config,std::move(act_m),stream);
       ffn_m.ParameterTensor(0).CopyFromHost(h_w1.Data(),h_w1.TotalElements());
       ffn_m.ParameterTensor(1).CopyFromHost(h_w2.Data(),h_w2.TotalElements());
 
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_minus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -475,7 +455,7 @@ static void TestPointwiseBackwardGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -484,31 +464,34 @@ static void TestPointwiseBackwardGrad()
       }
     }
 
-    ReportResult("FFN::PointwiseBackwardGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::PointwiseBackwardGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 6: Gated backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestGatedBackwardGrad()
+static void TestGatedBackwardGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("FFN::GatedBackwardGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=2;
     const uint32_t dim=4;
     const uint32_t ffn_dim=8;
     const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
@@ -520,8 +503,8 @@ static void TestGatedBackwardGrad()
     }
 
     // Get analytical gradient
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     // Save weights
     CAIF_HostTensor h_wg=ffn.ParameterTensor(0).ToHost();
@@ -530,16 +513,20 @@ static void TestGatedBackwardGrad()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    ffn.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    ffn.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
 
+    ctx.SetTraining(false);
     for(size_t i=0;i<host_input.size()&&passed==true;++i)
     {
       std::vector<float> input_plus(host_input);
@@ -548,15 +535,15 @@ static void TestGatedBackwardGrad()
       input_minus[i]-=h;
 
       // Forward with +h
-      auto act_p=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn_p(config,std::move(act_p),stream);
+      auto act_p=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_p(config,std::move(act_p),stream);
       ffn_p.ParameterTensor(0).CopyFromHost(h_wg.Data(),h_wg.TotalElements());
       ffn_p.ParameterTensor(1).CopyFromHost(h_wu.Data(),h_wu.TotalElements());
       ffn_p.ParameterTensor(2).CopyFromHost(h_wd.Data(),h_wd.TotalElements());
 
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_plus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -565,15 +552,15 @@ static void TestGatedBackwardGrad()
       }
 
       // Forward with -h
-      auto act_m=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn_m(config,std::move(act_m),stream);
+      auto act_m=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_m(config,std::move(act_m),stream);
       ffn_m.ParameterTensor(0).CopyFromHost(h_wg.Data(),h_wg.TotalElements());
       ffn_m.ParameterTensor(1).CopyFromHost(h_wu.Data(),h_wu.TotalElements());
       ffn_m.ParameterTensor(2).CopyFromHost(h_wd.Data(),h_wd.TotalElements());
 
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_minus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -584,7 +571,7 @@ static void TestGatedBackwardGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -593,31 +580,34 @@ static void TestGatedBackwardGrad()
       }
     }
 
-    ReportResult("FFN::GatedBackwardGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::GatedBackwardGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 7: Gated backward weight gradient (finite difference, W_gate spot check)
 //------------------------------------------------------------------------------
-static void TestGatedBackwardWeightGrad()
+static void TestGatedBackwardWeightGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("FFN::GatedBackwardWeightGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=2;
     const uint32_t dim=4;
     const uint32_t ffn_dim=8;
     const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
@@ -628,8 +618,8 @@ static void TestGatedBackwardWeightGrad()
     }
 
     // Get analytical gradient
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     CAIF_HostTensor h_wg=ffn.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wu=ffn.ParameterTensor(1).ToHost();
@@ -637,12 +627,15 @@ static void TestGatedBackwardWeightGrad()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    ffn.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    ffn.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    ffn.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    ffn.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_wg=ffn.GradientTensor(0).ToHost();
 
     bool passed=true;
@@ -652,6 +645,7 @@ static void TestGatedBackwardWeightGrad()
     std::vector<float> wg_data(h_wg.Data(),
                                 h_wg.Data()+h_wg.TotalElements());
 
+    ctx.SetTraining(false);
     for(size_t i=0;i<check_count&&passed==true;++i)
     {
       std::vector<float> wg_plus(wg_data);
@@ -660,15 +654,15 @@ static void TestGatedBackwardWeightGrad()
       wg_minus[i]-=h;
 
       // Forward with +h
-      auto act_p=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn_p(config,std::move(act_p),stream);
+      auto act_p=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_p(config,std::move(act_p),stream);
       ffn_p.ParameterTensor(0).CopyFromHost(wg_plus.data(),wg_plus.size());
       ffn_p.ParameterTensor(1).CopyFromHost(h_wu.Data(),h_wu.TotalElements());
       ffn_p.ParameterTensor(2).CopyFromHost(h_wd.Data(),h_wd.TotalElements());
 
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=ffn_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -677,15 +671,15 @@ static void TestGatedBackwardWeightGrad()
       }
 
       // Forward with -h
-      auto act_m=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn_m(config,std::move(act_m),stream);
+      auto act_m=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn_m(config,std::move(act_m),stream);
       ffn_m.ParameterTensor(0).CopyFromHost(wg_minus.data(),wg_minus.size());
       ffn_m.ParameterTensor(1).CopyFromHost(h_wu.Data(),h_wu.TotalElements());
       ffn_m.ParameterTensor(2).CopyFromHost(h_wd.Data(),h_wd.TotalElements());
 
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=ffn_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -696,7 +690,7 @@ static void TestGatedBackwardWeightGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad_wg.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dW_gate mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -705,13 +699,10 @@ static void TestGatedBackwardWeightGrad()
       }
     }
 
-    ReportResult("FFN::GatedBackwardWeightGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::GatedBackwardWeightGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
@@ -725,7 +716,7 @@ static void TestParameterCount()
     const uint32_t ffn_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
@@ -733,8 +724,8 @@ static void TestParameterCount()
 
     // Pointwise: 2 parameter tensors
     {
-      auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
       if(ffn.ParameterTensorCount()!=2)
       {
@@ -754,8 +745,8 @@ static void TestParameterCount()
 
     // Gated: 3 parameter tensors
     {
-      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
       if(ffn.ParameterTensorCount()!=3)
       {
@@ -775,11 +766,7 @@ static void TestParameterCount()
 
     ReportResult("FFN::ParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::ParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::ParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -795,23 +782,28 @@ static void TestZeroGradients()
     const uint32_t ffn_dim=8;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    ffn.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    ffn.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    ffn.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    ffn.Backward(grad_out,ctx);
 
     // Zero gradients
     ffn.ZeroGradients();
@@ -838,11 +830,7 @@ static void TestZeroGradients()
 
     ReportResult("FFN::ZeroGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::ZeroGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::ZeroGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -856,7 +844,7 @@ static void TestDescription()
     const uint32_t ffn_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
@@ -864,8 +852,8 @@ static void TestDescription()
 
     // Pointwise
     {
-      auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
       const std::string desc=ffn.Description();
       const std::string expected="FFN(dim=8,ffn_dim=32,activation=GELU)";
       if(desc!=expected)
@@ -877,8 +865,8 @@ static void TestDescription()
 
     // Gated
     {
-      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(activation),stream);
       const std::string desc=ffn.Description();
       const std::string expected="FFN(dim=8,ffn_dim=32,activation=SwiGLU)";
       if(desc!=expected)
@@ -890,27 +878,26 @@ static void TestDescription()
 
     ReportResult("FFN::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::Description")
 }
 
 #endif  // USE_CAIF_CUDA
 
 int main()
 {
-  std::cout<<"=== CAIF_DeviceFFN Tests ===\n\n";
+  std::cout<<"=== CAIF_DeviceFFN<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestPointwiseForwardShape();
   TestGatedForwardShape();
   TestPointwiseForwardValues();
   TestGatedForwardValues();
-  TestPointwiseBackwardGrad();
-  TestGatedBackwardGrad();
-  TestGatedBackwardWeightGrad();
+  TestPointwiseBackwardGrad(kGradModePrecise);
+  TestPointwiseBackwardGrad(kGradModeTF32);
+  TestGatedBackwardGrad(kGradModePrecise);
+  TestGatedBackwardGrad(kGradModeTF32);
+  TestGatedBackwardWeightGrad(kGradModePrecise);
+  TestGatedBackwardWeightGrad(kGradModeTF32);
   TestParameterCount();
   TestZeroGradients();
   TestDescription();
@@ -918,13 +905,5 @@ int main()
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

@@ -13,13 +13,16 @@
 // limitations under the License.
 
 #include "caif_device_context.h"
-#include "caif_constants.h"
 #include "caif_exception.h"
+#include "caif_settings.h"
+
+#include <cstdio>
+#include <cstdlib>
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
-#include "cuda/cublas_v2.h"
-#include "cudnn/cudnn.h"
+#include <cuda_runtime_api.h>
+#include <cublas_v2.h>
+#include <cudnn.h>
 #endif
 
 namespace instance
@@ -33,9 +36,58 @@ CAIF_DeviceContext::CAIF_DeviceContext():
                                         _cublaslt_workspace(nullptr),
                                         _last_cublas_stream(nullptr),
 #endif
+                                        _cublaslt_workspace_size(0),
                                         _initialized(false),
                                         _device_id(0)
 {
+}
+
+// Map (cc_major, cc_minor) to the workspace-size tier that unlocks the
+// fastest cuBLAS-Lt algo set for that architecture. The mapping comes
+// from NVIDIA's per-arch algo coverage notes plus empirical probing in
+// the 2026-04-19/20 MatMul investigation (see CHANGES.md).
+//
+//   sm_80 (A100)             -> 32 MB (large)
+//   sm_86 (RTX 3090 / A6000) -> 16 MB (medium)
+//   sm_89 (RTX 4090 / L40)   -> 32 MB (large)
+//   sm_90 (H100)             -> 32 MB (large)
+//   sm_120 (RTX 5090)        -> 32 MB (large)
+//   pre-Ampere (<sm_80)      ->  4 MB (small)
+//   any unknown future arch  -> 32 MB (large) -- err toward coverage
+size_t CAIF_DeviceContext::AutoSizeCublasLtWorkspace(const int cc_major,
+                                                    const int cc_minor)const
+{
+  if(cc_major<8)
+  {
+    return _cublaslt_workspace_bytes_small;
+  }
+  if(cc_major==8&&cc_minor==6)
+  {
+    return _cublaslt_workspace_bytes_medium;
+  }
+  return _cublaslt_workspace_bytes_large;
+}
+
+size_t CAIF_DeviceContext::ResolveCublasLtWorkspaceSize(const int cc_major,
+                                                        const int cc_minor,
+                                                        const size_t free_vram_bytes,
+                                                        bool &out_is_override)const
+{
+  const size_t override_bytes=CAIF_Settings::CublasLtWorkspaceBytes();
+  if(override_bytes==0)
+  {
+    out_is_override=false;
+    return AutoSizeCublasLtWorkspace(cc_major,cc_minor);
+  }
+  out_is_override=true;
+  const size_t max_allowed=
+                  free_vram_bytes/_cublaslt_workspace_free_vram_divisor;
+  if(override_bytes>max_allowed)
+  {
+    THROW_CAIFE("CAIF_Settings::CublasLtWorkspaceBytes override exceeds "
+                "free-VRAM safety bound");
+  }
+  return override_bytes;
 }
 
 CAIF_DeviceContext::~CAIF_DeviceContext()
@@ -80,6 +132,12 @@ void CAIF_DeviceContext::Initialize()
     THROW_CAIFE("cudaSetDevice failed");
   }
 
+  // Force cuBLAS to use a deterministic workspace pool. Must be set before
+  // the first cuBLAS handle is created so the heuristic cache keys are
+  // stable across runs (otherwise cuBLAS can pick different near-optimal
+  // algos at dim=512..1024). See CHANGES.md — determinism step 4.
+  setenv("CUBLAS_WORKSPACE_CONFIG",":4096:8",1);
+
   // Create cuBLAS handle
   cublasStatus_t cublas_status=cublasCreate(&_cublas_handle);
   if(cublas_status!=CUBLAS_STATUS_SUCCESS)
@@ -91,6 +149,12 @@ void CAIF_DeviceContext::Initialize()
   // This ensures numerical consistency with CPU BLAS
   cublasSetMathMode(_cublas_handle,CUBLAS_DEFAULT_MATH);
 
+  // Forbid atomic reductions inside cuBLAS kernels. atomicAdd accumulation
+  // is order-dependent and produces run-to-run nondeterministic sums; the
+  // non-atomic paths are deterministic (often slower on bwd split-K).
+  // See CHANGES.md — determinism step 5.
+  cublasSetAtomicsMode(_cublas_handle,CUBLAS_ATOMICS_NOT_ALLOWED);
+
   // Create cublasLt handle
   cublasStatus_t cublaslt_status=cublasLtCreate(&_cublaslt_handle);
   if(cublaslt_status!=CUBLAS_STATUS_SUCCESS)
@@ -100,8 +164,25 @@ void CAIF_DeviceContext::Initialize()
     THROW_CAIFE("Failed to create cublasLt handle");
   }
 
-  // Allocate cublasLt workspace (4 MB)
-  cudaError_t ws_status=cudaMalloc(&_cublaslt_workspace,g_caif_cublaslt_workspace_size);
+  size_t free_vram=0;
+  size_t total_vram=0;
+  cudaError_t meminfo_status=cudaMemGetInfo(&free_vram,&total_vram);
+  if(meminfo_status!=cudaSuccess)
+  {
+    cublasLtDestroy(_cublaslt_handle);
+    _cublaslt_handle=nullptr;
+    cublasDestroy(_cublas_handle);
+    _cublas_handle=nullptr;
+    THROW_CAIFE("cudaMemGetInfo failed");
+  }
+  CAIF_DeviceProperties &props=CAIF_DeviceProperties::ForDevice(_device_id);
+  bool ws_is_override=false;
+  _cublaslt_workspace_size=ResolveCublasLtWorkspaceSize(
+                                    props.ComputeCapabilityMajor(),
+                                    props.ComputeCapabilityMinor(),
+                                    free_vram,
+                                    ws_is_override);
+  cudaError_t ws_status=cudaMalloc(&_cublaslt_workspace,_cublaslt_workspace_size);
   if(ws_status!=cudaSuccess)
   {
     cublasLtDestroy(_cublaslt_handle);
@@ -110,6 +191,19 @@ void CAIF_DeviceContext::Initialize()
     _cublas_handle=nullptr;
     THROW_CAIFE("Failed to allocate cublasLt workspace");
   }
+  const char *basis_label="auto";
+  if(ws_is_override==true)
+  {
+    basis_label="override";
+  }
+  const double workspace_megabytes=static_cast<double>(_cublaslt_workspace_size)/
+                                   g_caif_bytes_per_megabyte_d;
+  std::fprintf(stderr,
+               "[CAIF] cuBLAS-Lt workspace: %.2f MB (%s, sm_%d%d)\n",
+               workspace_megabytes,
+               basis_label,
+               props.ComputeCapabilityMajor(),
+               props.ComputeCapabilityMinor());
 
   // Create cuDNN handle
   cudnnStatus_t cudnn_status=cudnnCreate(&_cudnn_handle);
@@ -144,6 +238,7 @@ void CAIF_DeviceContext::Cleanup()
     {
       cudaFree(_cublaslt_workspace);
       _cublaslt_workspace=nullptr;
+      _cublaslt_workspace_size=0;
     }
     if(_cublaslt_handle!=nullptr)
     {
@@ -200,7 +295,7 @@ void *CAIF_DeviceContext::CublasLtWorkspace()
 
 size_t CAIF_DeviceContext::CublasLtWorkspaceSize()const
 {
-  return g_caif_cublaslt_workspace_size;
+  return _cublaslt_workspace_size;
 }
 
 void CAIF_DeviceContext::SetCublasStream(cudaStream_t stream)

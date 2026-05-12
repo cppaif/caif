@@ -14,82 +14,50 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Cross-entropy loss from logits for language modeling
+// Cross-entropy loss from logits (templated on <ComputeT, StorageT>).
+//
+// Utility class with static methods. Uniform two-parameter signature with
+// both defaulting to `float`. Logits are stored at StorageT; targets are
+// always fp32-encoded token IDs. Every legal (ComputeT, StorageT) cell from
+// the cuBLAS-Lt grid is instantiated.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_CROSS_ENTROPY_LOSS_H
-#define CAIF_DEVICE_CROSS_ENTROPY_LOSS_H
+#pragma once
 
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 
+#ifdef USE_CAIF_CUDA
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
+
 namespace instance
 {
 
-/**
- * @brief Cross-entropy loss computed directly from logits (numerically stable)
- *
- * For language modeling, computes:
- *   loss = -log(softmax(logits)[target])
- *        = -logits[target] + log(sum(exp(logits)))
- *
- * Uses max subtraction for numerical stability.
- */
+template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceCrossEntropyLoss
 {
   public:
-    // Default ignore index (positions with this target are excluded from loss)
+    CAIF_DeviceCrossEntropyLoss()=delete;
+    ~CAIF_DeviceCrossEntropyLoss()=delete;
+
     static constexpr int g_default_ignore_index=-100;
 
-    /**
-     * @brief Compute per-position loss from logits
-     * @param logits [batch * seq_len, vocab_size] or [batch, seq_len, vocab_size]
-     * @param targets [batch * seq_len] or [batch, seq_len] (float-encoded token IDs)
-     * @param stream CUDA stream
-     * @param ignore_index Target value to ignore (default -100)
-     * @return Tensor of per-position losses [N]
-     */
     static CAIF_DeviceTensor ComputePerPositionLoss(const CAIF_DeviceTensor &logits,
-                                                   const CAIF_DeviceTensor &targets,
-                                                   CAIF_CudaStream &stream,
-                                                   int ignore_index=g_default_ignore_index);
+                                                    const CAIF_DeviceTensor &targets,
+                                                    CAIF_CudaStream &stream,
+                                                    int ignore_index=g_default_ignore_index);
 
-    /**
-     * @brief Compute mean loss (scalar)
-     * @param logits [batch * seq_len, vocab_size] or [batch, seq_len, vocab_size]
-     * @param targets [batch * seq_len] or [batch, seq_len]
-     * @param stream CUDA stream
-     * @param ignore_index Target value to ignore
-     * @return Mean loss as float (synchronizes stream)
-     */
     static float ComputeLoss(const CAIF_DeviceTensor &logits,
                              const CAIF_DeviceTensor &targets,
                              CAIF_CudaStream &stream,
                              int ignore_index=g_default_ignore_index);
 
-    /**
-     * @brief Compute gradient of loss w.r.t. logits
-     * grad[i,j] = (softmax(logits)[i,j] - (j == target[i] ? 1 : 0)) / N
-     * @param logits [N, vocab_size]
-     * @param targets [N]
-     * @param stream CUDA stream
-     * @param ignore_index Target value to ignore
-     * @return Gradient tensor [N, vocab_size]
-     */
     static CAIF_DeviceTensor ComputeGradient(const CAIF_DeviceTensor &logits,
-                                            const CAIF_DeviceTensor &targets,
-                                            CAIF_CudaStream &stream,
-                                            int ignore_index=g_default_ignore_index);
+                                             const CAIF_DeviceTensor &targets,
+                                             CAIF_CudaStream &stream,
+                                             int ignore_index=g_default_ignore_index);
 
-    /**
-     * @brief Compute both loss and gradient in one pass
-     * More efficient than calling ComputeLoss and ComputeGradient separately.
-     * @param logits [N, vocab_size]
-     * @param targets [N]
-     * @param grad_logits Output gradient tensor [N, vocab_size]
-     * @param stream CUDA stream
-     * @param ignore_index Target value to ignore
-     * @return Mean loss as float
-     */
     static float ComputeLossAndGradient(const CAIF_DeviceTensor &logits,
                                         const CAIF_DeviceTensor &targets,
                                         CAIF_DeviceTensor &grad_logits,
@@ -97,6 +65,18 @@ class CAIF_DeviceCrossEntropyLoss
                                         int ignore_index=g_default_ignore_index);
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceCrossEntropyLoss<float,float>;
+extern template class CAIF_DeviceCrossEntropyLoss<float,__half>;
+extern template class CAIF_DeviceCrossEntropyLoss<float,__nv_bfloat16>;
+extern template class CAIF_DeviceCrossEntropyLoss<__half,float>;
+extern template class CAIF_DeviceCrossEntropyLoss<__half,__half>;
+extern template class CAIF_DeviceCrossEntropyLoss<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,float>;
+extern template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceCrossEntropyLoss<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_CROSS_ENTROPY_LOSS_H
+}//end instance namespace

@@ -17,14 +17,20 @@
 // Test: Pluggable projections for MLA, FFN, and MoEExpert
 //------------------------------------------------------------------------------
 #include "caif_device_ml_attention.h"
+#include "caif_test_harness.h"
 #include "caif_device_ffn.h"
 #include "caif_device_moe_expert.h"
 #include "caif_device_frozen_linear.h"
 #include "caif_device_lora_adapter.h"
-#include "caif_device_pointwise_activations.h"
-#include "caif_device_gated_activations.h"
+#include "caif_device_gelu_activation.h"
+#include "caif_device_swiglu_activation.h"
+#include "caif_device_geglu_activation.h"
+#include "caif_device_reglu_activation.h"
+#include "caif_device_glu_activation.h"
+#include "caif_device_bilinear_activation.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
@@ -35,21 +41,9 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    ISE_Out::Out()<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    ISE_Out::Out()<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -57,16 +51,16 @@ static void ReportResult(const char *test_name,bool passed)
 //------------------------------------------------------------------------------
 // Helper: create FrozenLinear with random FP32 weights
 //------------------------------------------------------------------------------
-static std::unique_ptr<CAIF_DeviceFrozenLinear> MakeFrozenLinear(uint32_t in_dim,
-                                                                uint32_t out_dim,
-                                                                CAIF_CudaStream &stream,
-                                                                uint32_t seed=42)
+static std::unique_ptr<CAIF_DeviceFrozenLinear<float,float>> MakeFrozenLinear(uint32_t in_dim,
+                                                                                uint32_t out_dim,
+                                                                                CAIF_CudaStream &stream,
+                                                                                uint32_t seed=42)
 {
-  auto layer=std::make_unique<CAIF_DeviceFrozenLinear>(in_dim,out_dim,
-                                                      CAIF_DataType::CAIF_DataType_e::Float32,
-                                                      stream,
-                                                      g_caif_quant_default_group_size,
-                                                      false);
+  auto layer=std::make_unique<CAIF_DeviceFrozenLinear<float,float>>(in_dim,
+                                                                      out_dim,
+                                                                      stream,
+                                                                      g_caif_quant_default_group_size,
+                                                                      false);
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-0.3f,0.3f);
   const size_t count=static_cast<size_t>(in_dim)*out_dim;
@@ -83,7 +77,7 @@ static std::unique_ptr<CAIF_DeviceFrozenLinear> MakeFrozenLinear(uint32_t in_dim
 //------------------------------------------------------------------------------
 // Helper: wrap a FrozenLinear with LoRA
 //------------------------------------------------------------------------------
-static std::unique_ptr<CAIF_DeviceLoRAAdapter> MakeLoRAFrozen(uint32_t in_dim,
+static std::unique_ptr<CAIF_DeviceLoRAAdapter<float,float>> MakeLoRAFrozen(uint32_t in_dim,
                                                               uint32_t out_dim,
                                                               uint32_t rank,
                                                               float alpha,
@@ -91,12 +85,12 @@ static std::unique_ptr<CAIF_DeviceLoRAAdapter> MakeLoRAFrozen(uint32_t in_dim,
                                                               uint32_t seed=42)
 {
   auto frozen=MakeFrozenLinear(in_dim,out_dim,stream,seed);
-  CAIF_DeviceLoRAAdapter::LoRAConfig_t lora_cfg;
+  CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t lora_cfg;
   lora_cfg.rank=rank;
   lora_cfg.alpha=alpha;
   lora_cfg.input_dim=in_dim;
   lora_cfg.output_dim=out_dim;
-  return std::make_unique<CAIF_DeviceLoRAAdapter>(lora_cfg,std::move(frozen),stream,seed);
+  return std::make_unique<CAIF_DeviceLoRAAdapter<float,float>>(lora_cfg,std::move(frozen),stream,seed);
 }
 
 //------------------------------------------------------------------------------
@@ -133,9 +127,9 @@ static bool AnyNonZero(const CAIF_HostTensor &h)
 //------------------------------------------------------------------------------
 // Helper: MLA test config (same as test_device_ml_attention.cpp)
 //------------------------------------------------------------------------------
-static CAIF_DeviceMLAttention::MLAConfig_t MakeMLAConfig()
+static CAIF_DeviceMLAttention<float,float>::MLAConfig_t MakeMLAConfig()
 {
-  CAIF_DeviceMLAttention::MLAConfig_t config;
+  CAIF_DeviceMLAttention<float,float>::MLAConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.q_lora_rank=16;
@@ -173,19 +167,24 @@ static void TestMLAProjectionsForwardShape()
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceMLAttention::MLAProjections_t proj;
+    CAIF_DeviceMLAttention<float,float>::MLAProjections_t proj;
     proj.q_compress=MakeFrozenLinear(config.dim,config.q_lora_rank,stream,10);
     proj.q_decompress=MakeFrozenLinear(config.q_lora_rank,q_proj_dim,stream,20);
     proj.kv_compress=MakeFrozenLinear(config.dim,kv_compress_dim,stream,30);
     proj.kv_decompress=MakeFrozenLinear(config.kv_lora_rank,kv_decomp_dim,stream,40);
     proj.o_proj=MakeFrozenLinear(o_input_dim,config.dim,stream,50);
 
-    CAIF_DeviceMLAttention mla(config,std::move(proj),stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,std::move(proj),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*config.dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,config.dim},stream);
-    CAIF_DeviceTensor output=mla.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mla.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -202,11 +201,7 @@ static void TestMLAProjectionsForwardShape()
 
     ReportResult("MLA::Projections::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::Projections::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::Projections::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -230,14 +225,17 @@ static void TestMLALoRAProjectionsForward()
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceMLAttention::MLAProjections_t proj;
+    CAIF_DeviceMLAttention<float,float>::MLAProjections_t proj;
     proj.q_compress=MakeLoRAFrozen(config.dim,config.q_lora_rank,lora_rank,lora_alpha,stream,10);
     proj.q_decompress=MakeLoRAFrozen(config.q_lora_rank,q_proj_dim,lora_rank,lora_alpha,stream,20);
     proj.kv_compress=MakeLoRAFrozen(config.dim,kv_compress_dim,lora_rank,lora_alpha,stream,30);
     proj.kv_decompress=MakeLoRAFrozen(config.kv_lora_rank,kv_decomp_dim,lora_rank,lora_alpha,stream,40);
     proj.o_proj=MakeLoRAFrozen(o_input_dim,config.dim,lora_rank,lora_alpha,stream,50);
 
-    CAIF_DeviceMLAttention mla(config,std::move(proj),stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,std::move(proj),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*config.dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -246,7 +244,9 @@ static void TestMLALoRAProjectionsForward()
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,config.dim},stream);
-    CAIF_DeviceTensor output=mla.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mla.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -263,11 +263,7 @@ static void TestMLALoRAProjectionsForward()
 
     ReportResult("MLA::LoRAProjections::Forward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::LoRAProjections::Forward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::LoRAProjections::Forward")
 }
 
 //------------------------------------------------------------------------------
@@ -291,14 +287,14 @@ static void TestMLAProjectionsParameterCount()
 
     // LoRA has 2 trainable tensors (A and B), FrozenLinear has 0
     // So each LoRA-wrapped projection has 2 params
-    CAIF_DeviceMLAttention::MLAProjections_t proj;
+    CAIF_DeviceMLAttention<float,float>::MLAProjections_t proj;
     proj.q_compress=MakeLoRAFrozen(config.dim,config.q_lora_rank,lora_rank,lora_alpha,stream,10);
     proj.q_decompress=MakeLoRAFrozen(config.q_lora_rank,q_proj_dim,lora_rank,lora_alpha,stream,20);
     proj.kv_compress=MakeLoRAFrozen(config.dim,kv_compress_dim,lora_rank,lora_alpha,stream,30);
     proj.kv_decompress=MakeLoRAFrozen(config.kv_lora_rank,kv_decomp_dim,lora_rank,lora_alpha,stream,40);
     proj.o_proj=MakeLoRAFrozen(o_input_dim,config.dim,lora_rank,lora_alpha,stream,50);
 
-    CAIF_DeviceMLAttention mla(config,std::move(proj),stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,std::move(proj),stream);
 
     // 5 projections * 2 LoRA params each + 2 norm gammas = 12
     const size_t expected_count=12;
@@ -311,11 +307,7 @@ static void TestMLAProjectionsParameterCount()
 
     ReportResult("MLA::Projections::ParameterTensorCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::Projections::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::Projections::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -337,14 +329,14 @@ static void TestMLAProjectionsParameterNames()
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceMLAttention::MLAProjections_t proj;
+    CAIF_DeviceMLAttention<float,float>::MLAProjections_t proj;
     proj.q_compress=MakeLoRAFrozen(config.dim,config.q_lora_rank,lora_rank,lora_alpha,stream,10);
     proj.q_decompress=MakeLoRAFrozen(config.q_lora_rank,q_proj_dim,lora_rank,lora_alpha,stream,20);
     proj.kv_compress=MakeLoRAFrozen(config.dim,kv_compress_dim,lora_rank,lora_alpha,stream,30);
     proj.kv_decompress=MakeLoRAFrozen(config.kv_lora_rank,kv_decomp_dim,lora_rank,lora_alpha,stream,40);
     proj.o_proj=MakeLoRAFrozen(o_input_dim,config.dim,lora_rank,lora_alpha,stream,50);
 
-    CAIF_DeviceMLAttention mla(config,std::move(proj),stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,std::move(proj),stream);
     auto names=mla.ParameterNames("attn.");
 
     bool passed=true;
@@ -428,11 +420,7 @@ static void TestMLAProjectionsParameterNames()
 
     ReportResult("MLA::Projections::ParameterNames",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::Projections::ParameterNames",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::Projections::ParameterNames")
 }
 
 //------------------------------------------------------------------------------
@@ -456,14 +444,17 @@ static void TestMLALoRAProjectionsBackward()
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceMLAttention::MLAProjections_t proj;
+    CAIF_DeviceMLAttention<float,float>::MLAProjections_t proj;
     proj.q_compress=MakeLoRAFrozen(config.dim,config.q_lora_rank,lora_rank,lora_alpha,stream,10);
     proj.q_decompress=MakeLoRAFrozen(config.q_lora_rank,q_proj_dim,lora_rank,lora_alpha,stream,20);
     proj.kv_compress=MakeLoRAFrozen(config.dim,kv_compress_dim,lora_rank,lora_alpha,stream,30);
     proj.kv_decompress=MakeLoRAFrozen(config.kv_lora_rank,kv_decomp_dim,lora_rank,lora_alpha,stream,40);
     proj.o_proj=MakeLoRAFrozen(o_input_dim,config.dim,lora_rank,lora_alpha,stream,50);
 
-    CAIF_DeviceMLAttention mla(config,std::move(proj),stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,std::move(proj),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*config.dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -472,12 +463,15 @@ static void TestMLALoRAProjectionsBackward()
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,config.dim},stream);
-    mla.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mla.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*config.dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
                                                               {batch,seq_len,config.dim},stream);
-    CAIF_DeviceTensor grad_input=mla.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=mla.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -512,11 +506,7 @@ static void TestMLALoRAProjectionsBackward()
 
     ReportResult("MLA::LoRAProjections::Backward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::LoRAProjections::Backward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::LoRAProjections::Backward")
 }
 
 //==============================================================================
@@ -536,22 +526,27 @@ static void TestFFNProjectionsForwardShape()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    CAIF_DeviceFFN::FFNProjections_t proj;
+    CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
     proj.gate=MakeFrozenLinear(dim,ffn_dim,stream,10);
     proj.up=MakeFrozenLinear(dim,ffn_dim,stream,20);
     proj.down=MakeFrozenLinear(ffn_dim,dim,stream,30);
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -568,11 +563,7 @@ static void TestFFNProjectionsForwardShape()
 
     ReportResult("FFN::Projections::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::Projections::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::Projections::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -590,17 +581,20 @@ static void TestFFNLoRAProjectionsForward()
     const float lora_alpha=8.0f;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    CAIF_DeviceFFN::FFNProjections_t proj;
+    CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
     proj.gate=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,10);
     proj.up=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,20);
     proj.down=MakeLoRAFrozen(ffn_dim,dim,lora_rank,lora_alpha,stream,30);
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -609,7 +603,9 @@ static void TestFFNLoRAProjectionsForward()
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -626,11 +622,7 @@ static void TestFFNLoRAProjectionsForward()
 
     ReportResult("FFN::LoRAProjections::Forward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::LoRAProjections::Forward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::LoRAProjections::Forward")
 }
 
 //------------------------------------------------------------------------------
@@ -646,19 +638,19 @@ static void TestFFNProjectionsParameterCount()
     const float lora_alpha=8.0f;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
     // Frozen only (no LoRA) -- 0 params per projection
     {
-      CAIF_DeviceFFN::FFNProjections_t proj;
+      CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
       proj.gate=MakeFrozenLinear(dim,ffn_dim,stream,10);
       proj.up=MakeFrozenLinear(dim,ffn_dim,stream,20);
       proj.down=MakeFrozenLinear(ffn_dim,dim,stream,30);
 
-      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
 
       if(ffn.ParameterTensorCount()!=0)
       {
@@ -670,13 +662,13 @@ static void TestFFNProjectionsParameterCount()
 
     // LoRA-wrapped -- 2 params per projection, 3 projections = 6
     {
-      CAIF_DeviceFFN::FFNProjections_t proj;
+      CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
       proj.gate=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,10);
       proj.up=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,20);
       proj.down=MakeLoRAFrozen(ffn_dim,dim,lora_rank,lora_alpha,stream,30);
 
-      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-      CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+      CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
 
       if(ffn.ParameterTensorCount()!=6)
       {
@@ -688,11 +680,7 @@ static void TestFFNProjectionsParameterCount()
 
     ReportResult("FFN::Projections::ParameterTensorCount",true);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::Projections::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::Projections::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -710,17 +698,20 @@ static void TestFFNLoRAProjectionsBackward()
     const float lora_alpha=8.0f;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    CAIF_DeviceFFN::FFNProjections_t proj;
+    CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
     proj.gate=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,10);
     proj.up=MakeLoRAFrozen(dim,ffn_dim,lora_rank,lora_alpha,stream,20);
     proj.down=MakeLoRAFrozen(ffn_dim,dim,lora_rank,lora_alpha,stream,30);
 
-    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -729,12 +720,15 @@ static void TestFFNLoRAProjectionsBackward()
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,dim},stream);
-    ffn.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    ffn.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
                                                               {batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=ffn.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -766,11 +760,7 @@ static void TestFFNLoRAProjectionsBackward()
 
     ReportResult("FFN::LoRAProjections::Backward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::LoRAProjections::Backward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::LoRAProjections::Backward")
 }
 
 //==============================================================================
@@ -789,23 +779,28 @@ static void TestMoEExpertProjectionsForwardShape()
     const uint32_t hidden_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoEExpert::Config_t config;
+    CAIF_DeviceMoEExpert<float,float>::Config_t config;
     config.input_dim=input_dim;
     config.hidden_dim=hidden_dim;
     config.use_gated=true;
     config.use_bias=false;
 
-    CAIF_DeviceMoEExpert::MoEExpertProjections_t proj;
+    CAIF_DeviceMoEExpert<float,float>::MoEExpertProjections_t proj;
     proj.gate=MakeFrozenLinear(input_dim,hidden_dim,stream,10);
     proj.up=MakeFrozenLinear(input_dim,hidden_dim,stream,20);
     proj.down=MakeFrozenLinear(hidden_dim,input_dim,stream,30);
 
-    CAIF_DeviceMoEExpert expert(config,std::move(proj),stream);
+    CAIF_DeviceMoEExpert<float,float> expert(config,std::move(proj),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(num_tokens*input_dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {num_tokens,input_dim},stream);
-    CAIF_DeviceTensor output=expert.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=expert.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -822,11 +817,7 @@ static void TestMoEExpertProjectionsForwardShape()
 
     ReportResult("MoEExpert::Projections::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MoEExpert::Projections::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MoEExpert::Projections::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -842,7 +833,7 @@ static void TestMoEExpertProjectionsParameterCount()
     const float lora_alpha=8.0f;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoEExpert::Config_t config;
+    CAIF_DeviceMoEExpert<float,float>::Config_t config;
     config.input_dim=input_dim;
     config.hidden_dim=hidden_dim;
     config.use_gated=true;
@@ -852,12 +843,12 @@ static void TestMoEExpertProjectionsParameterCount()
 
     // Frozen only -- 0 params
     {
-      CAIF_DeviceMoEExpert::MoEExpertProjections_t proj;
+      CAIF_DeviceMoEExpert<float,float>::MoEExpertProjections_t proj;
       proj.gate=MakeFrozenLinear(input_dim,hidden_dim,stream,10);
       proj.up=MakeFrozenLinear(input_dim,hidden_dim,stream,20);
       proj.down=MakeFrozenLinear(hidden_dim,input_dim,stream,30);
 
-      CAIF_DeviceMoEExpert expert(config,std::move(proj),stream);
+      CAIF_DeviceMoEExpert<float,float> expert(config,std::move(proj),stream);
       if(expert.ParameterTensorCount()!=0)
       {
         ISE_Out::Out()<<"  Frozen-only expected 0, got "<<expert.ParameterTensorCount()<<"\n";
@@ -867,12 +858,12 @@ static void TestMoEExpertProjectionsParameterCount()
 
     // LoRA-wrapped -- 2 per projection * 3 = 6
     {
-      CAIF_DeviceMoEExpert::MoEExpertProjections_t proj;
+      CAIF_DeviceMoEExpert<float,float>::MoEExpertProjections_t proj;
       proj.gate=MakeLoRAFrozen(input_dim,hidden_dim,lora_rank,lora_alpha,stream,10);
       proj.up=MakeLoRAFrozen(input_dim,hidden_dim,lora_rank,lora_alpha,stream,20);
       proj.down=MakeLoRAFrozen(hidden_dim,input_dim,lora_rank,lora_alpha,stream,30);
 
-      CAIF_DeviceMoEExpert expert(config,std::move(proj),stream);
+      CAIF_DeviceMoEExpert<float,float> expert(config,std::move(proj),stream);
       if(expert.ParameterTensorCount()!=6)
       {
         ISE_Out::Out()<<"  LoRA expected 6, got "<<expert.ParameterTensorCount()<<"\n";
@@ -882,11 +873,7 @@ static void TestMoEExpertProjectionsParameterCount()
 
     ReportResult("MoEExpert::Projections::ParameterTensorCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MoEExpert::Projections::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MoEExpert::Projections::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -903,18 +890,21 @@ static void TestMoEExpertLoRAProjectionsBackward()
     const float lora_alpha=8.0f;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoEExpert::Config_t config;
+    CAIF_DeviceMoEExpert<float,float>::Config_t config;
     config.input_dim=input_dim;
     config.hidden_dim=hidden_dim;
     config.use_gated=true;
     config.use_bias=false;
 
-    CAIF_DeviceMoEExpert::MoEExpertProjections_t proj;
+    CAIF_DeviceMoEExpert<float,float>::MoEExpertProjections_t proj;
     proj.gate=MakeLoRAFrozen(input_dim,hidden_dim,lora_rank,lora_alpha,stream,10);
     proj.up=MakeLoRAFrozen(input_dim,hidden_dim,lora_rank,lora_alpha,stream,20);
     proj.down=MakeLoRAFrozen(hidden_dim,input_dim,lora_rank,lora_alpha,stream,30);
 
-    CAIF_DeviceMoEExpert expert(config,std::move(proj),stream);
+    CAIF_DeviceMoEExpert<float,float> expert(config,std::move(proj),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(num_tokens*input_dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -923,12 +913,15 @@ static void TestMoEExpertLoRAProjectionsBackward()
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {num_tokens,input_dim},stream);
-    expert.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    expert.Forward(input,ctx);
 
     std::vector<float> grad_ones(num_tokens*input_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
                                                               {num_tokens,input_dim},stream);
-    CAIF_DeviceTensor grad_input=expert.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=expert.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -960,11 +953,7 @@ static void TestMoEExpertLoRAProjectionsBackward()
 
     ReportResult("MoEExpert::LoRAProjections::Backward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MoEExpert::LoRAProjections::Backward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MoEExpert::LoRAProjections::Backward")
 }
 
 //------------------------------------------------------------------------------
@@ -980,22 +969,27 @@ static void TestFFNPointwiseProjectionsForward()
     const uint32_t ffn_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFFN::FFNConfig_t config;
+    CAIF_DeviceFFN<float,float>::FFNConfig_t config;
     config.dim=dim;
     config.ffn_dim=ffn_dim;
 
-    CAIF_DeviceFFN::FFNProjections_t proj;
+    CAIF_DeviceFFN<float,float>::FFNProjections_t proj;
     proj.up=MakeFrozenLinear(dim,ffn_dim,stream,20);
     proj.down=MakeFrozenLinear(ffn_dim,dim,stream,30);
     // gate is nullptr for pointwise
 
-    auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-    CAIF_DeviceFFN ffn(config,std::move(proj),std::move(activation),stream);
+    auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+    CAIF_DeviceFFN<float,float> ffn(config,std::move(proj),std::move(activation),stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=ffn.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=ffn.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -1012,11 +1006,7 @@ static void TestFFNPointwiseProjectionsForward()
 
     ReportResult("FFN::PointwiseProjections::Forward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FFN::PointwiseProjections::Forward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FFN::PointwiseProjections::Forward")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -1051,10 +1041,10 @@ int main()
 #endif
 
     ISE_Out::Out()<<"\n=== Summary ===\n";
-    ISE_Out::Out()<<"Passed: "<<g_tests_passed<<"\n";
-    ISE_Out::Out()<<"Failed: "<<g_tests_failed<<"\n";
+    ISE_Out::Out()<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+    ISE_Out::Out()<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-    if(g_tests_failed>0)
+    if(CAIF_TestHarness::FailedCount()>0)
     {
       return 1;
     }

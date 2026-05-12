@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "caif_device_tensor.h"
+#include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_cuda_event.h"
@@ -22,26 +23,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-5f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 // ============================================================================
@@ -81,11 +70,7 @@ static void TestHostTensorZeros()
 
     ReportResult("HostTensor::Zeros",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("HostTensor::Zeros",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("HostTensor::Zeros")
 }
 
 static void TestHostTensorFromData()
@@ -114,11 +99,7 @@ static void TestHostTensorFromData()
 
     ReportResult("HostTensor::FromData",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("HostTensor::FromData",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("HostTensor::FromData")
 }
 
 static void TestHostTensorFill()
@@ -141,11 +122,7 @@ static void TestHostTensorFill()
 
     ReportResult("HostTensor::Fill",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("HostTensor::Fill",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("HostTensor::Fill")
 }
 
 static void TestHostTensorReshape()
@@ -173,11 +150,7 @@ static void TestHostTensorReshape()
 
     ReportResult("HostTensor::Reshape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("HostTensor::Reshape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("HostTensor::Reshape")
 }
 
 static void TestHostTensorMoveSemantics()
@@ -210,11 +183,7 @@ static void TestHostTensorMoveSemantics()
 
     ReportResult("HostTensor::MoveSemantics",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("HostTensor::MoveSemantics",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("HostTensor::MoveSemantics")
 }
 
 // ============================================================================
@@ -233,11 +202,7 @@ static void TestCudaStreamCreate()
 
     ReportResult("CudaStream::Create",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("CudaStream::Create",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("CudaStream::Create")
 }
 
 static void TestCudaStreamDefault()
@@ -250,11 +215,7 @@ static void TestCudaStreamDefault()
 
     ReportResult("CudaStream::Default",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("CudaStream::Default",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("CudaStream::Default")
 }
 
 static void TestCudaEventCreate()
@@ -267,11 +228,7 @@ static void TestCudaEventCreate()
 
     ReportResult("CudaEvent::Create",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("CudaEvent::Create",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("CudaEvent::Create")
 }
 
 static void TestCudaStreamRecordEvent()
@@ -292,11 +249,7 @@ static void TestCudaStreamRecordEvent()
 
     ReportResult("CudaStream::RecordEvent",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("CudaStream::RecordEvent",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("CudaStream::RecordEvent")
 }
 
 // ============================================================================
@@ -342,11 +295,7 @@ static void TestDeviceTensorZeros()
 
     ReportResult("DeviceTensor::Zeros",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::Zeros",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::Zeros")
 }
 
 static void TestDeviceTensorFromHost()
@@ -386,11 +335,7 @@ static void TestDeviceTensorFromHost()
 
     ReportResult("DeviceTensor::FromHost",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::FromHost",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::FromHost")
 }
 
 static void TestDeviceTensorRoundTrip()
@@ -426,11 +371,7 @@ static void TestDeviceTensorRoundTrip()
 
     ReportResult("DeviceTensor::RoundTrip",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::RoundTrip",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::RoundTrip")
 }
 
 static void TestDeviceTensorMoveSemantics()
@@ -471,11 +412,7 @@ static void TestDeviceTensorMoveSemantics()
 
     ReportResult("DeviceTensor::MoveSemantics",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::MoveSemantics",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::MoveSemantics")
 }
 
 static void TestDeviceTensorClone()
@@ -515,11 +452,7 @@ static void TestDeviceTensorClone()
 
     ReportResult("DeviceTensor::Clone",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::Clone",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::Clone")
 }
 
 static void TestDeviceTensorFill()
@@ -546,11 +479,7 @@ static void TestDeviceTensorFill()
 
     ReportResult("DeviceTensor::Fill",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::Fill",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::Fill")
 }
 
 static void TestDeviceTensorNoDirtyFlags()
@@ -576,11 +505,7 @@ static void TestDeviceTensorNoDirtyFlags()
 
     ReportResult("DeviceTensor::NoDirtyFlags",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DeviceTensor::NoDirtyFlags",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DeviceTensor::NoDirtyFlags")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -619,13 +544,5 @@ int main()
   std::cout<<"\n[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

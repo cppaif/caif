@@ -14,13 +14,15 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident tabular embedding layer
+// Device-resident tabular embedding layer (templated on
+// <ComputeT, StorageT>).
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_TABULAR_EMBEDDING_H
-#define CAIF_DEVICE_TABULAR_EMBEDDING_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,39 +30,29 @@
 namespace instance
 {
 
-/**
- * @brief Projects tabular features to embedding dimension for transformer input.
- *
- * Input:  [batch, num_features] or [batch, seq_len, num_features]
- * Output: [batch, 1, dim] or [batch, seq_len, dim]
- *
- * This is a simple linear projection that converts raw feature vectors
- * into embeddings suitable for transformer processing.
- *
- * Parameters:
- *   0: W_proj  [num_features, dim]  Xavier uniform
- *   1: b_proj  [dim]                Zeros
- */
-class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     struct Config_t
     {
-      uint32_t num_features;  // Input feature dimension
-      uint32_t dim;           // Output embedding dimension
+      uint32_t num_features;
+      uint32_t dim;
     };
 
     CAIF_DeviceTabularEmbedding(const Config_t &config,
-                               CAIF_CudaStream &stream);
+                                CAIF_CudaStream &stream);
     ~CAIF_DeviceTabularEmbedding()override=default;
 
-    // Move
     CAIF_DeviceTabularEmbedding(CAIF_DeviceTabularEmbedding &&other);
     CAIF_DeviceTabularEmbedding &operator=(CAIF_DeviceTabularEmbedding &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::TabularEmbedding_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -71,30 +63,49 @@ class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
     uint32_t NumFeatures()const{return _config.num_features;}
     uint32_t Dim()const{return _config.dim;}
 
-    // Weight initialization
-    void InitializeWeights(uint32_t seed=0);
+    void InitializeWeights(uint32_t seed=0)override;
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
 
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
+
     Config_t _config;
 
-    CAIF_DeviceTensor _w_proj;       // [num_features, dim]
-    CAIF_DeviceTensor _b_proj;       // [dim]
+    CAIF_DeviceTensor _w_proj;
+    CAIF_DeviceTensor _b_proj;
+    CAIF_DeviceTensor _grad_w_proj;
+    CAIF_DeviceTensor _grad_b_proj;
 
-    CAIF_DeviceTensor _grad_w_proj;  // [num_features, dim]
-    CAIF_DeviceTensor _grad_b_proj;  // [dim]
-
-    // Cached for backward
     CAIF_DeviceTensor _cached_input;
     uint32_t _cached_batch;
     uint32_t _cached_seq_len;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceTabularEmbedding<float,float>;
+extern template class CAIF_DeviceTabularEmbedding<float,__half>;
+extern template class CAIF_DeviceTabularEmbedding<float,__nv_bfloat16>;
+extern template class CAIF_DeviceTabularEmbedding<__half,float>;
+extern template class CAIF_DeviceTabularEmbedding<__half,__half>;
+extern template class CAIF_DeviceTabularEmbedding<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,float>;
+extern template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceTabularEmbedding<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_TABULAR_EMBEDDING_H
+}//end instance namespace

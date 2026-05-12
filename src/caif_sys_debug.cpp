@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Per-site `tensor.DevicePtr<float>()` reads in this file are all on
+// `fp32_view`, which is built one line above each call via
+// `.To(Float32)` / `.Clone()`. Comments at each call site name this
+// explicitly per the type-dispatch full plan (Phase 2).
+
 #include "caif_sys_debug.h"
 #include <vector>
 #include <cstring>
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
-using namespace instance;
+namespace instance
+{
 
 bool CAIF_SysDebug::_enabled=false;
 
@@ -46,10 +52,24 @@ bool CAIF_SysDebug::CheckTensor(const std::string &label,
 #ifdef USE_CAIF_CUDA
   cudaStreamSynchronize(tensor.Stream().Handle());
 
-  const size_t total_elements=tensor.TotalElements();
+  // Cast non-fp32 storage to fp32 first so the NaN/inf scan reads typed
+  // float bits. The debug helper isn't perf-critical; the extra .To()
+  // round-trip is negligible vs the host-side scan.
+  CAIF_DeviceTensor fp32_view;
+  if(tensor.Dtype()!=CAIF_DataType::CAIF_DataType_e::Float32)
+  {
+    fp32_view=tensor.To(CAIF_DataType::CAIF_DataType_e::Float32);
+  }
+  else
+  {
+    fp32_view=tensor.Clone();
+  }
+
+  const size_t total_elements=fp32_view.TotalElements();
   std::vector<float> host_data(total_elements);
+  // fp32: fp32_view was just cast/cloned to Float32 above.
   cudaMemcpy(host_data.data(),
-             tensor.DevicePtr(),
+             fp32_view.DevicePtr<float>(),
              total_elements*sizeof(float),
              cudaMemcpyDeviceToHost);
 
@@ -131,7 +151,19 @@ void CAIF_SysDebug::PrintRawValues(const std::string &label,
 #ifdef USE_CAIF_CUDA
   cudaStreamSynchronize(tensor.Stream().Handle());
 
-  const size_t total_elements=tensor.TotalElements();
+  // Cast non-fp32 storage to fp32 first so the print reads typed float
+  // bits. Debug helper, perf irrelevant.
+  CAIF_DeviceTensor fp32_view;
+  if(tensor.Dtype()!=CAIF_DataType::CAIF_DataType_e::Float32)
+  {
+    fp32_view=tensor.To(CAIF_DataType::CAIF_DataType_e::Float32);
+  }
+  else
+  {
+    fp32_view=tensor.Clone();
+  }
+
+  const size_t total_elements=fp32_view.TotalElements();
   uint32_t print_count=count;
   if(count>total_elements)
   {
@@ -139,8 +171,9 @@ void CAIF_SysDebug::PrintRawValues(const std::string &label,
   }
 
   std::vector<float> host_data(print_count);
+  // fp32: fp32_view was just cast/cloned to Float32 above.
   cudaMemcpy(host_data.data(),
-             tensor.DevicePtr(),
+             fp32_view.DevicePtr<float>(),
              print_count*sizeof(float),
              cudaMemcpyDeviceToHost);
 
@@ -168,3 +201,5 @@ void CAIF_SysDebug::DebugLog(const std::string &message)
     SDbgLog()<<"[CAIF_SysDebug] "<<message<<std::endl;
   }
 }
+
+}//end instance namespace

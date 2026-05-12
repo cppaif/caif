@@ -12,7 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Token-embedding has two input encodings:
+//   1. Native integer (input.Dtype()==Int32/UInt32) — reinterpreted via
+//      `DeviceDataRaw()` to `unsigned int *`. No DevicePtr() call.
+//   2. fp32-compat (input.Dtype()==Float32, float-encoded token IDs) —
+//      uses `DevicePtr<float>()` per the type-dispatch full plan.
+// Per-site comments at each call site below name the fp32 contract.
+
 #include "caif_device_token_embedding.h"
+#include "caif_device_token_embedding_factory.h"
 #include "caif_cuda_kernels.h"
 #include "caif_exception.h"
 #include <vector>
@@ -20,104 +28,101 @@
 #include <cstring>
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace instance
 {
 
-CAIF_DeviceTokenEmbedding::CAIF_DeviceTokenEmbedding(const CAIF_DeviceTokenEmbedding::Config_t &config,
-                                                   CAIF_CudaStream &stream):
-                                                   CAIF_DeviceLayer(stream),
-                                                   _config(config),
-                                                   _embedding_table(),
-                                                   _embedding_table_grad(),
-                                                   _output_buffer(),
-                                                   _token_ids_device(nullptr),
-                                                   _token_ids_capacity(0),
-                                                   _cached_num_tokens(0),
-                                                   _output_batch(0),
-                                                   _output_seq_len(0)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::CAIF_DeviceTokenEmbedding(
+                                          const Config_t &config,
+                                          CAIF_CudaStream &stream):
+                                          CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                          _config(config),
+                                          _embedding_table(),
+                                          _embedding_table_grad(),
+                                          _token_ids_device(nullptr),
+                                          _token_ids_capacity(0),
+                                          _cached_num_tokens(0)
 {
   try
   {
     if(config.vocab_size==0)
     {
-      THROW_CAIFE("DeviceTokenEmbedding: vocab_size must be > 0");
+      THROW_CAIFE("CAIF_DeviceTokenEmbedding: vocab_size must be > 0");
     }
     if(config.dim==0)
     {
-      THROW_CAIFE("DeviceTokenEmbedding: dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceTokenEmbedding: dim must be > 0");
     }
 
-    // Xavier uniform init: limit = sqrt(6 / (fan_in + fan_out))
-    const float limit=std::sqrt(6.0f/static_cast<float>(config.vocab_size+config.dim));
+    // Xavier uniform init: limit = sqrt(scale / (fan_in + fan_out)).
+    const float limit=std::sqrt(g_caif_xavier_uniform_scale/
+                                 static_cast<float>(config.vocab_size+config.dim));
     const size_t table_size=static_cast<size_t>(config.vocab_size)*config.dim;
     std::vector<float> init_data(table_size);
     for(size_t i=0;i<table_size;++i)
     {
-      // Simple deterministic pseudo-random using golden ratio
-      const float t=static_cast<float>(i)*0.6180339887f;
+      // Deterministic pseudo-random via fractional part of i*phi.
+      const float t=static_cast<float>(i)*g_caif_golden_ratio_frac;
       init_data[i]=(t-std::floor(t))*2.0f*limit-limit;
     }
 
-    _embedding_table=CAIF_DeviceTensor::Uninitialized({config.vocab_size,config.dim},stream);
-    _embedding_table.CopyFromHost(init_data.data(),table_size);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    SetEmbeddingTable(CAIF_DeviceTensor::Uninitialized({config.vocab_size,config.dim},stream,sdt));
+    EmbeddingTableMut().CopyFromHostFp32(init_data.data(),table_size);
 
-    _embedding_table_grad=CAIF_DeviceTensor::Zeros({config.vocab_size,config.dim},stream);
+    _embedding_table_grad=CAIF_DeviceTensor::Zeros({config.vocab_size,config.dim},stream,sdt);
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTokenEmbedding::~CAIF_DeviceTokenEmbedding()
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::~CAIF_DeviceTokenEmbedding()
 {
   FreeTokenIdBuffer();
 }
 
-CAIF_DeviceTokenEmbedding::CAIF_DeviceTokenEmbedding(CAIF_DeviceTokenEmbedding &&other)noexcept:
-                                                   CAIF_DeviceLayer(std::move(other)),
-                                                   _config(other._config),
-                                                   _embedding_table(std::move(other._embedding_table)),
-                                                   _embedding_table_grad(std::move(other._embedding_table_grad)),
-                                                   _output_buffer(std::move(other._output_buffer)),
-                                                   _token_ids_device(other._token_ids_device),
-                                                   _token_ids_capacity(other._token_ids_capacity),
-                                                   _cached_num_tokens(other._cached_num_tokens),
-                                                   _output_batch(other._output_batch),
-                                                   _output_seq_len(other._output_seq_len)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::CAIF_DeviceTokenEmbedding(
+                                  CAIF_DeviceTokenEmbedding &&other):
+                                CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                                _config(other._config),
+                                _embedding_table(std::move(other._embedding_table)),
+                                _embedding_table_grad(std::move(other._embedding_table_grad)),
+                                _token_ids_device(other._token_ids_device),
+                                _token_ids_capacity(other._token_ids_capacity),
+                                _cached_num_tokens(other._cached_num_tokens)
 {
   other._token_ids_device=nullptr;
   other._token_ids_capacity=0;
   other._cached_num_tokens=0;
-  other._output_batch=0;
-  other._output_seq_len=0;
 }
 
-CAIF_DeviceTokenEmbedding &CAIF_DeviceTokenEmbedding::operator=(CAIF_DeviceTokenEmbedding &&other)noexcept
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT> &
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::operator=(CAIF_DeviceTokenEmbedding &&other)
 {
   if(this!=&other)
   {
     FreeTokenIdBuffer();
-    CAIF_DeviceLayer::operator=(std::move(other));
+    CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
     _config=other._config;
     _embedding_table=std::move(other._embedding_table);
     _embedding_table_grad=std::move(other._embedding_table_grad);
-    _output_buffer=std::move(other._output_buffer);
     _token_ids_device=other._token_ids_device;
     _token_ids_capacity=other._token_ids_capacity;
     _cached_num_tokens=other._cached_num_tokens;
-    _output_batch=other._output_batch;
-    _output_seq_len=other._output_seq_len;
     other._token_ids_device=nullptr;
     other._token_ids_capacity=0;
     other._cached_num_tokens=0;
-    other._output_batch=0;
-    other._output_seq_len=0;
   }
   return *this;
 }
 
-void CAIF_DeviceTokenEmbedding::EnsureTokenIdCapacity(size_t num_tokens)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::EnsureTokenIdCapacity(size_t num_tokens)
 {
 #ifdef USE_CAIF_CUDA
   if(num_tokens>_token_ids_capacity)
@@ -126,10 +131,13 @@ void CAIF_DeviceTokenEmbedding::EnsureTokenIdCapacity(size_t num_tokens)
     cudaMalloc(reinterpret_cast<void**>(&_token_ids_device),num_tokens*sizeof(uint32_t));
     _token_ids_capacity=num_tokens;
   }
+#else
+  (void)num_tokens;
 #endif
 }
 
-void CAIF_DeviceTokenEmbedding::FreeTokenIdBuffer()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::FreeTokenIdBuffer()
 {
 #ifdef USE_CAIF_CUDA
   if(_token_ids_device!=nullptr)
@@ -141,167 +149,174 @@ void CAIF_DeviceTokenEmbedding::FreeTokenIdBuffer()
 #endif
 }
 
-void CAIF_DeviceTokenEmbedding::EnsureOutputBuffer(uint32_t batch,uint32_t seq_len)
-{
-  if(batch!=_output_batch||seq_len!=_output_seq_len)
-  {
-    _output_buffer=CAIF_DeviceTensor::Uninitialized({batch,seq_len,_config.dim},*_stream);
-    _output_batch=batch;
-    _output_seq_len=seq_len;
-  }
-}
-
-CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::ForwardFromIds(const uint32_t *host_token_ids,
-                                                          uint32_t batch,
-                                                          uint32_t seq_len,
-                                                          bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ForwardFromIds(const uint32_t *host_token_ids,
+                                                              uint32_t batch,
+                                                              uint32_t seq_len,
+                                                              bool training)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceTokenEmbedding: layer has been moved from");
-    }
-
     const uint32_t num_tokens=batch*seq_len;
 
-    // Copy token IDs to device
     EnsureTokenIdCapacity(num_tokens);
 #ifdef USE_CAIF_CUDA
     cudaMemcpyAsync(_token_ids_device,
                     host_token_ids,
                     num_tokens*sizeof(uint32_t),
                     cudaMemcpyHostToDevice,
-                    _stream->Handle());
+                    Stream().Handle());
 #endif
 
-    // Reuse output buffer if shape matches
-    EnsureOutputBuffer(batch,seq_len);
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(
+      {batch,seq_len,_config.dim},Stream(),StorageDtype());
 
-    launch_embedding_lookup(_embedding_table.DevicePtr(),
-                            _token_ids_device,
-                            _output_buffer.DevicePtr(),
-                            static_cast<int>(num_tokens),
-                            static_cast<int>(_config.dim),
-                            _stream->Handle());
+    launch_embedding_lookup<StorageT>(StoragePtr(_embedding_table),
+                                      _token_ids_device,
+                                      StoragePtr(output),
+                                      static_cast<int>(num_tokens),
+                                      static_cast<int>(_config.dim),
+                                      Stream().Handle());
 
     if(training==true)
     {
       _cached_num_tokens=num_tokens;
     }
 
-    return _output_buffer.Clone();
+    return output;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Forward(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                          CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceTokenEmbedding: layer has been moved from");
-    }
-
-    const auto &shape=input.Shape();
+    const std::vector<uint32_t> &shape=input.Shape();
     if(shape.size()!=2)
     {
-      THROW_CAIFE("DeviceTokenEmbedding::Forward: input must be 2D [batch, seq_len]");
+      THROW_CAIFE("CAIF_DeviceTokenEmbedding::Forward: input must be 2D [batch, seq_len]");
     }
 
     const uint32_t batch=shape[0];
     const uint32_t seq_len=shape[1];
     const uint32_t num_tokens=batch*seq_len;
 
-    // Reuse output buffer if shape matches
-    EnsureOutputBuffer(batch,seq_len);
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(
+      {batch,seq_len,_config.dim},ctx.Stream(),StorageDtype());
 
-    launch_embedding_lookup_float(_embedding_table.DevicePtr(),
-                                  input.DevicePtr(),
-                                  _output_buffer.DevicePtr(),
-                                  static_cast<int>(num_tokens),
-                                  static_cast<int>(_config.dim),
-                                  _stream->Handle());
+    const CAIF_DataType::CAIF_DataType_e dtype=input.Dtype();
+    const bool is_uint_ids=(dtype==CAIF_DataType::CAIF_DataType_e::UInt32||
+                            dtype==CAIF_DataType::CAIF_DataType_e::Int32);
 
-    if(training==true)
+    if(is_uint_ids==true)
     {
-      // Convert float IDs to uint32 on GPU (no host roundtrip)
-      EnsureTokenIdCapacity(num_tokens);
-      launch_float_to_uint(input.DevicePtr(),
-                            _token_ids_device,
-                            static_cast<int>(num_tokens),
-                            _stream->Handle());
-      _cached_num_tokens=num_tokens;
+      // Native integer path: no float->uint cast in the kernel. Input
+      // tensor is Int32/UInt32 (4-byte elements); reinterpret via the
+      // raw data pointer so the fp32-only DevicePtr() overload isn't
+      // touched.
+      const unsigned int *ids=reinterpret_cast<const unsigned int *>(input.DeviceDataRaw());
+      launch_embedding_lookup<StorageT>(StoragePtr(_embedding_table),
+                                        ids,
+                                        StoragePtr(output),
+                                        static_cast<int>(num_tokens),
+                                        static_cast<int>(_config.dim),
+                                        ctx.Stream().Handle());
+
+      if(ctx.Training()==true)
+      {
+        EnsureTokenIdCapacity(num_tokens);
+#ifdef USE_CAIF_CUDA
+        cudaMemcpyAsync(_token_ids_device,
+                        ids,
+                        num_tokens*sizeof(uint32_t),
+                        cudaMemcpyDeviceToDevice,
+                        ctx.Stream().Handle());
+#endif
+        _cached_num_tokens=num_tokens;
+      }
+    }
+    else
+    {
+      // Compat path: float-encoded token IDs (in-kernel cast). input is
+      // Float32 by definition here (we're in the else branch of the
+      // Int32/UInt32 check), so DevicePtr<float>() is the correct typed
+      // accessor.
+      launch_embedding_lookup_float<StorageT>(StoragePtr(_embedding_table),
+                                              input.DevicePtr<float>(),
+                                              StoragePtr(output),
+                                              static_cast<int>(num_tokens),
+                                              static_cast<int>(_config.dim),
+                                              ctx.Stream().Handle());
+
+      if(ctx.Training()==true)
+      {
+        EnsureTokenIdCapacity(num_tokens);
+        // fp32: input is Float32 in this else-branch (see comment above).
+        launch_float_to_uint(input.DevicePtr<float>(),
+                             _token_ids_device,
+                             static_cast<int>(num_tokens),
+                             ctx.Stream().Handle());
+        _cached_num_tokens=num_tokens;
+      }
     }
 
-    return _output_buffer.Clone();
+    return output;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceTokenEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                           CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceTokenEmbedding: layer has been moved from");
-    }
     if(_cached_num_tokens==0)
     {
-      THROW_CAIFE(
-        "DeviceTokenEmbedding::Backward: must call Forward with training=true first");
+      THROW_CAIFE("CAIF_DeviceTokenEmbedding::Backward: must call Forward with training=true first");
     }
+    AssertInputDtype(grad_output);
 
-    // Zero grad table before scatter-add
-    _embedding_table_grad.Fill(0.0f);
+    _embedding_table_grad.FillZero();
 
-    launch_embedding_backward(grad_output.DevicePtr(),
-                              _token_ids_device,
-                              _embedding_table_grad.DevicePtr(),
-                              static_cast<int>(_cached_num_tokens),
-                              static_cast<int>(_config.dim),
-                              _stream->Handle());
+    launch_embedding_backward<StorageT>(StoragePtr(grad_output),
+                                        _token_ids_device,
+                                        StoragePtr(_embedding_table_grad),
+                                        static_cast<int>(_cached_num_tokens),
+                                        static_cast<int>(_config.dim),
+                                        ctx.Stream().Handle());
 
-    // Return empty tensor (input is non-differentiable discrete token IDs)
+    // Input is non-differentiable discrete token IDs.
     return CAIF_DeviceTensor();
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceTokenEmbedding::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _embedding_table_grad.Fill(0.0f);
+    _embedding_table_grad.FillZero();
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceTokenEmbedding::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  try
-  {
-    return g_caif_embedding_parameter_count;
-  }
-  CAIF_CATCH_BLOCK()
+  return g_caif_embedding_parameter_count;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index)
-{
-  try
-  {
-    if(index==0)
-    {
-      return _embedding_table;
-    }
-    THROW_CAIFE("DeviceTokenEmbedding::ParameterTensor: index out of range");
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
   try
   {
@@ -309,12 +324,29 @@ const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::ParameterTensor(size_t index
     {
       return _embedding_table;
     }
-    THROW_CAIFE("DeviceTokenEmbedding::ParameterTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceTokenEmbedding::ParameterTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)const
+{
+  try
+  {
+    if(index==0)
+    {
+      return _embedding_table;
+    }
+    THROW_CAIFE("CAIF_DeviceTokenEmbedding::ParameterTensor: index out of range");
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   try
   {
@@ -322,12 +354,14 @@ CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
     {
       return _embedding_table_grad;
     }
-    THROW_CAIFE("DeviceTokenEmbedding::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceTokenEmbedding::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   try
   {
@@ -335,21 +369,19 @@ const CAIF_DeviceTensor &CAIF_DeviceTokenEmbedding::GradientTensor(size_t index)
     {
       return _embedding_table_grad;
     }
-    THROW_CAIFE("DeviceTokenEmbedding::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceTokenEmbedding::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceTokenEmbedding::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::TotalParameterCount()const
 {
-  try
-  {
-    return static_cast<size_t>(_config.vocab_size)*_config.dim;
-  }
-  CAIF_CATCH_BLOCK()
+  return static_cast<size_t>(_config.vocab_size)*_config.dim;
 }
 
-std::string CAIF_DeviceTokenEmbedding::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -359,7 +391,9 @@ std::string CAIF_DeviceTokenEmbedding::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceTokenEmbedding::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
@@ -369,5 +403,33 @@ std::vector<std::string> CAIF_DeviceTokenEmbedding::ParameterNames(const std::st
   }
   CAIF_CATCH_BLOCK()
 }
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::LoadEmbeddingTable(CAIF_DeviceTensor &&table)
+{
+  try
+  {
+    const std::vector<uint32_t> &shape=table.Shape();
+    if(shape.size()!=2||shape[0]!=_config.vocab_size||shape[1]!=_config.dim)
+    {
+      THROW_CAIFE("CAIF_DeviceTokenEmbedding::LoadEmbeddingTable: shape mismatch");
+    }
+    _embedding_table=std::move(table);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceTokenEmbedding<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceTokenEmbedding<float,__half>;
+template class CAIF_DeviceTokenEmbedding<float,__nv_bfloat16>;
+template class CAIF_DeviceTokenEmbedding<__half,float>;
+template class CAIF_DeviceTokenEmbedding<__half,__half>;
+template class CAIF_DeviceTokenEmbedding<__half,__nv_bfloat16>;
+template class CAIF_DeviceTokenEmbedding<__nv_bfloat16,float>;
+template class CAIF_DeviceTokenEmbedding<__nv_bfloat16,__half>;
+template class CAIF_DeviceTokenEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

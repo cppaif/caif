@@ -14,44 +14,55 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident Transformer Model
+// CAIF_DeviceTransformerModel<ComputeT, StorageT> — complete transformer
+// model. Assembles embedding, positional encoding, N transformer blocks,
+// final norm, and output head into a single trainable unit.
+//
+// Input:  [batch, seq_len] (token IDs as float)
+// Output: [batch, seq_len, output_dim]
+//
+// Components (appended to the container in this order):
+//   - TokenEmbedding<C, S>           [batch, seq_len] -> [batch, seq_len, dim]
+//   - PositionalEncoding<C, S>       (optional, omitted when use_rope=true)
+//   - N x TransformerBlock<C, S>
+//   - RMSNorm<C, S>                  (final normalization)
+//   - LinearHead<C, S>               [batch, seq_len, dim] -> [batch, seq_len, output_dim]
+//
+// Forward / backward chaining is inherited from CAIF_DeviceContainer.
+// Parameter / gradient iteration, zero-grad, total-param-count, and aux-loss
+// summation all come from the container base. The model templates on
+// <ComputeT, StorageT> for the cell every internal sublayer is built at.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_TRANSFORMER_MODEL_H
-#define CAIF_DEVICE_TRANSFORMER_MODEL_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_container.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_device_token_embedding.h"
 #include "caif_device_positional_encoding.h"
 #include "caif_device_transformer_block.h"
 #include "caif_device_rmsnorm.h"
 #include "caif_device_linear_head.h"
+#include "caif_storage_dtype.h"
+#include "caif_storage_dtype_float.h"
+#ifdef USE_CAIF_CUDA
+#include "caif_storage_dtype_half.h"
+#include "caif_storage_dtype_bfloat16.h"
+#endif
+
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <memory>
 
 namespace instance
 {
 
-/**
- * @brief Complete transformer model
- *
- * Assembles embedding, positional encoding, N transformer blocks,
- * final norm, and output head into a single trainable unit.
- *
- * Input:  [batch, seq_len] (token IDs as float)
- * Output: [batch, seq_len, output_dim]
- *
- * Components:
- *   - TokenEmbedding: [batch, seq_len] -> [batch, seq_len, dim]
- *   - PositionalEncoding (optional, not used with RoPE)
- *   - N x TransformerBlock
- *   - RMSNorm (final normalization)
- *   - LinearHead: [batch, seq_len, dim] -> [batch, seq_len, output_dim]
- */
-class CAIF_DeviceTransformerModel:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceTransformerModel:public CAIF_DeviceContainer
 {
   public:
+    typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
+
     /**
      * @brief Configuration for TransformerModel
      */
@@ -71,6 +82,7 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceLayer
       // Features
       bool causal;              // Causal attention mask
       bool use_rope;            // Use rotary position embeddings
+      int rope_style=0;         // CAIF_ROPE_INTERLEAVED(0) or CAIF_ROPE_HALF_SPLIT(1)
       PositionalEncodingMode_e pe_mode;  // Learned, Sinusoidal (ignored if use_rope)
 
       // Output
@@ -82,19 +94,14 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceLayer
     ~CAIF_DeviceTransformerModel()override=default;
 
     // Move
-    CAIF_DeviceTransformerModel(CAIF_DeviceTransformerModel &&other)noexcept;
-    CAIF_DeviceTransformerModel &operator=(CAIF_DeviceTransformerModel &&other)noexcept;
+    CAIF_DeviceTransformerModel(CAIF_DeviceTransformerModel &&other);
+    CAIF_DeviceTransformerModel &operator=(CAIF_DeviceTransformerModel &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
-    void ZeroGradients()override;
-    size_t ParameterTensorCount()const override;
-    CAIF_DeviceTensor &ParameterTensor(size_t index)override;
-    const CAIF_DeviceTensor &ParameterTensor(size_t index)const override;
-    CAIF_DeviceTensor &GradientTensor(size_t index)override;
-    const CAIF_DeviceTensor &GradientTensor(size_t index)const override;
-    size_t TotalParameterCount()const override;
+    // CAIF_DeviceLayer interface — only the tag and the name-prefixing override
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::TransformerModel_e;
+    }
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
@@ -102,25 +109,37 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceLayer
     const Config_t &Config()const{return _config;}
     uint32_t NumLayers()const{return _config.num_layers;}
 
+    static constexpr CAIF_DataType::CAIF_DataType_e ComputeDtype()
+    {
+      return CAIF_StorageDtype_t<ComputeT>::Value;
+    }
+    static constexpr CAIF_DataType::CAIF_DataType_e StorageDtype()
+    {
+      return CAIF_StorageDtype_t<StorageT>::Value;
+    }
+
   protected:
 
   private:
-    // Map global parameter index to (component, local_index)
-    void MapIndex(size_t global_index,size_t &component_idx,size_t &local_idx)const;
-
+    // Slot indices within _sublayers for name-prefix resolution.
+    // _pos_enc_present toggles whether a PositionalEncoding sublayer
+    // sits between the embedding and the first block.
     Config_t _config;
-
-    // Sub-layers
-    std::unique_ptr<CAIF_DeviceTokenEmbedding> _embedding;
-    std::unique_ptr<CAIF_DevicePositionalEncoding> _pos_enc;  // nullptr if RoPE
-    std::vector<std::unique_ptr<CAIF_DeviceTransformerBlock>> _blocks;
-    std::unique_ptr<CAIF_DeviceRMSNorm> _final_norm;
-    std::unique_ptr<CAIF_DeviceLinearHead> _head;
-
-    // Parameter counts per component (for MapIndex)
-    std::vector<size_t> _param_offsets;  // Cumulative parameter counts
+    bool _pos_enc_present;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceTransformerModel<float,float>;
+extern template class CAIF_DeviceTransformerModel<float,__half>;
+extern template class CAIF_DeviceTransformerModel<float,__nv_bfloat16>;
+extern template class CAIF_DeviceTransformerModel<__half,float>;
+extern template class CAIF_DeviceTransformerModel<__half,__half>;
+extern template class CAIF_DeviceTransformerModel<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceTransformerModel<__nv_bfloat16,float>;
+extern template class CAIF_DeviceTransformerModel<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceTransformerModel<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceTransformerModel<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_TRANSFORMER_MODEL_H
+}//end instance namespace

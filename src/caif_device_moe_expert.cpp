@@ -17,128 +17,133 @@
 // Device-resident MoE Expert implementation
 //------------------------------------------------------------------------------
 #include "caif_device_moe_expert.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_exception.h"
 #include <random>
 #include <cmath>
 
-using namespace instance;
+namespace instance
+{
 
-CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,CAIF_CudaStream &stream)
-  :CAIF_DeviceLayer(stream)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoEExpert<ComputeT,StorageT>::CAIF_DeviceMoEExpert(const Config_t &config,CAIF_CudaStream &stream)
+  :CAIF_DeviceMoEExpertBase<ComputeT,StorageT>(stream)
   ,_config(config)
   ,_use_projections(false)
 {
   try
   {
     // Validate config
-    if(_config.input_dim==0)
+    if(Config().input_dim==0)
     {
       THROW_CAIFE("MoEExpert: input_dim must be > 0");
     }
-    if(_config.hidden_dim==0)
+    if(Config().hidden_dim==0)
     {
       THROW_CAIFE("MoEExpert: hidden_dim must be > 0");
     }
 
-    // Allocate weights
-    if(_config.use_gated==true)
+    // Allocate weights at the templated storage dtype.
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    if(Config().use_gated==true)
     {
-      _w_gate=CAIF_DeviceTensor::Uninitialized({_config.input_dim,_config.hidden_dim},stream);
-      _grad_w_gate=CAIF_DeviceTensor::Zeros({_config.input_dim,_config.hidden_dim},stream);
+      SetWGate(CAIF_DeviceTensor::Uninitialized({Config().input_dim,Config().hidden_dim},stream,sd));
+      SetGradWGate(CAIF_DeviceTensor::Zeros({Config().input_dim,Config().hidden_dim},stream,sd));
 
-      if(_config.use_bias==true)
+      if(Config().use_bias==true)
       {
-        _b_gate=CAIF_DeviceTensor::Zeros({_config.hidden_dim},stream);
-        _grad_b_gate=CAIF_DeviceTensor::Zeros({_config.hidden_dim},stream);
+        SetBGate(CAIF_DeviceTensor::Zeros({Config().hidden_dim},stream,sd));
+        SetGradBGate(CAIF_DeviceTensor::Zeros({Config().hidden_dim},stream,sd));
       }
     }
 
-    _w_up=CAIF_DeviceTensor::Uninitialized({_config.input_dim,_config.hidden_dim},stream);
-    _w_down=CAIF_DeviceTensor::Uninitialized({_config.hidden_dim,_config.input_dim},stream);
-    _grad_w_up=CAIF_DeviceTensor::Zeros({_config.input_dim,_config.hidden_dim},stream);
-    _grad_w_down=CAIF_DeviceTensor::Zeros({_config.hidden_dim,_config.input_dim},stream);
+    SetWUp(CAIF_DeviceTensor::Uninitialized({Config().input_dim,Config().hidden_dim},stream,sd));
+    SetWDown(CAIF_DeviceTensor::Uninitialized({Config().hidden_dim,Config().input_dim},stream,sd));
+    SetGradWUp(CAIF_DeviceTensor::Zeros({Config().input_dim,Config().hidden_dim},stream,sd));
+    SetGradWDown(CAIF_DeviceTensor::Zeros({Config().hidden_dim,Config().input_dim},stream,sd));
 
-    if(_config.use_bias==true)
+    if(Config().use_bias==true)
     {
-      _b_up=CAIF_DeviceTensor::Zeros({_config.hidden_dim},stream);
-      _b_down=CAIF_DeviceTensor::Zeros({_config.input_dim},stream);
-      _grad_b_up=CAIF_DeviceTensor::Zeros({_config.hidden_dim},stream);
-      _grad_b_down=CAIF_DeviceTensor::Zeros({_config.input_dim},stream);
+      SetBUp(CAIF_DeviceTensor::Zeros({Config().hidden_dim},stream,sd));
+      SetBDown(CAIF_DeviceTensor::Zeros({Config().input_dim},stream,sd));
+      SetGradBUp(CAIF_DeviceTensor::Zeros({Config().hidden_dim},stream,sd));
+      SetGradBDown(CAIF_DeviceTensor::Zeros({Config().input_dim},stream,sd));
     }
 
-    // Xavier initialization
+    // Xavier initialization — host fp32 stage, then To(sd) when needed.
     std::random_device rd;
     std::mt19937 gen(rd());
 
-    float scale_up=std::sqrt(2.0f/static_cast<float>(_config.input_dim+_config.hidden_dim));
-    float scale_down=std::sqrt(2.0f/static_cast<float>(_config.hidden_dim+_config.input_dim));
+    float scale_up=std::sqrt(2.0f/static_cast<float>(Config().input_dim+Config().hidden_dim));
+    float scale_down=std::sqrt(2.0f/static_cast<float>(Config().hidden_dim+Config().input_dim));
 
     std::normal_distribution<float> dist_up(0.0f,scale_up);
     std::normal_distribution<float> dist_down(0.0f,scale_down);
 
-    // Initialize w_up
+    // Initialize w_up — host-side fp32 sample, host-converted to sd at
+    // upload (no device-side fp32 staging tensor).
     {
-      std::vector<float> data(_config.input_dim*_config.hidden_dim);
+      std::vector<float> data(Config().input_dim*Config().hidden_dim);
       for(size_t i=0;i<data.size();++i)
       {
         data[i]=dist_up(gen);
       }
-      _w_up.CopyFromHost(data.data(),data.size());
+      WUpMut().CopyFromHostFp32(data.data(),data.size());
     }
 
     // Initialize w_down
     {
-      std::vector<float> data(_config.hidden_dim*_config.input_dim);
+      std::vector<float> data(Config().hidden_dim*Config().input_dim);
       for(size_t i=0;i<data.size();++i)
       {
         data[i]=dist_down(gen);
       }
-      _w_down.CopyFromHost(data.data(),data.size());
+      WDownMut().CopyFromHostFp32(data.data(),data.size());
     }
 
     // Initialize w_gate if gated
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
-      std::vector<float> data(_config.input_dim*_config.hidden_dim);
+      std::vector<float> data(Config().input_dim*Config().hidden_dim);
       for(size_t i=0;i<data.size();++i)
       {
         data[i]=dist_up(gen);
       }
-      _w_gate.CopyFromHost(data.data(),data.size());
+      WGateMut().CopyFromHostFp32(data.data(),data.size());
     }
 
-    _stream->Synchronize();
+    Stream().Synchronize();
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoEExpert<ComputeT,StorageT>::CAIF_DeviceMoEExpert(const Config_t &config,
                                          MoEExpertProjections_t projections,
-                                         CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
+                                         CAIF_CudaStream &stream):CAIF_DeviceMoEExpertBase<ComputeT,StorageT>(stream),
                                                                   _config(config),
                                                                   _projections(std::move(projections)),
                                                                   _use_projections(true)
 {
   try
   {
-    if(_config.input_dim==0)
+    if(Config().input_dim==0)
     {
       THROW_CAIFE("MoEExpert: input_dim must be > 0");
     }
-    if(_config.hidden_dim==0)
+    if(Config().hidden_dim==0)
     {
       THROW_CAIFE("MoEExpert: hidden_dim must be > 0");
     }
-    if(_projections.up==nullptr)
+    if(Projections().up==nullptr)
     {
       THROW_CAIFE("MoEExpert: up projection must not be null");
     }
-    if(_projections.down==nullptr)
+    if(Projections().down==nullptr)
     {
       THROW_CAIFE("MoEExpert: down projection must not be null");
     }
-    if(_config.use_gated==true&&_projections.gate==nullptr)
+    if(Config().use_gated==true&&Projections().gate==nullptr)
     {
       THROW_CAIFE("MoEExpert: gate projection required for gated mode");
     }
@@ -146,8 +151,9 @@ CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(const Config_t &config,
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(CAIF_DeviceMoEExpert &&other)
-  :CAIF_DeviceLayer(std::move(other))
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoEExpert<ComputeT,StorageT>::CAIF_DeviceMoEExpert(CAIF_DeviceMoEExpert<ComputeT,StorageT> &&other)
+  :CAIF_DeviceMoEExpertBase<ComputeT,StorageT>(std::move(other))
   ,_config(other._config)
   ,_projections(std::move(other._projections))
   ,_use_projections(other._use_projections)
@@ -170,11 +176,12 @@ CAIF_DeviceMoEExpert::CAIF_DeviceMoEExpert(CAIF_DeviceMoEExpert &&other)
 {
 }
 
-CAIF_DeviceMoEExpert &CAIF_DeviceMoEExpert::operator=(CAIF_DeviceMoEExpert &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoEExpert<ComputeT,StorageT> &CAIF_DeviceMoEExpert<ComputeT,StorageT>::operator=(CAIF_DeviceMoEExpert<ComputeT,StorageT> &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
+    CAIF_DeviceMoEExpertBase<ComputeT,StorageT>::operator=(std::move(other));
     _config=other._config;
     _projections=std::move(other._projections);
     _use_projections=other._use_projections;
@@ -198,85 +205,95 @@ CAIF_DeviceMoEExpert &CAIF_DeviceMoEExpert::operator=(CAIF_DeviceMoEExpert &&oth
   return *this;
 }
 
-CAIF_DeviceTensor CAIF_DeviceMoEExpert::Forward(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMoEExpert<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)
 {
   try
   {
     // Input: [num_tokens, input_dim]
     const auto &shape=input.Shape();
-    if(shape.size()!=2||shape[1]!=_config.input_dim)
+    if(shape.size()!=2||shape[1]!=Config().input_dim)
     {
       THROW_CAIFE("MoEExpert::Forward: expected input shape [N, input_dim]");
     }
 
     const uint32_t num_tokens=shape[0];
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
     // Cache input for backward (only when not using projections)
-    if(training==true&&_use_projections==false)
+    if(ctx.Training()==true&&UseProjections()==false)
     {
-      _cached_input=input.Clone();
+      SetCachedInput(input.Clone());
     }
 
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
-      // Gated FFN: output = (gate * SiLU(up)) @ down
+      // Gated FFN (SwiGLU): output = (SiLU(gate) * up) @ down. This matches
+      // HF's standard convention: `down_proj(act_fn(gate_proj(x)) * up_proj(x))`
+      // which is what every recent MoE (OLMoE / GLM-4-MoE / DSv2 / Qwen3MoE)
+      // trains under and is what CAIF_DeviceFFN does via SwiGLUActivation::
+      // Forward(gate, up, output). Swapping the silu target (silu(up) vs
+      // silu(gate)) breaks parity vs the reference implementation on
+      // every loaded MoE expert because the trained weights aren't
+      // symmetric in gate/up.
       CAIF_DeviceTensor gate_out;
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        gate_out=_projections.gate->Forward(input,training);
+        gate_out=Projections().gate->Forward(input,ctx);
       }
       else
       {
-        gate_out=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-        CAIF_DeviceOps::MatMul(input,_w_gate,gate_out);
-        if(_config.use_bias==true)
+        gate_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WGate(),gate_out,ctx,cdt);
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceOps::AddBias(gate_out,_b_gate,gate_out);
+          CAIF_Ops::AddBias(gate_out,BGate(),gate_out);
         }
       }
 
       CAIF_DeviceTensor up_out;
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        up_out=_projections.up->Forward(input,training);
+        up_out=Projections().up->Forward(input,ctx);
       }
       else
       {
-        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-        CAIF_DeviceOps::MatMul(input,_w_up,up_out);
-        if(_config.use_bias==true)
+        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WUp(),up_out,ctx,cdt);
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceOps::AddBias(up_out,_b_up,up_out);
+          CAIF_Ops::AddBias(up_out,BUp(),up_out);
         }
       }
 
-      // SiLU activation on up, then multiply by gate
-      CAIF_DeviceTensor up_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::SiLU(up_out,up_activated);
+      // SwiGLU: silu(gate) * up. Standard HF convention.
+      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLU(gate_out,gate_activated);
 
-      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::Multiply(gate_out,up_activated,hidden);
+      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::Multiply(gate_activated,up_out,hidden);
 
-      if(training==true)
+      if(ctx.Training()==true)
       {
-        _cached_gate_out=std::move(gate_out);
-        _cached_up_out=std::move(up_out);
-        _cached_hidden=hidden.Clone();
+        SetCachedGateOut(std::move(gate_out));
+        SetCachedUpOut(std::move(up_out));
+        SetCachedHidden(hidden.Clone());
       }
 
       // Down projection
       CAIF_DeviceTensor output;
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        output=_projections.down->Forward(hidden,training);
+        output=Projections().down->Forward(hidden,ctx);
       }
       else
       {
-        output=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMul(hidden,_w_down,output);
-        if(_config.use_bias==true)
+        output=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::MatMul(hidden,WDown(),output,ctx,cdt);
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceOps::AddBias(output,_b_down,output);
+          CAIF_Ops::AddBias(output,BDown(),output);
         }
       }
 
@@ -286,41 +303,41 @@ CAIF_DeviceTensor CAIF_DeviceMoEExpert::Forward(const CAIF_DeviceTensor &input,b
     {
       // Standard FFN: output = SiLU(input @ w_up + b_up) @ w_down + b_down
       CAIF_DeviceTensor up_out;
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        up_out=_projections.up->Forward(input,training);
+        up_out=Projections().up->Forward(input,ctx);
       }
       else
       {
-        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-        CAIF_DeviceOps::MatMul(input,_w_up,up_out);
-        if(_config.use_bias==true)
+        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WUp(),up_out,ctx,cdt);
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceOps::AddBias(up_out,_b_up,up_out);
+          CAIF_Ops::AddBias(up_out,BUp(),up_out);
         }
       }
 
-      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::SiLU(up_out,hidden);
+      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLU(up_out,hidden);
 
-      if(training==true)
+      if(ctx.Training()==true)
       {
-        _cached_up_out=std::move(up_out);
-        _cached_hidden=hidden.Clone();
+        SetCachedUpOut(std::move(up_out));
+        SetCachedHidden(hidden.Clone());
       }
 
       CAIF_DeviceTensor output;
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        output=_projections.down->Forward(hidden,training);
+        output=Projections().down->Forward(hidden,ctx);
       }
       else
       {
-        output=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMul(hidden,_w_down,output);
-        if(_config.use_bias==true)
+        output=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::MatMul(hidden,WDown(),output,ctx,cdt);
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceOps::AddBias(output,_b_down,output);
+          CAIF_Ops::AddBias(output,BDown(),output);
         }
       }
 
@@ -330,123 +347,284 @@ CAIF_DeviceTensor CAIF_DeviceMoEExpert::Forward(const CAIF_DeviceTensor &input,b
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceMoEExpert::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoEExpert<ComputeT,StorageT>::ForwardInto(const CAIF_DeviceTensor &input,
+                                                          CAIF_DeviceTensor &output,
+                                                          CAIF_RunContext &ctx)
+{
+  try
+  {
+    // Same flow as ForwardImpl, but the final down-projection writes into
+    // `output` (caller-provided slice). Saves a per-expert allocation and
+    // a per-expert D2D cudaMemcpyAsync in the MoE layer loop.
+    const auto &shape=input.Shape();
+    if(shape.size()!=2||shape[1]!=Config().input_dim)
+    {
+      THROW_CAIFE("MoEExpert::ForwardInto: expected input shape [N, input_dim]");
+    }
+    const auto &out_shape=output.Shape();
+    if(out_shape.size()!=2||out_shape[0]!=shape[0]||out_shape[1]!=Config().input_dim)
+    {
+      THROW_CAIFE("MoEExpert::ForwardInto: output shape must be [N, input_dim]");
+    }
+
+    const uint32_t num_tokens=shape[0];
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
+
+    if(ctx.Training()==true&&UseProjections()==false)
+    {
+      SetCachedInput(input.Clone());
+    }
+
+    if(Config().use_gated==true)
+    {
+      CAIF_DeviceTensor gate_out;
+      if(UseProjections()==true)
+      {
+        gate_out=Projections().gate->Forward(input,ctx);
+      }
+      else
+      {
+        gate_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WGate(),gate_out,ctx,cdt);
+        if(Config().use_bias==true)
+        {
+          CAIF_Ops::AddBias(gate_out,BGate(),gate_out);
+        }
+      }
+
+      CAIF_DeviceTensor up_out;
+      if(UseProjections()==true)
+      {
+        up_out=Projections().up->Forward(input,ctx);
+      }
+      else
+      {
+        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WUp(),up_out,ctx,cdt);
+        if(Config().use_bias==true)
+        {
+          CAIF_Ops::AddBias(up_out,BUp(),up_out);
+        }
+      }
+
+      // SwiGLU: silu(gate) * up. Same correction as the ForwardImpl path
+      // above; see the comment there.
+      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLU(gate_out,gate_activated);
+
+      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::Multiply(gate_activated,up_out,hidden);
+
+      if(ctx.Training()==true)
+      {
+        SetCachedGateOut(std::move(gate_out));
+        SetCachedUpOut(std::move(up_out));
+        SetCachedHidden(hidden.Clone());
+      }
+
+      // Down projection writes directly into the caller-provided output.
+      // The projections branch can't take advantage (it allocates inside
+      // its own Forward), so it falls back to a copy. The bench cells use
+      // the non-projections constructor, so the fast path applies there.
+      if(UseProjections()==true)
+      {
+        CAIF_DeviceTensor proj_out=Projections().down->Forward(hidden,ctx);
+#ifdef USE_CAIF_CUDA
+        cudaMemcpyAsync(output.DeviceDataRaw(),
+                        proj_out.DeviceDataRaw(),
+                        static_cast<size_t>(num_tokens)*Config().input_dim
+                          *CAIF_DataType(sd).ElementSizeBytes(),
+                        cudaMemcpyDeviceToDevice,
+                        Stream().Handle());
+#endif
+      }
+      else
+      {
+        CAIF_Ops::MatMul(hidden,WDown(),output,ctx,cdt);
+        if(Config().use_bias==true)
+        {
+          CAIF_Ops::AddBias(output,BDown(),output);
+        }
+      }
+    }
+    else
+    {
+      CAIF_DeviceTensor up_out;
+      if(UseProjections()==true)
+      {
+        up_out=Projections().up->Forward(input,ctx);
+      }
+      else
+      {
+        up_out=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMul(input,WUp(),up_out,ctx,cdt);
+        if(Config().use_bias==true)
+        {
+          CAIF_Ops::AddBias(up_out,BUp(),up_out);
+        }
+      }
+
+      CAIF_DeviceTensor hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLU(up_out,hidden);
+
+      if(ctx.Training()==true)
+      {
+        SetCachedUpOut(std::move(up_out));
+        SetCachedHidden(hidden.Clone());
+      }
+
+      if(UseProjections()==true)
+      {
+        CAIF_DeviceTensor proj_out=Projections().down->Forward(hidden,ctx);
+#ifdef USE_CAIF_CUDA
+        cudaMemcpyAsync(output.DeviceDataRaw(),
+                        proj_out.DeviceDataRaw(),
+                        static_cast<size_t>(num_tokens)*Config().input_dim
+                          *CAIF_DataType(sd).ElementSizeBytes(),
+                        cudaMemcpyDeviceToDevice,
+                        Stream().Handle());
+#endif
+      }
+      else
+      {
+        CAIF_Ops::MatMul(hidden,WDown(),output,ctx,cdt);
+        if(Config().use_bias==true)
+        {
+          CAIF_Ops::AddBias(output,BDown(),output);
+        }
+      }
+    }
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMoEExpert<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)
 {
   try
   {
     // grad_output: [num_tokens, input_dim]
     const auto &shape=grad_output.Shape();
     const uint32_t num_tokens=shape[0];
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
     // Backward through down projection
     CAIF_DeviceTensor grad_hidden;
-    if(_use_projections==true)
+    if(UseProjections()==true)
     {
-      grad_hidden=_projections.down->Backward(grad_output);
+      grad_hidden=Projections().down->Backward(grad_output,ctx);
     }
     else
     {
-      grad_hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_output,_w_down,grad_hidden);
+      grad_hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::MatMulTransposeB(grad_output,WDown(),grad_hidden,ctx,cdt);
 
-      CAIF_DeviceTensor grad_w_down_batch=CAIF_DeviceTensor::Uninitialized({_config.hidden_dim,_config.input_dim},
-                                                                         *_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_hidden,grad_output,grad_w_down_batch);
-      CAIF_DeviceOps::Add(_grad_w_down,grad_w_down_batch,_grad_w_down);
+      CAIF_DeviceTensor grad_w_down_batch=CAIF_DeviceTensor::Uninitialized({Config().hidden_dim,Config().input_dim},
+                                                                          Stream(),sd);
+      CAIF_Ops::MatMulTransposeA(CachedHidden(),grad_output,grad_w_down_batch,ctx,cdt);
+      CAIF_Ops::Add(GradWDown(),grad_w_down_batch,GradWDownMut());
 
-      if(_config.use_bias==true)
+      if(Config().use_bias==true)
       {
-        CAIF_DeviceTensor grad_b_down_batch=CAIF_DeviceTensor::Uninitialized({_config.input_dim},*_stream);
-        CAIF_DeviceOps::SumAxis(grad_output,0,grad_b_down_batch);
-        CAIF_DeviceOps::Add(_grad_b_down,grad_b_down_batch,_grad_b_down);
+        CAIF_DeviceTensor grad_b_down_batch=CAIF_DeviceTensor::Uninitialized({Config().input_dim},Stream(),sd);
+        CAIF_Ops::SumAxis(grad_output,0,grad_b_down_batch);
+        CAIF_Ops::Add(GradBDown(),grad_b_down_batch,GradBDownMut());
       }
     }
 
     CAIF_DeviceTensor grad_input;
 
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
-      // Backward through gated activation
-      CAIF_DeviceTensor up_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::SiLU(_cached_up_out,up_activated);
+      // Backward through SwiGLU (silu(gate) * up). Mirror the forward
+      // semantics now in ForwardImpl / ForwardInto:
+      //   hidden = silu(gate_out) * up_out
+      //   grad_gate_act = grad_hidden * up_out
+      //   grad_gate     = SiLUBackward(gate_out, grad_gate_act)
+      //   grad_up       = grad_hidden * silu(gate_out)
+      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLU(CachedGateOut(),gate_activated);
 
-      CAIF_DeviceTensor grad_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::Multiply(grad_hidden,up_activated,grad_gate);
+      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::Multiply(grad_hidden,gate_activated,grad_up);
 
-      CAIF_DeviceTensor grad_up_activated=
-        CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::Multiply(grad_hidden,_cached_gate_out,grad_up_activated);
+      CAIF_DeviceTensor grad_gate_activated=
+        CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::Multiply(grad_hidden,CachedUpOut(),grad_gate_activated);
 
-      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::SiLUBackward(_cached_up_out,grad_up_activated,grad_up);
+      CAIF_DeviceTensor grad_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLUBackward(CachedGateOut(),grad_gate_activated,grad_gate);
 
       // Backward through gate and up projections
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        CAIF_DeviceTensor gi_up=_projections.up->Backward(grad_up);
-        CAIF_DeviceTensor gi_gate=_projections.gate->Backward(grad_gate);
-        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::Add(gi_up,gi_gate,grad_input);
+        CAIF_DeviceTensor gi_up=Projections().up->Backward(grad_up,ctx);
+        CAIF_DeviceTensor gi_gate=Projections().gate->Backward(grad_gate,ctx);
+        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::Add(gi_up,gi_gate,grad_input);
       }
       else
       {
-        CAIF_DeviceTensor grad_w_up_batch=CAIF_DeviceTensor::Uninitialized({_config.input_dim,
-                                                                        _config.hidden_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeA(_cached_input,grad_up,grad_w_up_batch);
-        CAIF_DeviceOps::Add(_grad_w_up,grad_w_up_batch,_grad_w_up);
+        CAIF_DeviceTensor grad_w_up_batch=CAIF_DeviceTensor::Uninitialized({Config().input_dim,
+                                                                          Config().hidden_dim},Stream(),sd);
+        CAIF_Ops::MatMulTransposeA(CachedInput(),grad_up,grad_w_up_batch,ctx,cdt);
+        CAIF_Ops::Add(GradWUp(),grad_w_up_batch,GradWUpMut());
 
-        CAIF_DeviceTensor grad_w_gate_batch=CAIF_DeviceTensor::Uninitialized({_config.input_dim,_config.hidden_dim},
-                                                                           *_stream);
-        CAIF_DeviceOps::MatMulTransposeA(_cached_input,grad_gate,grad_w_gate_batch);
-        CAIF_DeviceOps::Add(_grad_w_gate,grad_w_gate_batch,_grad_w_gate);
+        CAIF_DeviceTensor grad_w_gate_batch=CAIF_DeviceTensor::Uninitialized({Config().input_dim,Config().hidden_dim},
+                                                                             Stream(),sd);
+        CAIF_Ops::MatMulTransposeA(CachedInput(),grad_gate,grad_w_gate_batch,ctx,cdt);
+        CAIF_Ops::Add(GradWGate(),grad_w_gate_batch,GradWGateMut());
 
-        if(_config.use_bias==true)
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceTensor grad_b_up_batch=CAIF_DeviceTensor::Uninitialized({_config.hidden_dim},*_stream);
-          CAIF_DeviceOps::SumAxis(grad_up,0,grad_b_up_batch);
-          CAIF_DeviceOps::Add(_grad_b_up,grad_b_up_batch,_grad_b_up);
+          CAIF_DeviceTensor grad_b_up_batch=CAIF_DeviceTensor::Uninitialized({Config().hidden_dim},Stream(),sd);
+          CAIF_Ops::SumAxis(grad_up,0,grad_b_up_batch);
+          CAIF_Ops::Add(GradBUp(),grad_b_up_batch,GradBUpMut());
 
-          CAIF_DeviceTensor grad_b_gate_batch=CAIF_DeviceTensor::Uninitialized({_config.hidden_dim},*_stream);
-          CAIF_DeviceOps::SumAxis(grad_gate,0,grad_b_gate_batch);
-          CAIF_DeviceOps::Add(_grad_b_gate,grad_b_gate_batch,_grad_b_gate);
+          CAIF_DeviceTensor grad_b_gate_batch=CAIF_DeviceTensor::Uninitialized({Config().hidden_dim},Stream(),sd);
+          CAIF_Ops::SumAxis(grad_gate,0,grad_b_gate_batch);
+          CAIF_Ops::Add(GradBGate(),grad_b_gate_batch,GradBGateMut());
         }
 
-        CAIF_DeviceTensor grad_input_up=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeB(grad_up,_w_up,grad_input_up);
+        CAIF_DeviceTensor grad_input_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::MatMulTransposeB(grad_up,WUp(),grad_input_up,ctx,cdt);
 
-        CAIF_DeviceTensor grad_input_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeB(grad_gate,_w_gate,grad_input_gate);
+        CAIF_DeviceTensor grad_input_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::MatMulTransposeB(grad_gate,WGate(),grad_input_gate,ctx,cdt);
 
-        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::Add(grad_input_up,grad_input_gate,grad_input);
+        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::Add(grad_input_up,grad_input_gate,grad_input);
       }
     }
     else
     {
       // Backward through SiLU activation
-      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.hidden_dim},*_stream);
-      CAIF_DeviceOps::SiLUBackward(_cached_up_out,grad_hidden,grad_up);
+      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_Ops::SiLUBackward(CachedUpOut(),grad_hidden,grad_up);
 
-      if(_use_projections==true)
+      if(UseProjections()==true)
       {
-        grad_input=_projections.up->Backward(grad_up);
+        grad_input=Projections().up->Backward(grad_up,ctx);
       }
       else
       {
-        CAIF_DeviceTensor grad_w_up_batch=CAIF_DeviceTensor::Uninitialized({_config.input_dim,_config.hidden_dim},
-                                                                         *_stream);
-        CAIF_DeviceOps::MatMulTransposeA(_cached_input,grad_up,grad_w_up_batch);
-        CAIF_DeviceOps::Add(_grad_w_up,grad_w_up_batch,_grad_w_up);
+        CAIF_DeviceTensor grad_w_up_batch=CAIF_DeviceTensor::Uninitialized({Config().input_dim,Config().hidden_dim},
+                                                                          Stream(),sd);
+        CAIF_Ops::MatMulTransposeA(CachedInput(),grad_up,grad_w_up_batch,ctx,cdt);
+        CAIF_Ops::Add(GradWUp(),grad_w_up_batch,GradWUpMut());
 
-        if(_config.use_bias==true)
+        if(Config().use_bias==true)
         {
-          CAIF_DeviceTensor grad_b_up_batch=CAIF_DeviceTensor::Uninitialized({_config.hidden_dim},*_stream);
-          CAIF_DeviceOps::SumAxis(grad_up,0,grad_b_up_batch);
-          CAIF_DeviceOps::Add(_grad_b_up,grad_b_up_batch,_grad_b_up);
+          CAIF_DeviceTensor grad_b_up_batch=CAIF_DeviceTensor::Uninitialized({Config().hidden_dim},Stream(),sd);
+          CAIF_Ops::SumAxis(grad_up,0,grad_b_up_batch);
+          CAIF_Ops::Add(GradBUp(),grad_b_up_batch,GradBUpMut());
         }
 
-        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeB(grad_up,_w_up,grad_input);
+        grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+        CAIF_Ops::MatMulTransposeB(grad_up,WUp(),grad_input,ctx,cdt);
       }
     }
 
@@ -455,64 +633,66 @@ CAIF_DeviceTensor CAIF_DeviceMoEExpert::Backward(const CAIF_DeviceTensor &grad_o
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceMoEExpert::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoEExpert<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    if(_use_projections==true)
+    if(UseProjections()==true)
     {
-      if(_config.use_gated==true&&_projections.gate!=nullptr)
+      if(Config().use_gated==true&&Projections().gate!=nullptr)
       {
-        _projections.gate->ZeroGradients();
+        Projections().gate->ZeroGradients();
       }
-      _projections.up->ZeroGradients();
-      _projections.down->ZeroGradients();
+      Projections().up->ZeroGradients();
+      Projections().down->ZeroGradients();
     }
     else
     {
-      if(_config.use_gated==true)
+      if(Config().use_gated==true)
       {
-        _grad_w_gate.Fill(0.0f);
-        if(_config.use_bias==true)
+        GradWGateMut().FillZero();
+        if(Config().use_bias==true)
         {
-          _grad_b_gate.Fill(0.0f);
+          GradBGateMut().FillZero();
         }
       }
 
-      _grad_w_up.Fill(0.0f);
-      _grad_w_down.Fill(0.0f);
+      GradWUpMut().FillZero();
+      GradWDownMut().FillZero();
 
-      if(_config.use_bias==true)
+      if(Config().use_bias==true)
       {
-        _grad_b_up.Fill(0.0f);
-        _grad_b_down.Fill(0.0f);
+        GradBUpMut().FillZero();
+        GradBDownMut().FillZero();
       }
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceMoEExpert::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMoEExpert<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  if(_use_projections==true)
+  if(UseProjections()==true)
   {
-    size_t count=_projections.up->ParameterTensorCount()+
-                 _projections.down->ParameterTensorCount();
-    if(_config.use_gated==true&&_projections.gate!=nullptr)
+    size_t count=Projections().up->ParameterTensorCount()+
+                 Projections().down->ParameterTensorCount();
+    if(Config().use_gated==true&&Projections().gate!=nullptr)
     {
-      count+=_projections.gate->ParameterTensorCount();
+      count+=Projections().gate->ParameterTensorCount();
     }
     return count;
   }
   size_t count=2;  // w_up, w_down
-  if(_config.use_gated==true)
+  if(Config().use_gated==true)
   {
     count+=1;  // w_gate
   }
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
     count+=2;  // b_up, b_down
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
       count+=1;  // b_gate
     }
@@ -520,203 +700,209 @@ size_t CAIF_DeviceMoEExpert::ParameterTensorCount()const
   return count;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMoEExpert::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMoEExpert<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
-  if(_use_projections==true)
+  if(UseProjections()==true)
   {
     size_t offset=0;
-    if(_config.use_gated==true&&_projections.gate!=nullptr)
+    if(Config().use_gated==true&&Projections().gate!=nullptr)
     {
-      const size_t count=_projections.gate->ParameterTensorCount();
+      const size_t count=Projections().gate->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.gate->ParameterTensor(index-offset);
+        return Projections().gate->ParameterTensor(index-offset);
       }
       offset+=count;
     }
     {
-      const size_t count=_projections.up->ParameterTensorCount();
+      const size_t count=Projections().up->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.up->ParameterTensor(index-offset);
+        return Projections().up->ParameterTensor(index-offset);
       }
       offset+=count;
     }
     {
-      const size_t count=_projections.down->ParameterTensorCount();
+      const size_t count=Projections().down->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.down->ParameterTensor(index-offset);
+        return Projections().down->ParameterTensor(index-offset);
       }
     }
     THROW_CAIFE("MoEExpert::ParameterTensor: index out of range");
   }
   size_t idx=0;
-  if(_config.use_gated==true)
+  if(Config().use_gated==true)
   {
     if(index==idx)
     {
-      return _w_gate;
+      return WGateMut();
     }
     ++idx;
   }
   if(index==idx)
   {
-    return _w_up;
+    return WUpMut();
   }
   ++idx;
   if(index==idx)
   {
-    return _w_down;
+    return WDownMut();
   }
   ++idx;
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
       if(index==idx)
       {
-        return _b_gate;
+        return BGateMut();
       }
       ++idx;
     }
     if(index==idx)
     {
-      return _b_up;
+      return BUpMut();
     }
     ++idx;
     if(index==idx)
     {
-      return _b_down;
+      return BDownMut();
     }
   }
   THROW_CAIFE("MoEExpert::ParameterTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMoEExpert::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMoEExpert<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
   return const_cast<CAIF_DeviceMoEExpert*>(this)->ParameterTensor(index);
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMoEExpert::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMoEExpert<ComputeT,StorageT>::GradientTensor(size_t index)
 {
-  if(_use_projections==true)
+  if(UseProjections()==true)
   {
     size_t offset=0;
-    if(_config.use_gated==true&&_projections.gate!=nullptr)
+    if(Config().use_gated==true&&Projections().gate!=nullptr)
     {
-      const size_t count=_projections.gate->ParameterTensorCount();
+      const size_t count=Projections().gate->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.gate->GradientTensor(index-offset);
+        return Projections().gate->GradientTensor(index-offset);
       }
       offset+=count;
     }
     {
-      const size_t count=_projections.up->ParameterTensorCount();
+      const size_t count=Projections().up->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.up->GradientTensor(index-offset);
+        return Projections().up->GradientTensor(index-offset);
       }
       offset+=count;
     }
     {
-      const size_t count=_projections.down->ParameterTensorCount();
+      const size_t count=Projections().down->ParameterTensorCount();
       if(index<offset+count)
       {
-        return _projections.down->GradientTensor(index-offset);
+        return Projections().down->GradientTensor(index-offset);
       }
     }
     THROW_CAIFE("MoEExpert::GradientTensor: index out of range");
   }
   size_t idx=0;
-  if(_config.use_gated==true)
+  if(Config().use_gated==true)
   {
     if(index==idx)
     {
-      return _grad_w_gate;
+      return GradWGateMut();
     }
     ++idx;
   }
   if(index==idx)
   {
-    return _grad_w_up;
+    return GradWUpMut();
   }
   ++idx;
   if(index==idx)
   {
-    return _grad_w_down;
+    return GradWDownMut();
   }
   ++idx;
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
       if(index==idx)
       {
-        return _grad_b_gate;
+        return GradBGateMut();
       }
       ++idx;
     }
     if(index==idx)
     {
-      return _grad_b_up;
+      return GradBUpMut();
     }
     ++idx;
     if(index==idx)
     {
-      return _grad_b_down;
+      return GradBDownMut();
     }
   }
   THROW_CAIFE("MoEExpert::GradientTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMoEExpert::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMoEExpert<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   return const_cast<CAIF_DeviceMoEExpert*>(this)->GradientTensor(index);
 }
 
-size_t CAIF_DeviceMoEExpert::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMoEExpert<ComputeT,StorageT>::TotalParameterCount()const
 {
-  if(_use_projections==true)
+  if(UseProjections()==true)
   {
-    size_t total=_projections.up->TotalParameterCount()+
-                 _projections.down->TotalParameterCount();
-    if(_config.use_gated==true&&_projections.gate!=nullptr)
+    size_t total=Projections().up->TotalParameterCount()+
+                 Projections().down->TotalParameterCount();
+    if(Config().use_gated==true&&Projections().gate!=nullptr)
     {
-      total+=_projections.gate->TotalParameterCount();
+      total+=Projections().gate->TotalParameterCount();
     }
     return total;
   }
   size_t count=0;
-  count+=_config.input_dim*_config.hidden_dim;  // w_up
-  count+=_config.hidden_dim*_config.input_dim;  // w_down
-  if(_config.use_gated==true)
+  count+=Config().input_dim*Config().hidden_dim;  // w_up
+  count+=Config().hidden_dim*Config().input_dim;  // w_down
+  if(Config().use_gated==true)
   {
-    count+=_config.input_dim*_config.hidden_dim;  // w_gate
+    count+=Config().input_dim*Config().hidden_dim;  // w_gate
   }
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
-    count+=_config.hidden_dim;  // b_up
-    count+=_config.input_dim;   // b_down
-    if(_config.use_gated==true)
+    count+=Config().hidden_dim;  // b_up
+    count+=Config().input_dim;   // b_down
+    if(Config().use_gated==true)
     {
-      count+=_config.hidden_dim;  // b_gate
+      count+=Config().hidden_dim;  // b_gate
     }
   }
   return count;
 }
 
-std::string CAIF_DeviceMoEExpert::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceMoEExpert<ComputeT,StorageT>::Description()const
 {
   std::string desc="MoEExpert[";
-  desc+=std::to_string(_config.input_dim)+"->"+std::to_string(_config.hidden_dim);
-  desc+="->"+std::to_string(_config.input_dim);
-  if(_config.use_gated==true)
+  desc+=std::to_string(Config().input_dim)+"->"+std::to_string(Config().hidden_dim);
+  desc+="->"+std::to_string(Config().input_dim);
+  if(Config().use_gated==true)
   {
     desc+=",gated";
   }
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
     desc+=",bias";
   }
@@ -724,33 +910,34 @@ std::string CAIF_DeviceMoEExpert::Description()const
   return desc;
 }
 
-std::vector<std::string> CAIF_DeviceMoEExpert::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string> CAIF_DeviceMoEExpert<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
-  if(_use_projections==true)
+  if(UseProjections()==true)
   {
     std::vector<std::string> names;
     std::vector<std::string> sub;
-    if(_config.use_gated==true&&_projections.gate!=nullptr)
+    if(Config().use_gated==true&&Projections().gate!=nullptr)
     {
-      sub=_projections.gate->ParameterNames(prefix+"gate_proj.");
+      sub=Projections().gate->ParameterNames(prefix+"gate_proj.");
       names.insert(names.end(),sub.begin(),sub.end());
     }
-    sub=_projections.up->ParameterNames(prefix+"up_proj.");
+    sub=Projections().up->ParameterNames(prefix+"up_proj.");
     names.insert(names.end(),sub.begin(),sub.end());
-    sub=_projections.down->ParameterNames(prefix+"down_proj.");
+    sub=Projections().down->ParameterNames(prefix+"down_proj.");
     names.insert(names.end(),sub.begin(),sub.end());
     return names;
   }
   std::vector<std::string> names;
-  if(_config.use_gated==true)
+  if(Config().use_gated==true)
   {
     names.push_back(prefix+"w_gate");
   }
   names.push_back(prefix+"w_up");
   names.push_back(prefix+"w_down");
-  if(_config.use_bias==true)
+  if(Config().use_bias==true)
   {
-    if(_config.use_gated==true)
+    if(Config().use_gated==true)
     {
       names.push_back(prefix+"b_gate");
     }
@@ -759,3 +946,100 @@ std::vector<std::string> CAIF_DeviceMoEExpert::ParameterNames(const std::string 
   }
   return names;
 }
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoEExpert<ComputeT,StorageT>::LoadWGate(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UseProjections()==true)
+    {
+      THROW_CAIFE("MoEExpert::LoadWGate: not valid when using sub-projections");
+    }
+    if(Config().use_gated==false)
+    {
+      THROW_CAIFE("MoEExpert::LoadWGate: requires use_gated=true");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2||
+       shape[0]!=Config().input_dim||
+       shape[1]!=Config().hidden_dim)
+    {
+      THROW_CAIFE("MoEExpert::LoadWGate: shape mismatch, expected "
+                  "[input_dim, hidden_dim]");
+    }
+    if(w.Dtype()!=StorageDtype())
+    {
+      THROW_CAIFE("MoEExpert::LoadWGate: dtype mismatch, expected StorageDtype");
+    }
+    _w_gate=std::move(w);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoEExpert<ComputeT,StorageT>::LoadWUp(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UseProjections()==true)
+    {
+      THROW_CAIFE("MoEExpert::LoadWUp: not valid when using sub-projections");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2||
+       shape[0]!=Config().input_dim||
+       shape[1]!=Config().hidden_dim)
+    {
+      THROW_CAIFE("MoEExpert::LoadWUp: shape mismatch, expected "
+                  "[input_dim, hidden_dim]");
+    }
+    if(w.Dtype()!=StorageDtype())
+    {
+      THROW_CAIFE("MoEExpert::LoadWUp: dtype mismatch, expected StorageDtype");
+    }
+    _w_up=std::move(w);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoEExpert<ComputeT,StorageT>::LoadWDown(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UseProjections()==true)
+    {
+      THROW_CAIFE("MoEExpert::LoadWDown: not valid when using sub-projections");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2||
+       shape[0]!=Config().hidden_dim||
+       shape[1]!=Config().input_dim)
+    {
+      THROW_CAIFE("MoEExpert::LoadWDown: shape mismatch, expected "
+                  "[hidden_dim, input_dim]");
+    }
+    if(w.Dtype()!=StorageDtype())
+    {
+      THROW_CAIFE("MoEExpert::LoadWDown: dtype mismatch, expected StorageDtype");
+    }
+    _w_down=std::move(w);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceMoEExpert<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceMoEExpert<float,__half>;
+template class CAIF_DeviceMoEExpert<float,__nv_bfloat16>;
+template class CAIF_DeviceMoEExpert<__half,float>;
+template class CAIF_DeviceMoEExpert<__half,__half>;
+template class CAIF_DeviceMoEExpert<__half,__nv_bfloat16>;
+template class CAIF_DeviceMoEExpert<__nv_bfloat16,float>;
+template class CAIF_DeviceMoEExpert<__nv_bfloat16,__half>;
+template class CAIF_DeviceMoEExpert<__nv_bfloat16,__nv_bfloat16>;
+#endif
+
+}//end instance namespace

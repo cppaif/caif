@@ -14,15 +14,21 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident positional encoding layer
+// Device-resident positional encoding layer (templated on
+// <ComputeT, StorageT>).
+//
+// Uniform two-parameter signature with both defaulting to `float`. The
+// pe_table / sinusoidal_table follow StorageT; runtime dispatch over
+// dtype is replaced by the static type.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_POSITIONAL_ENCODING_H
-#define CAIF_DEVICE_POSITIONAL_ENCODING_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace instance
@@ -31,20 +37,12 @@ namespace instance
 enum class PositionalEncodingMode_e:uint8_t
 {
   Learned,
-  Sinusoidal
+  Sinusoidal,
+  None
 };
 
-/**
- * @brief Adds position information to embeddings.
- *
- * Input:  [batch, seq_len, dim]
- * Output: [batch, seq_len, dim] (input + positional encoding)
- *
- * Two modes:
- * - Learned: trainable pe_table [max_seq_len, dim]
- * - Sinusoidal: fixed sin/cos table computed at construction
- */
-class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     struct Config_t
@@ -55,7 +53,7 @@ class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayer
     };
 
     CAIF_DevicePositionalEncoding(const Config_t &config,
-                                 CAIF_CudaStream &stream);
+                                  CAIF_CudaStream &stream);
     ~CAIF_DevicePositionalEncoding()override=default;
 
     // Move
@@ -63,8 +61,12 @@ class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayer
     CAIF_DevicePositionalEncoding &operator=(CAIF_DevicePositionalEncoding &&other);
 
     // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::PositionalEncoding_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -75,28 +77,55 @@ class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
     uint32_t MaxSeqLen()const{return _config.max_seq_len;}
     uint32_t Dim()const{return _config.dim;}
     PositionalEncodingMode_e Mode()const{return _config.mode;}
 
+    /**
+     * @brief Replace the learned positional-embedding table with a tensor of
+     * shape [max_seq_len, dim]. Only valid in Learned mode.
+     */
+    void LoadPETable(CAIF_DeviceTensor &&table);
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &PETableMut(){return _pe_table;}
+    CAIF_DeviceTensor &SinusoidalTableMut(){return _sinusoidal_table;}
+    void SetPETable(CAIF_DeviceTensor &&t){_pe_table=std::move(t);}
+    void SetSinusoidalTable(CAIF_DeviceTensor &&t){_sinusoidal_table=std::move(t);}
+
     Config_t _config;
 
-    // Learned mode: trainable table + gradient
-    CAIF_DeviceTensor _pe_table;      // [max_seq_len, dim]
-    CAIF_DeviceTensor _pe_table_grad; // [max_seq_len, dim]
+    CAIF_DeviceTensor _pe_table;          // [max_seq_len, dim] at StorageT
+    CAIF_DeviceTensor _pe_table_grad;     // [max_seq_len, dim] at StorageT
+    CAIF_DeviceTensor _sinusoidal_table;  // [max_seq_len, dim] at StorageT
 
-    // Sinusoidal mode: fixed table (non-trainable)
-    CAIF_DeviceTensor _sinusoidal_table; // [max_seq_len, dim]
-
-    // Cached for backward
     uint32_t _cached_batch;
     uint32_t _cached_seq_len;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DevicePositionalEncoding<float,float>;
+extern template class CAIF_DevicePositionalEncoding<float,__half>;
+extern template class CAIF_DevicePositionalEncoding<float,__nv_bfloat16>;
+extern template class CAIF_DevicePositionalEncoding<__half,float>;
+extern template class CAIF_DevicePositionalEncoding<__half,__half>;
+extern template class CAIF_DevicePositionalEncoding<__half,__nv_bfloat16>;
+extern template class CAIF_DevicePositionalEncoding<__nv_bfloat16,float>;
+extern template class CAIF_DevicePositionalEncoding<__nv_bfloat16,__half>;
+extern template class CAIF_DevicePositionalEncoding<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DevicePositionalEncoding<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_POSITIONAL_ENCODING_H
+}//end instance namespace

@@ -22,6 +22,8 @@
 #include "caif_base.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
+#include "caif_run_context_scope.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,11 +35,17 @@ namespace instance
  * @brief Abstract base class for all device-resident layers
  *
  * Defines the interface that CAIF_DeviceNetwork uses to manage
- * heterogeneous layer stacks. Every layer stores its parameters
- * and gradients as CAIF_DeviceTensor objects on the GPU.
+ * heterogeneous layer stacks. Every layer stores its parameters and
+ * gradients as CAIF_DeviceTensor objects on the GPU.
  *
- * Subclasses must implement Forward, Backward, parameter access,
- * and gradient zeroing.
+ * Subclasses implement ForwardImpl / BackwardImpl, parameter access,
+ * and gradient zeroing. The active runtime stream is read from the
+ * per-call CAIF_RunContext (ctx.Stream()) during Forward/Backward;
+ * layers also retain a construction-time stream reference for tensor
+ * allocation and non-runtime utility methods (weight loading,
+ * checkpoint I/O, optimizer-state allocation). The ctx is the source
+ * of truth during a pass; the layer field is a construction-/utility-
+ * time convenience.
  */
 class CAIF_DeviceLayer:public CAIF_Base
 {
@@ -49,12 +57,12 @@ class CAIF_DeviceLayer:public CAIF_Base
     CAIF_DeviceLayer &operator=(const CAIF_DeviceLayer &)=delete;
 
     // Movable
-    CAIF_DeviceLayer(CAIF_DeviceLayer &&other)noexcept:_stream(other._stream)
+    CAIF_DeviceLayer(CAIF_DeviceLayer &&other):_stream(other._stream)
     {
       other._stream=nullptr;
     }
 
-    CAIF_DeviceLayer &operator=(CAIF_DeviceLayer &&other)noexcept
+    CAIF_DeviceLayer &operator=(CAIF_DeviceLayer &&other)
     {
       if(this!=&other)
       {
@@ -65,91 +73,140 @@ class CAIF_DeviceLayer:public CAIF_Base
     }
 
     /**
-     * @brief Forward pass
-     * @param input Input tensor
-     * @param training If true, cache intermediates for backward pass
-     * @return Output tensor
+     * @brief Forward pass entry point.
+     *
+     * Non-virtual. Wraps ForwardImpl with a CAIF_RunContextSubsystemScope so
+     * every subclass automatically pushes/pops its SubsystemTag() onto the
+     * ctx stack. Subclasses implement ForwardImpl, not Forward.
      */
-    virtual CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,
-                                     bool training)=0;
+    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,
+                              CAIF_RunContext &ctx)
+    {
+      CAIF_RunContextSubsystemScope scope(ctx,SubsystemTag());
+      return ForwardImpl(input,ctx);
+    }
 
     /**
-     * @brief Backward pass
-     * @param grad_output Gradient from the next layer
-     * @return Gradient with respect to the input
+     * @brief Backward pass entry point.
+     *
+     * Non-virtual. Wraps BackwardImpl with a CAIF_RunContextSubsystemScope
+     * so the subsystem stack is maintained through backward pass as well.
      */
-    virtual CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)=0;
+    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output,
+                               CAIF_RunContext &ctx)
+    {
+      CAIF_RunContextSubsystemScope scope(ctx,SubsystemTag());
+      return BackwardImpl(grad_output,ctx);
+    }
 
-    /**
-     * @brief Zero all gradient tensors
-     */
+    virtual CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,
+                                          CAIF_RunContext &ctx)=0;
+    virtual CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                           CAIF_RunContext &ctx)=0;
+    virtual CAIF_RunContext::Subsystem_e SubsystemTag()const=0;
+
+    virtual float AuxLoss()const{return 0.0f;}
+
     virtual void ZeroGradients()=0;
 
-    /**
-     * @brief Number of parameter tensors (weights + biases)
-     *
-     * For example a dense layer with bias returns 2 (weight tensor + bias tensor).
-     * A layer with no trainable parameters returns 0.
-     */
     virtual size_t ParameterTensorCount()const=0;
-
-    /**
-     * @brief Access a parameter tensor by index
-     * @param index Parameter tensor index (0-based)
-     * @return Reference to the parameter tensor
-     */
     virtual CAIF_DeviceTensor &ParameterTensor(size_t index)=0;
     virtual const CAIF_DeviceTensor &ParameterTensor(size_t index)const=0;
-
-    /**
-     * @brief Access a gradient tensor by index
-     * @param index Gradient tensor index (same ordering as ParameterTensor)
-     * @return Reference to the gradient tensor
-     */
     virtual CAIF_DeviceTensor &GradientTensor(size_t index)=0;
     virtual const CAIF_DeviceTensor &GradientTensor(size_t index)const=0;
 
-    /**
-     * @brief Total number of scalar parameters across all tensors
-     */
+    // Per-parameter trainable flag. Defaults to true on leaf layers; the
+    // CAIF_DeviceContainer override consults its per-sublayer _trainable
+    // vector and recurses, so callers can freeze a single sublayer
+    // (e.g. attn / norm / embedding while the MoE sublayer trains, or a
+    // base FFN whose LoRA adapter is the only trainable surface). The
+    // optimizer Initialize/Step both honor this flag.
+    virtual bool IsParameterTrainable(size_t index)const
+    {
+      static_cast<void>(index);
+      return true;
+    }
+
     virtual size_t TotalParameterCount()const=0;
 
-    /**
-     * @brief Human-readable layer description
-     */
     virtual std::string Description()const=0;
 
-    /**
-     * @brief Get parameter names for serialization.
-     *
-     * Returns names for each parameter tensor in the same order as
-     * ParameterTensor(). Names follow HuggingFace/PyTorch conventions
-     * (e.g., "weight", "bias", "q_proj.weight").
-     *
-     * The prefix parameter allows building hierarchical names:
-     * - For standalone layers: prefix="" -> "weight", "bias"
-     * - For layers in a model: prefix="layers.0.self_attn." -> "layers.0.self_attn.q_proj.weight"
-     *
-     * @param prefix Prefix to prepend to each parameter name
-     * @return Vector of parameter names (same size as ParameterTensorCount())
-     */
     virtual std::vector<std::string> ParameterNames(const std::string &prefix="")const=0;
 
+    // Frozen (non-trainable) tensors held by this layer or its children.
+    // Returned dequantized to fp32 by value so external harnesses can
+    // round-trip base weights for parity init against a reference
+    // implementation; not visited by the optimizer.
+    virtual size_t FrozenTensorCount()const{return 0;}
+    virtual CAIF_DeviceTensor FrozenTensorFP32(size_t index)const
+    {
+      static_cast<void>(index);
+      THROW_CAIFE("layer has no frozen tensors");
+    }
+    virtual std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const
+    {
+      static_cast<void>(prefix);
+      return {};
+    }
+
+    // Polymorphic re-randomization of trainable weights. Default is no-op
+    // because most layers (norms, embeddings, dropout) initialize their
+    // parameters at construction. Layers that take a seed-dependent path
+    // (MHA, MLA, CrossAttention, DenseLayer, etc.) override this to forward
+    // the seed to their per-template InitializeWeights routine. Strategies
+    // call this through the polymorphic CAIF_DeviceLayer pointer so they
+    // don't need to know the (ComputeT,StorageT) cell.
+    virtual void InitializeWeights(uint32_t seed=0)
+    {
+      static_cast<void>(seed);
+    }
+
     /**
-     * @brief Get the CUDA stream for this layer
+     * @brief Enable / disable activation (gradient) checkpointing on this
+     * layer.
+     *
+     * Default: no-op. Layers that support checkpointing (today:
+     * CAIF_DevicePreNormBlock) override this and route to their own
+     * SetCheckpointed. Callers walk the un-templated layer list and call
+     * this on every layer; non-block layers silently no-op.
      */
-    CAIF_CudaStream *Stream()const{return _stream;}
+    virtual void SetCheckpointed(const bool b)
+    {
+      static_cast<void>(b);
+    }
+    virtual bool Checkpointed()const{return false;}
+
+    /**
+     * @brief True when the layer holds a valid construction stream.
+     *
+     * Returns false only after a move-from. Runtime Forward/Backward code
+     * no longer checks this; it reads ctx.Stream() and trusts the
+     * top-level container to have set a valid stream.
+     */
+    bool HasStream()const{return _stream!=nullptr;}
+
+    /**
+     * @brief Access the construction-time CUDA stream by reference.
+     *
+     * Non-runtime convenience: used for checkpoint I/O, optimizer-state
+     * allocation, and other out-of-pass work that does not receive a ctx.
+     * Inside ForwardImpl / BackwardImpl, read the active stream via
+     * ctx.Stream() instead — that is the per-call source of truth.
+     */
+    CAIF_CudaStream &Stream()const
+    {
+      if(_stream==nullptr)
+      {
+        THROW_CAIFE("stream is null");
+      }
+      return *_stream;
+    }
 
   protected:
-    /**
-     * @brief Construct with a CUDA stream
-     * @param stream Reference to CUDA stream (stored as pointer for move semantics)
-     */
     explicit CAIF_DeviceLayer(CAIF_CudaStream &stream):_stream(&stream){}
 
-    CAIF_CudaStream *_stream;
-
   private:
+    CAIF_CudaStream *_stream;
 };
 
 }//end instance namespace

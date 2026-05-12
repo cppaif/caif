@@ -12,11 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/**
- * @file aif_settings.cpp
- * @brief Definition of global runtime configuration flags.
- */
-
 #include "caif_settings.h"
 
 namespace instance
@@ -24,7 +19,13 @@ namespace instance
 
 bool CAIF_Settings::g_train_log=false;
 bool CAIF_Settings::g_activation_aware_init=false;
-CAIF_TensorBackend::BackendType_e CAIF_Settings::g_backend_override=CAIF_TensorBackend::BackendType_e::Auto;
+// Default regime: Accuracy_e (full FP32 both passes).
+// Conservative default that keeps gradient-test behaviour identical
+// to the pre-rearch baseline's network-level backward pass. Timing
+// runs should opt into Performance_e explicitly.
+CAIF_Settings::MatmulMode_e CAIF_Settings::g_matmul_mode=CAIF_Settings::MatmulMode_e::Accuracy_e;
+// cuBLAS-Lt workspace override (bytes). Zero selects auto-detection from
+// the active GPU's compute capability at CAIF_DeviceContext::Initialize().
+size_t CAIF_Settings::g_cublaslt_workspace_bytes=0;
 
 }//end instance namespace
-

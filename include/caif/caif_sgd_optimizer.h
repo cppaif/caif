@@ -12,166 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/**
- * @file aif_sgd_optimizer.h
- * @brief SGD (Stochastic Gradient Descent) optimizer implementation
- * @author CAIF Development Team
- * @version 1.0
- * @date 2024
- */
-
 #pragma once
 
 #include "caif_optimizer.h"
-#include "caif_framework.h"
-#include <vector>
 
 namespace instance
 {
-  /**
-   * @brief SGD (Stochastic Gradient Descent) optimizer implementation
-   * 
-   * Implements SGD with optional momentum and weight decay.
-   * Update rule: param = param - learning_rate * gradient
-   * With momentum: velocity = momentum * velocity - learning_rate * gradient
-   *                param = param + velocity
-   */
-  class CAIF_SGDOptimizer:public CAIF_Optimizer
-  {
-    public:
-      /**
-       * @brief Constructor with optimizer parameters
-       * @param framework Reference to CAIF framework instance
-       * @param learning_rate Learning rate for parameter updates
-       * @param momentum Momentum factor (0.0 for no momentum)
-       * @param weight_decay Weight decay factor for L2 regularization
-       */
-      explicit CAIF_SGDOptimizer(
-                                CAIF_Framework &framework,
-                                const float learning_rate=g_caif_default_learning_rate,
-                                const float momentum=g_caif_default_momentum,
-                                const float weight_decay=0.0f
-                               );
-      
-      /**
-       * @brief Virtual destructor
-       */
-      virtual ~CAIF_SGDOptimizer()=default;
-      
-      /**
-       * @brief Copy constructor
-       * @param other Optimizer to copy from
-       */
-      CAIF_SGDOptimizer(const CAIF_SGDOptimizer &other)=default;
-      
-      /**
-       * @brief Move constructor
-       * @param other Optimizer to move from
-       */
-      CAIF_SGDOptimizer(CAIF_SGDOptimizer &&other)noexcept=default;
-      
-      /**
-       * @brief Copy assignment operator
-       * @param other Optimizer to copy from
-       * @return Reference to this optimizer
-       */
-      CAIF_SGDOptimizer &operator=(const CAIF_SGDOptimizer &other)=default;
-      
-      /**
-       * @brief Move assignment operator
-       * @param other Optimizer to move from
-       * @return Reference to this optimizer
-       */
-      CAIF_SGDOptimizer &operator=(CAIF_SGDOptimizer &&other)noexcept=default;
 
-      // Implementation of pure virtual methods from CAIF_Optimizer
-      
-      /**
-       * @brief Update parameters using SGD algorithm
-       * @param parameters Current parameter tensors
-       * @param gradients Gradient tensors
-       * @return Updated parameters
-       */
-      std::vector<CAIF_Tensor> UpdateParameters(
-                                               const std::vector<CAIF_Tensor> &parameters,
-                                               const std::vector<CAIF_Tensor> &gradients
-                                              )override;
-      
-      /**
-       * @brief Get optimizer type
-       * @return SGD optimizer type
-       */
-      CAIF_OptimizerType_e OptimizerType()const override;
-      
-      /**
-       * @brief Clone the optimizer (deep copy)
-       * @return Unique pointer to cloned optimizer
-       * @note Framework reference is copied from this optimizer (same framework instance)
-       */
-      std::unique_ptr<CAIF_Optimizer> Clone()const override;
-      
-      /**
-       * @brief Reset optimizer state
-       */
-      void Reset()override;
+class CAIF_SgdOptimizer:public CAIF_Optimizer
+{
+  public:
+    CAIF_SgdOptimizer(const float lr,
+                      const float weight_decay,
+                      CAIF_CudaStream &stream);
+    ~CAIF_SgdOptimizer()override=default;
 
-      /**
-       * @brief Apply gradients to parameters
-       * @param parameters Parameters to update
-       * @param gradients Gradients to apply
-       */
-      void ApplyGradients(
-                          std::vector<CAIF_Tensor> &parameters,
-                          const std::vector<CAIF_Tensor> &gradients
-                         );
-      
-      /**
-       * @brief Get optimizer state
-       * @return Vector of state tensors
-       */
-      std::vector<CAIF_Tensor> State()const override;
-      
-      /**
-       * @brief Set optimizer state
-       * @param state Vector of state tensors
-       */
-      void SetState(const std::vector<CAIF_Tensor> &state)override;
+    CAIF_OptimizerType_e Type()const override
+    {
+      return CAIF_OptimizerType_e::SGD;
+    }
 
-      // Additional methods
-      
-      /**
-       * @brief Get momentum value
-       * @return Current momentum value
-       */
-      float Momentum()const;
-      
-      /**
-       * @brief Set momentum value
-       * @param momentum New momentum value
-       */
-      void SetMomentum(const float momentum);
-      
-      /**
-       * @brief Get weight decay value
-       * @return Current weight decay value
-       */
-      float WeightDecay()const;
-      
-      /**
-       * @brief Set weight decay value
-       * @param weight_decay New weight decay value
-       */
-      void SetWeightDecay(const float weight_decay);
-      
-      /**
-       * @brief Get optimizer description
-       * @return String describing the optimizer configuration
-       */
-      std::string Description()const;
+  protected:
+    // Plain SGD has no per-parameter state; AllocateState is a no-op.
+    void AllocateState(const CAIF_DeviceTensor &param)override;
+    void UpdateOne(CAIF_DeviceTensor &target,
+                   const CAIF_DeviceTensor &grad,
+                   const size_t idx)override;
+};
 
-    private:
-      float _momentum;              ///< Momentum factor
-      float _weight_decay;          ///< Weight decay factor for L2 regularization
-      std::vector<CAIF_Tensor> _velocity;  ///< Velocity tensors for momentum
-  };
 }//end instance namespace

@@ -20,6 +20,9 @@ __pycache__/
 dist/
 *.eggs
 
+# Internal — never push to GitHub
+CLAUDE.md
+
 # IDE
 .vscode/
 .idea/

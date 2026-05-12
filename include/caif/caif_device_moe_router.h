@@ -14,14 +14,16 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident MoE Router (expert selection network)
+// Device-resident MoE Router (templated on <ComputeT, StorageT>).
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_MOE_ROUTER_H
-#define CAIF_DEVICE_MOE_ROUTER_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
+#include "caif_data_type.h"
+#include "caif_device_moe_layer_factory.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -29,65 +31,65 @@
 namespace instance
 {
 
-/**
- * @brief Router network for Mixture of Experts
- *
- * Computes routing weights and selects top-k experts per token.
- *
- * Architecture:
- *   Input [batch, seq_len, dim] -> Linear [dim, num_experts] -> Softmax -> Top-k
- *
- * Outputs:
- *   - expert_indices: [batch, seq_len, top_k] - indices of selected experts
- *   - expert_weights: [batch, seq_len, top_k] - normalized weights for selected experts
- *   - router_logits:  [batch, seq_len, num_experts] - raw logits (for aux losses)
- *
- * Parameters:
- *   - W_router [dim, num_experts]
- *   - b_router [num_experts] (optional)
- */
-class CAIF_DeviceMoERouter:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceMoERouter:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-
     enum class RoutingType_e:uint8_t
     {
-      TopK=0,           // Standard top-k routing
-      ExpertChoice=1,   // Expert selects tokens (Phase 3)
-      Soft=2            // Soft routing - all experts (Phase 3)
+      TopK=0,
+      ExpertChoice=1,
+      Soft=2
     };
 
     struct Config_t
     {
-      uint32_t input_dim;       // Input dimension
-      uint32_t num_experts;     // Total number of experts
-      uint32_t top_k;           // Number of experts per token
+      uint32_t input_dim;
+      uint32_t num_experts;
+      uint32_t top_k;
       RoutingType_e routing_type;
-      bool use_bias;            // Add bias to router projection
-      float noise_std;          // Router noise for exploration (training only)
+      bool use_bias;
+      float noise_std;
+      // Gating regime — see CAIF_DeviceMoELayerFactory::GatingKind_e
+      // for the semantics.  Defaulted so legacy aggregate / direct-
+      // assignment callers keep building without naming the field.
+      CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind=
+        CAIF_DeviceMoELayerFactory::GatingKind_e::SoftmaxTopK_e;
+      // Re-normalise the selected top-k weights to sum=1 after gating.
+      // True matches HF DeepSeek-V2 / GLM-4-MoE behavior (and is also
+      // a no-op under SoftmaxTopK with k=num_experts).  Defaulted true
+      // for the same legacy-caller reason.
+      bool norm_topk_prob=true;
+      // Post-normalise multiplicative scale on the combine weights.
+      // 1.0 matches the un-scaled HF default and the historical CAIF
+      // softmax route.  DSv2-Lite ships with this field at ~1.0; some
+      // larger DeepSeek-V3 / GLM variants use values >1 to dilate the
+      // expert mixture.
+      float routed_scaling_factor=1.0f;
     };
 
     struct RouterOutput_t
     {
-      CAIF_DeviceTensor expert_indices;   // [batch*seq_len, top_k] int32
-      CAIF_DeviceTensor expert_weights;   // [batch*seq_len, top_k] float
-      CAIF_DeviceTensor router_logits;    // [batch*seq_len, num_experts] float
-      CAIF_DeviceTensor router_probs;     // [batch*seq_len, num_experts] float (softmax)
+      CAIF_DeviceTensor expert_indices;
+      CAIF_DeviceTensor expert_weights;
+      CAIF_DeviceTensor router_logits;
+      CAIF_DeviceTensor router_probs;
     };
 
     CAIF_DeviceMoERouter(const Config_t &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceMoERouter()override=default;
 
-    // Move
     CAIF_DeviceMoERouter(CAIF_DeviceMoERouter &&other);
     CAIF_DeviceMoERouter &operator=(CAIF_DeviceMoERouter &&other);
 
-    // Main routing function
-    RouterOutput_t Route(const CAIF_DeviceTensor &input,bool training);
+    RouterOutput_t Route(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::MoERouter_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -98,36 +100,123 @@ class CAIF_DeviceMoERouter:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Backward for routing (takes grad w.r.t. expert_weights)
-    CAIF_DeviceTensor BackwardRouting(const CAIF_DeviceTensor &grad_weights);
+    CAIF_DeviceTensor BackwardRouting(const CAIF_DeviceTensor &grad_weights,CAIF_RunContext &ctx);
+    CAIF_DeviceTensor BackwardRoutingAuxAware(const CAIF_DeviceTensor &grad_weights,
+                                              const CAIF_DeviceTensor &balance_bias,
+                                              const CAIF_DeviceTensor &z_logsumexp_scaled,
+                                              CAIF_RunContext &ctx);
 
-    // Accessors
     const Config_t &Config()const{return _config;}
     uint32_t InputDim()const{return _config.input_dim;}
     uint32_t NumExperts()const{return _config.num_experts;}
     uint32_t TopK()const{return _config.top_k;}
 
+    // Bias the router so that expert `expert_index` dominates at
+    // initialization. Sets the router's bias term to a one-hot pattern
+    // whose `expert_index` slot carries `bias_magnitude` and all other
+    // slots carry zero (and zeroes the matrix weight so the bias alone
+    // determines the logits at init). For typical input distributions
+    // a `bias_magnitude` of ~5.0 yields softmax(expert_index) > 0.99.
+    //
+    // Used by the add-moe / layer-surgery path so the model starts in
+    // the "frozen base behavior" state — Expert 0 (the frozen-FFN
+    // expert) gets all the routing weight at init, and training learns
+    // to route to the trainable experts where useful.
+    //
+    // Caller contract: `expert_index < NumExperts()`. The router config
+    // must have been built with `use_bias=true`; mismatch throws.
+    void InitFavorExpert(uint32_t expert_index,float bias_magnitude);
+
+    // Read-side accessors to the router's trained weights. Used by
+    // add-MoE Phase 4 — when an existing CAIF_DeviceMoELayer's MoE
+    // layer is being widened (e.g. GLM layers 1-46 going from 64
+    // experts to 64+N), the builder reads the trained `_w_router`
+    // and `_b_router` out of the existing router, allocates a wider
+    // tensor in caller space whose top `original_num_experts` rows
+    // match the original, fills the bottom rows with init values,
+    // and hands it back to the new (wider) router via LoadWRouter /
+    // LoadBRouter. Without preservation the trained routing signal
+    // is lost at the moment of substitution.
+    const CAIF_DeviceTensor &WRouter()const{return _w_router;}
+    const CAIF_DeviceTensor &BRouter()const{return _b_router;}
+
+    // Move-in setters for the router weights. Caller must respect
+    // shape: `_w_router` is `[input_dim, num_experts]`, `_b_router`
+    // is `[num_experts]`. Mismatch throws. Used to preserve trained
+    // router weights when widening a MoE layer (see `WRouter()`
+    // docstring above).
+    void LoadWRouter(CAIF_DeviceTensor &&w);
+    void LoadBRouter(CAIF_DeviceTensor &&b);
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &WRouterMut(){return _w_router;}
+    CAIF_DeviceTensor &BRouterMut(){return _b_router;}
+    CAIF_DeviceTensor &GradWRouterMut(){return _grad_w_router;}
+    CAIF_DeviceTensor &GradBRouterMut(){return _grad_b_router;}
+    CAIF_DeviceTensor &CachedInputMut(){return _cached_input;}
+    CAIF_DeviceTensor &CachedLogitsMut(){return _cached_logits;}
+    CAIF_DeviceTensor &CachedProbsMut(){return _cached_probs;}
+    CAIF_DeviceTensor &CachedIndicesMut(){return _cached_indices;}
+    CAIF_DeviceTensor &GradTopkPreviewMut(){return _grad_topk_preview;}
+
+    const CAIF_DeviceTensor &GradWRouter()const{return _grad_w_router;}
+    const CAIF_DeviceTensor &GradBRouter()const{return _grad_b_router;}
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    const CAIF_DeviceTensor &CachedLogits()const{return _cached_logits;}
+    const CAIF_DeviceTensor &CachedProbs()const{return _cached_probs;}
+    const CAIF_DeviceTensor &CachedIndices()const{return _cached_indices;}
+    const CAIF_DeviceTensor &GradTopkPreview()const{return _grad_topk_preview;}
+
+    void SetWRouter(CAIF_DeviceTensor &&w){_w_router=std::move(w);}
+    void SetBRouter(CAIF_DeviceTensor &&b){_b_router=std::move(b);}
+    void SetGradWRouter(CAIF_DeviceTensor &&t){_grad_w_router=std::move(t);}
+    void SetGradBRouter(CAIF_DeviceTensor &&t){_grad_b_router=std::move(t);}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+    void SetCachedLogits(CAIF_DeviceTensor &&t){_cached_logits=std::move(t);}
+    void SetCachedProbs(CAIF_DeviceTensor &&t){_cached_probs=std::move(t);}
+    void SetCachedIndices(CAIF_DeviceTensor &&t){_cached_indices=std::move(t);}
+    void SetGradTopkPreview(CAIF_DeviceTensor &&t){_grad_topk_preview=std::move(t);}
+
+    void SetConfig(const Config_t &c){_config=c;}
 
     Config_t _config;
 
-    // Router weights
-    CAIF_DeviceTensor _w_router;    // [input_dim, num_experts]
-    CAIF_DeviceTensor _b_router;    // [num_experts] (optional)
+    CAIF_DeviceTensor _w_router;
+    CAIF_DeviceTensor _b_router;
 
-    // Gradients
     CAIF_DeviceTensor _grad_w_router;
     CAIF_DeviceTensor _grad_b_router;
 
-    // Cached for backward
     CAIF_DeviceTensor _cached_input;
     CAIF_DeviceTensor _cached_logits;
     CAIF_DeviceTensor _cached_probs;
     CAIF_DeviceTensor _cached_indices;
+    CAIF_DeviceTensor _grad_topk_preview;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceMoERouter<float,float>;
+extern template class CAIF_DeviceMoERouter<float,__half>;
+extern template class CAIF_DeviceMoERouter<float,__nv_bfloat16>;
+extern template class CAIF_DeviceMoERouter<__half,float>;
+extern template class CAIF_DeviceMoERouter<__half,__half>;
+extern template class CAIF_DeviceMoERouter<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceMoERouter<__nv_bfloat16,float>;
+extern template class CAIF_DeviceMoERouter<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceMoERouter<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceMoERouter<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_MOE_ROUTER_H
+}//end instance namespace

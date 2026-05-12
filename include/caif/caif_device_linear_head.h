@@ -14,67 +14,51 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident Linear Head (output projection layer)
+// Device-resident Linear Head — output projection layer (templated on
+// <ComputeT, StorageT>).
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_LINEAR_HEAD_H
-#define CAIF_DEVICE_LINEAR_HEAD_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace instance
 {
 
-/**
- * @brief Linear projection layer for transformer outputs
- *
- * Projects from input_dim to output_dim via learned weight matrix.
- * Supports weight tying with embedding tables for language model heads.
- *
- * Input:  [batch, seq_len, input_dim] or [batch, input_dim]
- * Output: [batch, seq_len, output_dim] or [batch, output_dim]
- *
- * Parameters (untied):
- *   - W [input_dim, output_dim] Xavier uniform init
- *   - b [output_dim] zeros (only when use_bias==true)
- *
- * Parameters (tied):
- *   - Uses external weight tensor transposed
- *   - b [output_dim] zeros (only when use_bias==true)
- */
-class CAIF_DeviceLinearHead:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceLinearHead:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    /**
-     * @brief Configuration for LinearHead
-     */
     struct Config_t
     {
-      uint32_t input_dim;   // Input dimension
-      uint32_t output_dim;  // Output dimension
-      bool use_bias;        // Whether to add bias after projection
+      uint32_t input_dim;
+      uint32_t output_dim;
+      bool use_bias;
     };
 
-    // Standard constructor (owns weight)
     CAIF_DeviceLinearHead(const Config_t &config,CAIF_CudaStream &stream);
 
-    // Weight-tied constructor (uses external weight transposed)
     CAIF_DeviceLinearHead(const Config_t &config,
-                         CAIF_DeviceTensor &tied_weight,
-                         CAIF_DeviceTensor &tied_weight_grad,
-                         CAIF_CudaStream &stream);
+                          CAIF_DeviceTensor &tied_weight,
+                          CAIF_DeviceTensor &tied_weight_grad,
+                          CAIF_CudaStream &stream);
 
     ~CAIF_DeviceLinearHead()override=default;
 
-    // Move
-    CAIF_DeviceLinearHead(CAIF_DeviceLinearHead &&other)noexcept;
-    CAIF_DeviceLinearHead &operator=(CAIF_DeviceLinearHead &&other)noexcept;
+    CAIF_DeviceLinearHead(CAIF_DeviceLinearHead &&other);
+    CAIF_DeviceLinearHead &operator=(CAIF_DeviceLinearHead &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::LinearHead_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -85,7 +69,6 @@ class CAIF_DeviceLinearHead:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
     uint32_t InputDim()const{return _config.input_dim;}
     uint32_t OutputDim()const{return _config.output_dim;}
     bool UseBias()const{return _config.use_bias;}
@@ -93,30 +76,53 @@ class CAIF_DeviceLinearHead:public CAIF_DeviceLayer
     bool Frozen()const{return _frozen;}
     void SetFrozen(bool frozen){_frozen=frozen;}
 
+    void LoadWeight(CAIF_DeviceTensor &&weight);
+    void LoadBias(CAIF_DeviceTensor &&bias);
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &WeightMut(){return _weight;}
+    void SetWeight(CAIF_DeviceTensor &&w){_weight=std::move(w);}
+
     Config_t _config;
     bool _weight_tied;
     bool _frozen;
 
-    // Owned weight (only when not tied)
-    CAIF_DeviceTensor _weight;       // [input_dim, output_dim]
-    CAIF_DeviceTensor _weight_grad;  // [input_dim, output_dim]
+    CAIF_DeviceTensor _weight;
+    CAIF_DeviceTensor _weight_grad;
 
-    // External weight pointers (only when tied)
-    CAIF_DeviceTensor *_tied_weight;       // [output_dim, input_dim] (embedding table)
+    CAIF_DeviceTensor *_tied_weight;
     CAIF_DeviceTensor *_tied_weight_grad;
 
-    // Bias (always owned, if enabled)
-    CAIF_DeviceTensor _bias;       // [output_dim]
-    CAIF_DeviceTensor _bias_grad;  // [output_dim]
+    CAIF_DeviceTensor _bias;
+    CAIF_DeviceTensor _bias_grad;
 
-    // Cached for backward
     CAIF_DeviceTensor _cached_input;
     std::vector<uint32_t> _cached_shape;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceLinearHead<float,float>;
+extern template class CAIF_DeviceLinearHead<float,__half>;
+extern template class CAIF_DeviceLinearHead<float,__nv_bfloat16>;
+extern template class CAIF_DeviceLinearHead<__half,float>;
+extern template class CAIF_DeviceLinearHead<__half,__half>;
+extern template class CAIF_DeviceLinearHead<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceLinearHead<__nv_bfloat16,float>;
+extern template class CAIF_DeviceLinearHead<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceLinearHead<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceLinearHead<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_LINEAR_HEAD_H
+}//end instance namespace

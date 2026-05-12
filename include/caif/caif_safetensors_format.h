@@ -32,17 +32,6 @@ namespace instance
 {
 
 /**
- * @brief SafeTensors format constants
- */
-namespace SafeTensorsConstants
-{
-  constexpr uint64_t g_max_file_size=2ULL<<40;  // 2 TiB
-  constexpr size_t g_max_tensors=4096;
-  constexpr size_t g_max_header_size=100*1024*1024;  // 100 MB header limit
-  constexpr size_t g_alignment=8;  // Data alignment
-}//end SafeTensorsConstants namespace
-
-/**
  * @brief SafeTensors format implementation.
  *
  * Industry standard format, HuggingFace compatible, zero dependencies.
@@ -132,6 +121,80 @@ class CAIF_SafeTensorsFormat:public CAIF_ModelFormat
      * @return Map of tensor name to tensor info (dtype, shape, offsets)
      */
     std::map<std::string,SafeTensorInfo_t> TensorInfos(const std::string &path)const;
+
+    /**
+     * @brief Cached metadata for one shard of a sharded SafeTensors model.
+     *
+     * `path` is the full filesystem path to the .safetensors shard.
+     * `data_start` is the byte offset where tensor data begins within
+     * the shard (the 8-byte length prefix + JSON header are above
+     * this). `tensor_infos` maps each tensor name in this shard to
+     * its dtype / shape / data offsets — populated once at handle-
+     * open time so subsequent `LoadFromHandle` calls do not re-parse
+     * the JSON header.
+     */
+    struct ShardedHandle_t
+    {
+      public:
+        typedef std::map<std::string,SafeTensorInfo_t> InfoMap_t;
+        typedef std::map<std::string,std::string> WeightMap_t;
+
+        struct PerShard_t
+        {
+          public:
+            PerShard_t():_path(),_data_start(0),_tensor_infos(){}
+            const std::string &Path()const{return _path;}
+            uint64_t DataStart()const{return _data_start;}
+            const InfoMap_t &TensorInfos()const{return _tensor_infos;}
+            void SetPath(const std::string &p){_path=p;}
+            void SetDataStart(const uint64_t o){_data_start=o;}
+            void SetTensorInfos(InfoMap_t m){_tensor_infos=std::move(m);}
+          private:
+            std::string _path;
+            uint64_t _data_start;
+            InfoMap_t _tensor_infos;
+        };
+
+        typedef std::map<std::string,PerShard_t> ShardMap_t;
+
+        ShardedHandle_t():_directory(),_weight_map(),_shards(){}
+
+        const std::string &Directory()const{return _directory;}
+        const WeightMap_t &WeightMap()const{return _weight_map;}
+        const ShardMap_t &Shards()const{return _shards;}
+
+        void SetDirectory(const std::string &d){_directory=d;}
+        void SetWeightMap(WeightMap_t m){_weight_map=std::move(m);}
+        WeightMap_t &MutableWeightMap(){return _weight_map;}
+        ShardMap_t &MutableShards(){return _shards;}
+
+      private:
+        std::string _directory;
+        // tensor_name -> shard_filename (relative)
+        WeightMap_t _weight_map;
+        // shard_filename -> per-shard cache
+        ShardMap_t _shards;
+    };
+
+    /**
+     * @brief Open a sharded model directory lazily — parse the index file
+     * and every shard's JSON header but load no tensor data. Returns a
+     * `ShardedHandle_t` the caller passes to `LoadFromHandle` to stream
+     * individual tensors as needed. Memory cost: O(num_tensors * sizeof
+     * SafeTensorInfo_t) host bytes; zero device memory.
+     */
+    ShardedHandle_t OpenShardedHandle(const std::string &directory)const;
+
+    /**
+     * @brief Stream a single tensor out of a previously-opened sharded
+     * handle. Throws if the tensor name is not in the handle's index. Uses
+     * the cached shard path + data offset, so this call only does:
+     *   open shard fd -> seek -> read tensor bytes -> upload to device.
+     * No JSON re-parse, no repeated index lookup.
+     */
+    CAIF_DeviceTensor LoadFromHandle(const ShardedHandle_t &handle,
+                                     const std::string &tensor_name,
+                                     CAIF_CudaStream &stream)const;
 
     std::string Extension()const override{return ".safetensors";}
     std::string FormatName()const override{return "SafeTensors";}

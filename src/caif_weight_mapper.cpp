@@ -19,7 +19,8 @@
 #include "caif_weight_mapper.h"
 #include <algorithm>
 
-using namespace instance;
+namespace instance
+{
 
 bool CAIF_WeightMapper::ComparePrefixByLength(const PrefixRule_t &a,const PrefixRule_t &b)
 {
@@ -151,3 +152,5 @@ CAIF_WeightMapper::UnmappedHfNames(const std::set<std::string> &available_hf_nam
 
   return unmapped;
 }
+
+}//end instance namespace

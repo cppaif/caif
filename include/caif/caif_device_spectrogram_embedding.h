@@ -14,13 +14,20 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident spectrogram embedding layer for audio
+// Device-resident spectrogram embedding layer (templated on
+// <ComputeT, StorageT>).
+//
+// Uniform two-parameter signature with both defaulting to `float`.
+// Storage tensors (W_proj / b_proj / cls_token / grads / cached input)
+// follow StorageT. MatMul/BiasAdd/elementwise_add are dtype-aware so
+// every (ComputeT, StorageT) cell runs natively.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_SPECTROGRAM_EMBEDDING_H
-#define CAIF_DEVICE_SPECTROGRAM_EMBEDDING_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,41 +35,30 @@
 namespace instance
 {
 
-/**
- * @brief Projects audio spectrograms to embedding dimension for transformer input.
- *
- * Input:  [batch, time_frames, freq_bins] (spectrogram)
- * Output: [batch, time_frames, dim] or [batch, time_frames+1, dim] (with CLS)
- *
- * Each time frame's frequency bins are linearly projected to the embedding
- * dimension. Optionally prepends a CLS token for classification tasks.
- *
- * Parameters:
- *   0: W_proj     [freq_bins, dim]  Xavier uniform
- *   1: b_proj     [dim]             Zeros
- *   2: cls_token  [1, dim]          Xavier uniform (only with use_cls_token)
- */
-class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     struct Config_t
     {
-      uint32_t freq_bins;       // Number of frequency bins (e.g., 80 for mel)
-      uint32_t dim;             // Output embedding dimension
-      bool use_cls_token;       // Prepend CLS token for classification
+      uint32_t freq_bins;
+      uint32_t dim;
+      bool use_cls_token;
     };
 
     CAIF_DeviceSpectrogramEmbedding(const Config_t &config,
-                                   CAIF_CudaStream &stream);
+                                    CAIF_CudaStream &stream);
     ~CAIF_DeviceSpectrogramEmbedding()override=default;
 
-    // Move
     CAIF_DeviceSpectrogramEmbedding(CAIF_DeviceSpectrogramEmbedding &&other);
     CAIF_DeviceSpectrogramEmbedding &operator=(CAIF_DeviceSpectrogramEmbedding &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::SpectrogramEmbedding_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -73,33 +69,55 @@ class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
     uint32_t FreqBins()const{return _config.freq_bins;}
     uint32_t Dim()const{return _config.dim;}
     bool UseCLSToken()const{return _config.use_cls_token;}
 
-    // Weight initialization
-    void InitializeWeights(uint32_t seed=0);
+    void InitializeWeights(uint32_t seed=0)override;
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
 
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    const Config_t &Config()const{return _config;}
+    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
+    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
+
     Config_t _config;
 
-    CAIF_DeviceTensor _w_proj;       // [freq_bins, dim]
-    CAIF_DeviceTensor _b_proj;       // [dim]
-    CAIF_DeviceTensor _cls_token;    // [1, dim] (only when use_cls_token)
+    CAIF_DeviceTensor _w_proj;
+    CAIF_DeviceTensor _b_proj;
+    CAIF_DeviceTensor _cls_token;
 
-    CAIF_DeviceTensor _grad_w_proj;  // [freq_bins, dim]
-    CAIF_DeviceTensor _grad_b_proj;  // [dim]
-    CAIF_DeviceTensor _grad_cls;     // [1, dim] (only when use_cls_token)
+    CAIF_DeviceTensor _grad_w_proj;
+    CAIF_DeviceTensor _grad_b_proj;
+    CAIF_DeviceTensor _grad_cls;
 
-    // Cached for backward
     CAIF_DeviceTensor _cached_input;
     uint32_t _cached_batch;
     uint32_t _cached_time_frames;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceSpectrogramEmbedding<float,float>;
+extern template class CAIF_DeviceSpectrogramEmbedding<float,__half>;
+extern template class CAIF_DeviceSpectrogramEmbedding<float,__nv_bfloat16>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__half,float>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__half,__half>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,float>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceSpectrogramEmbedding<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_SPECTROGRAM_EMBEDDING_H
+}//end instance namespace

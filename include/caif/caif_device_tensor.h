@@ -19,6 +19,7 @@
 #include "caif_constants.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
+#include "caif_exception.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -56,6 +57,23 @@ class CAIF_HostTensor;
 class CAIF_DeviceTensor:public CAIF_Base
 {
   public:
+    /**
+     * @brief Storage location for tensor data.
+     *
+     * `Device_e` — CUDA device memory (cudaMalloc), operated on by the device
+     * backend (cuBLAS/cuDNN/custom kernels). Default.
+     *
+     * `Host_e` — aligned host memory (`new[]`), operated on by the host
+     * backend (OpenBLAS/OpenMP/Eigen). Calling `Stream()` on a host-backed
+     * tensor throws; every op dispatches on `Location()` internally and
+     * requires all operand tensors to share the same location.
+     */
+    enum class Location_e:uint32_t
+    {
+      Device_e=0,
+      Host_e=1
+    };
+
     /**
      * @brief Default constructor - creates empty tensor
      */
@@ -112,6 +130,19 @@ class CAIF_DeviceTensor:public CAIF_Base
                                           CAIF_DataType::CAIF_DataType_e dtype);
 
     /**
+     * @brief Non-owning view over an existing device buffer with a chosen shape
+     *
+     * Zero-copy alternative to `Clone()+Reshape()` when callers only need a
+     * different logical shape over data they do not own. The returned tensor
+     * shares the pointer and will not free it on destruction. The caller is
+     * responsible for ensuring the backing buffer outlives the view.
+     */
+    static CAIF_DeviceTensor WrapView(void *device_ptr,
+                                     const std::vector<uint32_t> &shape,
+                                     CAIF_CudaStream &stream,
+                                     CAIF_DataType::CAIF_DataType_e dtype);
+
+    /**
      * @brief Create a device tensor from host tensor (upload, FP32)
      * @param host The host tensor to copy from
      * @param stream The CUDA stream for the copy operation
@@ -144,11 +175,71 @@ class CAIF_DeviceTensor:public CAIF_Base
                                         CAIF_DataType::CAIF_DataType_e dtype);
 
     /**
+     * @brief Host-backed zero-initialized tensor (no CUDA stream, FP32).
+     *
+     * Allocates aligned host memory (`new[]`) and zero-fills. Used by the
+     * host backend of `CAIF_Ops` — dispatch branches on `Location()` so the
+     * same layer code runs on either backend.
+     */
+    static CAIF_DeviceTensor ZerosHost(const std::vector<uint32_t> &shape);
+
+    /**
+     * @brief Host-backed zero-initialized tensor with explicit dtype.
+     */
+    static CAIF_DeviceTensor ZerosHost(const std::vector<uint32_t> &shape,
+                                       CAIF_DataType::CAIF_DataType_e dtype);
+
+    /**
+     * @brief Host-backed uninitialized tensor (FP32).
+     */
+    static CAIF_DeviceTensor UninitializedHost(const std::vector<uint32_t> &shape);
+
+    /**
+     * @brief Host-backed uninitialized tensor with explicit dtype.
+     */
+    static CAIF_DeviceTensor UninitializedHost(const std::vector<uint32_t> &shape,
+                                               CAIF_DataType::CAIF_DataType_e dtype);
+
+    /**
+     * @brief Copy a host-backed tensor to a new device-backed tensor.
+     *
+     * Errors if this tensor is already `Location_e::Device_e`.
+     */
+    CAIF_DeviceTensor ToDevice(CAIF_CudaStream &stream)const;
+
+    /**
+     * @brief Copy a device-backed tensor to a new host-backed tensor.
+     *
+     * Returned tensor is the same `CAIF_DeviceTensor` type but with
+     * `Location_e::Host_e`. Distinct from `ToHost()` which returns a
+     * legacy `CAIF_HostTensor`.
+     */
+    CAIF_DeviceTensor ToHostLocation()const;
+
+    /**
      * @brief Copy fp32 data from host to this tensor (in-place upload)
      * @param host_data Pointer to host data
      * @param num_elements Number of elements to copy (must match tensor size)
      */
     void CopyFromHost(const float *host_data,size_t num_elements);
+
+    /**
+     * @brief Copy fp32 data from host into this tensor at whatever storage
+     *        dtype this tensor was allocated at — performing the host-side
+     *        conversion fp32 -> fp16 / fp32 -> bf16 inline before the
+     *        single device upload.
+     *
+     * Use this on the random-init / Xavier-init path: the caller produces
+     * an fp32 host sample buffer, this tensor was already allocated at the
+     * target storage dtype, and the convert happens on the host side
+     * without any GPU staging tensor. fp32 destinations short-circuit to
+     * `CopyFromHost(...)`. Replaces the older `staging.To(sd)` pattern
+     * which doubled transient device memory at construction time.
+     *
+     * @param host_data Pointer to fp32 host data
+     * @param num_elements Number of elements (must match tensor size)
+     */
+    void CopyFromHostFp32(const float *host_data,size_t num_elements);
 
     /**
      * @brief Copy raw bytes from host to this tensor (in-place upload)
@@ -162,6 +253,22 @@ class CAIF_DeviceTensor:public CAIF_Base
      * @param host_buffer Pointer to host buffer (caller-provided)
      */
     void CopyToHost(float *host_buffer)const;
+
+    /**
+     * @brief Download this tensor's data to a host fp32 buffer regardless
+     *        of the tensor's storage dtype, performing the host-side
+     *        conversion fp16 -> fp32 / bf16 -> fp32 inline after the
+     *        single device download.
+     *
+     * Symmetric counterpart to `CopyFromHostFp32(...)`. fp32 sources
+     * short-circuit to `CopyToHost(...)`. fp16 / bf16 sources download
+     * raw bytes via `CopyToHostRaw`, then expand to fp32 host-side. No
+     * device-side staging tensor.
+     *
+     * @param host_buffer Pointer to fp32 host buffer (caller-provided,
+     *                    must hold at least `TotalElements()` floats)
+     */
+    void CopyToHostFp32(float *host_buffer)const;
 
     /**
      * @brief Copy raw bytes from this tensor to host buffer (download, any dtype)
@@ -188,16 +295,29 @@ class CAIF_DeviceTensor:public CAIF_Base
     CAIF_DeviceTensor To(CAIF_DataType::CAIF_DataType_e target_dtype)const;
 
     /**
-     * @brief Get mutable pointer to device memory (typed as float for FP32)
-     * @return Pointer to device memory
+     * @brief Get mutable pointer to device memory (typed as float for FP32).
+     * Caller is responsible for ensuring the tensor's storage_dtype is fp32
+     * (or that the `float *` is being type-erased into a `void *` parameter
+     * downstream). Use DevicePtr<T>() for typed access on non-fp32 storage,
+     * or route through caif_kernel_dispatch.h for runtime dtype dispatch.
      */
     float *DevicePtr(){return reinterpret_cast<float*>(_device_data);}
 
     /**
-     * @brief Get const pointer to device memory (typed as float for FP32)
-     * @return Const pointer to device memory
+     * @brief Get const pointer to device memory (typed as float for FP32).
+     * Same caller contract as the non-const overload.
      */
     const float *DevicePtr()const{return reinterpret_cast<const float*>(_device_data);}
+
+    /**
+     * @brief Get typed device pointer for dtype-templated kernel launches.
+     * Caller is responsible for passing T that matches the tensor's Dtype().
+     */
+    template<typename T>
+    T *DevicePtr(){return reinterpret_cast<T*>(_device_data);}
+
+    template<typename T>
+    const T *DevicePtr()const{return reinterpret_cast<const T*>(_device_data);}
 
     /**
      * @brief Get mutable pointer to raw device memory (any dtype)
@@ -260,6 +380,16 @@ class CAIF_DeviceTensor:public CAIF_Base
     bool IsAllocated()const{return _device_data!=nullptr;}
 
     /**
+     * @brief Storage location (device vs host).
+     *
+     * Default is `Location_e::Device_e` for every existing factory. The
+     * host-backed factories (`ZerosHost`, `UninitializedHost`) produce
+     * tensors with `Location_e::Host_e`. `ToDevice` / `ToHostLocation`
+     * produce a new tensor in the requested location.
+     */
+    Location_e Location()const{return _location;}
+
+    /**
      * @brief Get the associated CUDA stream
      * @return Reference to the CUDA stream
      */
@@ -287,6 +417,13 @@ class CAIF_DeviceTensor:public CAIF_Base
      * @param value The value to fill with
      */
     void Fill(float value);
+
+    /**
+     * @brief Zero the tensor's storage (works for any dtype).
+     * Uses cudaMemsetAsync(0); the all-zero bit pattern is +0 in every
+     * IEEE float and 0 in every integer encoding, so this is dtype-safe.
+     */
+    void FillZero();
 
     /**
      * @brief Reshape the tensor (must have same total elements)
@@ -332,6 +469,8 @@ class CAIF_DeviceTensor:public CAIF_Base
     size_t _size_bytes;
     CAIF_CudaStream *_stream;
     CAIF_DataType _dtype;
+    bool _owns_data;  // False for WrapView — destructor skips free
+    Location_e _location;
 };
 
 }//end instance namespace

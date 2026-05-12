@@ -16,14 +16,17 @@
 // Example: Train a small transformer language model from scratch
 //
 // Demonstrates:
-//   - Building a transformer model with CAIF_DeviceNetwork
-//   - Forward/backward pass with cross-entropy loss
-//   - Adam optimizer training loop
-//   - Saving the trained model to SafeTensors format
+//   - Picking a `<ComputeT, StorageT>` instantiation for the model
+//     (here: <float, float>; swap to <float, __nv_bfloat16> for
+//     bf16 storage + fp32 compute, etc.)
+//   - Building CAIF_DeviceTransformerModel and registering it in a
+//     CAIF_DeviceNetwork
+//   - Forward / cross-entropy loss / backward / Adam step
+//   - Saving the trained model to SafeTensors
 //
-// This trains on synthetic data (repeated token patterns) to verify the
-// pipeline works end-to-end.  Replace the synthetic data with real
-// tokenized text for actual language model training.
+// Trains on synthetic data (repeated token patterns) — just enough to
+// verify the pipeline runs end-to-end. For real training, swap the
+// synthetic input/target arrays for tokenized text.
 //--------------------------------------------------------------------------
 
 #include "caif_device_network.h"
@@ -36,6 +39,7 @@
 #include <vector>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 
 using namespace instance;
 
@@ -45,11 +49,20 @@ int main()
   {
     ISE_Out::Out()<<"=== CAIF Train Transformer Example ==="<<std::endl;
 
-    // Initialize CUDA
+    // Pick the model dtype here. To change it, edit BOTH template args
+    // below. Supported combinations:
+    //   <float, float>           — fp32 storage + fp32 compute (default)
+    //   <float, __nv_bfloat16>   — bf16 storage + fp32 compute
+    //   <float, __half>          — fp16 storage + fp32 compute
+    //   <__half, __half>         — fp16 storage + fp16 compute
+    //   ... 9 combinations total (3 compute dtypes x 3 storage dtypes)
+    typedef CAIF_DeviceTransformerModel<float,float> Model_t;
+    typedef CAIF_DeviceCrossEntropyLoss<float,float> CrossEntropy_t;
+
     CAIF_DeviceContext::Instance().Initialize();
     CAIF_CudaStream stream;
 
-    // Model configuration — a tiny transformer for demonstration
+    // Tiny transformer for demonstration.
     const uint32_t vocab_size=256;
     const uint32_t max_seq_len=32;
     const uint32_t dim=64;
@@ -57,7 +70,7 @@ int main()
     const uint32_t num_layers=2;
     const uint32_t ffn_dim=dim*4;
 
-    CAIF_DeviceTransformerModel::Config_t model_cfg;
+    Model_t::Config_t model_cfg;
     model_cfg.vocab_size=vocab_size;
     model_cfg.max_seq_len=max_seq_len;
     model_cfg.dim=dim;
@@ -71,15 +84,14 @@ int main()
     model_cfg.output_dim=vocab_size;
     model_cfg.tie_weights=true;
 
-    // Build model inside a DeviceNetwork
     CAIF_DeviceNetwork network(stream);
-    auto model=std::make_unique<CAIF_DeviceTransformerModel>(model_cfg,stream);
+    std::unique_ptr<Model_t> model=std::make_unique<Model_t>(model_cfg,stream);
     network.AddLayer(std::move(model));
 
     ISE_Out::Out()<<"Model: "<<network.TotalParameterCount()<<" parameters"<<std::endl;
 
-    // Create synthetic training data — a repeating pattern of tokens
-    // In production, load real tokenized text here
+    // Synthetic training data — repeating token pattern. Replace with
+    // tokenized text for real training.
     const uint32_t batch_size=4;
     const uint32_t seq_len=max_seq_len;
     const uint32_t num_tokens=batch_size*seq_len;
@@ -92,13 +104,16 @@ int main()
       target_data[i]=static_cast<float>((i+1)%vocab_size);
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),{batch_size,seq_len},stream);
-    CAIF_DeviceTensor target=CAIF_DeviceTensor::FromHostData(target_data.data(),{batch_size,seq_len},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
+                                                            {batch_size,seq_len},
+                                                            stream);
+    CAIF_DeviceTensor target=CAIF_DeviceTensor::FromHostData(target_data.data(),
+                                                             {batch_size,seq_len},
+                                                             stream);
 
-    // Training loop
     const uint32_t num_steps=50;
     const float learning_rate=1e-3f;
-    network.InitializeAdam(learning_rate,0.9f,0.999f,1e-8f);
+    network.InitializeAdam(learning_rate);
 
     ISE_Out::Out()<<"Training for "<<num_steps<<" steps..."<<std::endl;
 
@@ -106,18 +121,16 @@ int main()
     {
       network.ZeroGradients();
 
-      // Forward
       CAIF_DeviceTensor output=network.Forward(input,true);
 
-      // Loss + gradient
       CAIF_DeviceTensor grad_output;
-      const float loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(output,target,grad_output,stream);
+      const float loss=CrossEntropy_t::ComputeLossAndGradient(output,
+                                                              target,
+                                                              grad_output,
+                                                              stream);
 
-      // Backward
       network.Backward(grad_output);
-
-      // Optimizer step
-      network.AdamStep();
+      network.OptimizerStep();
 
       if((step+1)%10==0)
       {
@@ -125,7 +138,6 @@ int main()
       }
     }
 
-    // Save trained model
     const std::string save_path="trained_model.safetensors";
     network.SaveSafeTensors(save_path);
     ISE_Out::Out()<<"Model saved to "<<save_path<<std::endl;
@@ -136,11 +148,6 @@ int main()
   catch(CAIF_Exception &e)
   {
     ISE_Out::ErrLog()<<"CAIF Exception: "<<e<<std::endl;
-    return 1;
-  }
-  catch(std::exception &e)
-  {
-    ISE_Out::ErrLog()<<"Exception: "<<e.what()<<std::endl;
     return 1;
   }
 }

@@ -16,21 +16,27 @@
 #include "caif_host_tensor.h"
 #include "caif_exception.h"
 #include "caif_cuda_kernels.h"
+#include "caif_host_dtype_convert.h"
 #include "ise_lib/ise_out.h"
 #include <cstring>
+#include <new>
+#include <vector>
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
-using namespace instance;
+namespace instance
+{
 
 CAIF_DeviceTensor::CAIF_DeviceTensor():_device_data(nullptr),
                                      _shape(),
                                      _total_elements(0),
                                      _size_bytes(0),
                                      _stream(nullptr),
-                                     _dtype(CAIF_DataType::CAIF_DataType_e::Float32)
+                                     _dtype(CAIF_DataType::CAIF_DataType_e::Float32),
+                                     _owns_data(false),
+                                     _location(Location_e::Device_e)
 {
 }
 
@@ -41,7 +47,9 @@ CAIF_DeviceTensor::CAIF_DeviceTensor(const std::vector<uint32_t> &shape,
                                                   _total_elements(1),
                                                   _size_bytes(0),
                                                   _stream(&stream),
-                                                  _dtype(CAIF_DataType::CAIF_DataType_e::Float32)
+                                                  _dtype(CAIF_DataType::CAIF_DataType_e::Float32),
+                                                  _owns_data(allocate),
+                                                  _location(Location_e::Device_e)
 {
   for(const uint32_t dim:_shape)
   {
@@ -63,7 +71,9 @@ CAIF_DeviceTensor::CAIF_DeviceTensor(const std::vector<uint32_t> &shape,
                                                                        _total_elements(1),
                                                                        _size_bytes(0),
                                                                        _stream(&stream),
-                                                                       _dtype(dtype)
+                                                                       _dtype(dtype),
+                                                                       _owns_data(allocate),
+                                                                       _location(Location_e::Device_e)
 {
   for(const uint32_t dim:_shape)
   {
@@ -87,12 +97,16 @@ CAIF_DeviceTensor::CAIF_DeviceTensor(CAIF_DeviceTensor &&other):_device_data(oth
                                                                      _total_elements(other._total_elements),
                                                                      _size_bytes(other._size_bytes),
                                                                      _stream(other._stream),
-                                                                     _dtype(other._dtype)
+                                                                     _dtype(other._dtype),
+                                                                     _owns_data(other._owns_data),
+                                                                     _location(other._location)
 {
   other._device_data=nullptr;
   other._total_elements=0;
   other._size_bytes=0;
   other._stream=nullptr;
+  other._owns_data=false;
+  other._location=Location_e::Device_e;
 }
 
 CAIF_DeviceTensor &CAIF_DeviceTensor::operator=(CAIF_DeviceTensor &&other)
@@ -107,11 +121,15 @@ CAIF_DeviceTensor &CAIF_DeviceTensor::operator=(CAIF_DeviceTensor &&other)
     _size_bytes=other._size_bytes;
     _stream=other._stream;
     _dtype=other._dtype;
+    _owns_data=other._owns_data;
+    _location=other._location;
 
     other._device_data=nullptr;
     other._total_elements=0;
     other._size_bytes=0;
     other._stream=nullptr;
+    other._owns_data=false;
+    other._location=Location_e::Device_e;
   }
   return *this;
 }
@@ -128,8 +146,9 @@ void CAIF_DeviceTensor::AllocateDevice()
     THROW_CAIFE("Cannot allocate zero-size device tensor");
   }
 
-  // [ALLOC] debug logging commented out -- see GLMDEBUG.md
-  // Generates ~16K lines per training step, caused system RAM OOM via log growth
+  // [ALLOC] debug logging commented out — kept for ad-hoc memory tracing.
+  // Generates ~16K lines per training step at production scale; uncomment
+  // only for a short window or it will OOM the log target.
   // if(_size_bytes>=1024*1024)
   // {
   //   size_t free_mem=0;
@@ -175,15 +194,16 @@ void CAIF_DeviceTensor::AllocateDevice()
 
 void CAIF_DeviceTensor::FreeDevice()
 {
-#ifdef USE_CAIF_CUDA
-  if(_device_data!=nullptr)
+  if(_device_data!=nullptr&&_owns_data==true)
   {
-    // [FREE] debug logging commented out -- see GLMDEBUG.md
-    // if(_size_bytes>=1024*1024)
-    // {
-    //   ISE_Out::Out()<<"[FREE] "<<(_size_bytes/(1024*1024))<<"MB ("
-    //                 <<_size_bytes<<" bytes)"<<std::endl;
-    // }
+    if(_location==Location_e::Host_e)
+    {
+      ::operator delete[](_device_data,std::align_val_t(64));
+      _device_data=nullptr;
+      _owns_data=false;
+      return;
+    }
+#ifdef USE_CAIF_CUDA
     if(_stream!=nullptr)
     {
       cudaFreeAsync(_device_data,_stream->Handle());
@@ -192,9 +212,10 @@ void CAIF_DeviceTensor::FreeDevice()
     {
       cudaFree(_device_data);
     }
-    _device_data=nullptr;
-  }
 #endif
+  }
+  _device_data=nullptr;
+  _owns_data=false;
 }
 
 CAIF_DeviceTensor CAIF_DeviceTensor::Zeros(const std::vector<uint32_t> &shape,
@@ -253,6 +274,17 @@ CAIF_DeviceTensor CAIF_DeviceTensor::Uninitialized(const std::vector<uint32_t> &
                                                  CAIF_DataType::CAIF_DataType_e dtype)
 {
   return CAIF_DeviceTensor(shape,stream,true,dtype);
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::WrapView(void *device_ptr,
+                                             const std::vector<uint32_t> &shape,
+                                             CAIF_CudaStream &stream,
+                                             CAIF_DataType::CAIF_DataType_e dtype)
+{
+  CAIF_DeviceTensor view(shape,stream,false,dtype);
+  view._device_data=device_ptr;
+  view._owns_data=false;
+  return view;
 }
 
 CAIF_DeviceTensor CAIF_DeviceTensor::FromHost(const CAIF_HostTensor &host,CAIF_CudaStream &stream)
@@ -370,6 +402,46 @@ void CAIF_DeviceTensor::CopyFromHost(const float *host_data,size_t num_elements)
 #endif
 }
 
+void CAIF_DeviceTensor::CopyFromHostFp32(const float *host_data,size_t num_elements)
+{
+  try
+  {
+    if(host_data==nullptr)
+    {
+      THROW_CAIFE("Cannot copy from null host data");
+    }
+    if(num_elements!=TotalElements())
+    {
+      THROW_CAIFE("Host fp32 element count does not match tensor element count");
+    }
+    if(IsAllocated()==false)
+    {
+      THROW_CAIFE("Device tensor not allocated");
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      CopyFromHost(host_data,num_elements);
+      return;
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::BFloat16)
+    {
+      std::vector<uint16_t> packed(num_elements);
+      CAIF_HostDtypeConvert::Fp32ToBf16Buffer(host_data,packed.data(),num_elements);
+      CopyFromHostRaw(packed.data(),packed.size()*sizeof(uint16_t));
+      return;
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::Float16)
+    {
+      std::vector<uint16_t> packed(num_elements);
+      CAIF_HostDtypeConvert::Fp32ToFp16Buffer(host_data,packed.data(),num_elements);
+      CopyFromHostRaw(packed.data(),packed.size()*sizeof(uint16_t));
+      return;
+    }
+    THROW_CAIFE("CopyFromHostFp32: unsupported target dtype");
+  }
+  CAIF_CATCH_BLOCK();
+}
+
 void CAIF_DeviceTensor::CopyFromHostRaw(const void *host_data,size_t num_bytes)
 {
   if(host_data==nullptr)
@@ -437,6 +509,44 @@ void CAIF_DeviceTensor::CopyToHost(float *host_buffer)const
 #else
   THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif
+}
+
+void CAIF_DeviceTensor::CopyToHostFp32(float *host_buffer)const
+{
+  try
+  {
+    if(host_buffer==nullptr)
+    {
+      THROW_CAIFE("Cannot copy to null host buffer");
+    }
+    if(IsAllocated()==false)
+    {
+      THROW_CAIFE("Device tensor not allocated");
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      CopyToHost(host_buffer);
+      return;
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::BFloat16)
+    {
+      const size_t n=TotalElements();
+      std::vector<uint16_t> packed(n);
+      CopyToHostRaw(packed.data());
+      CAIF_HostDtypeConvert::Bf16ToFp32Buffer(packed.data(),host_buffer,n);
+      return;
+    }
+    if(Dtype()==CAIF_DataType::CAIF_DataType_e::Float16)
+    {
+      const size_t n=TotalElements();
+      std::vector<uint16_t> packed(n);
+      CopyToHostRaw(packed.data());
+      CAIF_HostDtypeConvert::Fp16ToFp32Buffer(packed.data(),host_buffer,n);
+      return;
+    }
+    THROW_CAIFE("CopyToHostFp32: unsupported source dtype");
+  }
+  CAIF_CATCH_BLOCK();
 }
 
 void CAIF_DeviceTensor::CopyToHostRaw(void *host_buffer)const
@@ -598,6 +708,27 @@ void CAIF_DeviceTensor::Synchronize()const
   }
 }
 
+void CAIF_DeviceTensor::FillZero()
+{
+  if(_device_data==nullptr||_size_bytes==0)
+  {
+    return;
+  }
+  if(_stream==nullptr)
+  {
+    THROW_CAIFE("Device tensor has no associated stream");
+  }
+#ifdef USE_CAIF_CUDA
+  cudaError_t status=cudaMemsetAsync(_device_data,0,_size_bytes,_stream->Handle());
+  if(status!=cudaSuccess)
+  {
+    THROW_CAIFE("Failed to zero device tensor");
+  }
+#else
+  THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
+#endif
+}
+
 void CAIF_DeviceTensor::Fill(float value)
 {
   if(_device_data==nullptr||_total_elements==0)
@@ -658,7 +789,20 @@ void CAIF_DeviceTensor::Reshape(const std::vector<uint32_t> &new_shape)
 
 CAIF_DeviceTensor CAIF_DeviceTensor::Clone()const
 {
-  if(IsEmpty()==true||_stream==nullptr)
+  if(IsEmpty()==true)
+  {
+    return CAIF_DeviceTensor();
+  }
+  if(_location==Location_e::Host_e)
+  {
+    CAIF_DeviceTensor out=UninitializedHost(_shape,_dtype.Value());
+    if(_size_bytes>0)
+    {
+      std::memcpy(out._device_data,_device_data,_size_bytes);
+    }
+    return out;
+  }
+  if(_stream==nullptr)
   {
     return CAIF_DeviceTensor();
   }
@@ -688,3 +832,103 @@ CAIF_DeviceTensor CAIF_DeviceTensor::CloneTo(CAIF_CudaStream &stream)const
 
   return tensor;
 }
+
+//------------------------------------------------------------------------------
+// Host-backed factories
+//------------------------------------------------------------------------------
+
+static constexpr size_t CAIF_HOST_ALIGNMENT=64;
+
+CAIF_DeviceTensor CAIF_DeviceTensor::UninitializedHost(const std::vector<uint32_t> &shape)
+{
+  return UninitializedHost(shape,CAIF_DataType::CAIF_DataType_e::Float32);
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::UninitializedHost(const std::vector<uint32_t> &shape,
+                                                       CAIF_DataType::CAIF_DataType_e dtype)
+{
+  CAIF_DeviceTensor tensor;
+  tensor._shape=shape;
+  tensor._dtype=CAIF_DataType(dtype);
+  tensor._total_elements=1;
+  for(const uint32_t dim:shape)
+  {
+    tensor._total_elements*=dim;
+  }
+  tensor._size_bytes=tensor._dtype.StorageSizeBytes(tensor._total_elements);
+  tensor._stream=nullptr;
+  tensor._location=Location_e::Host_e;
+  tensor._owns_data=false;
+  if(tensor._size_bytes>0)
+  {
+    tensor._device_data=::operator new[](tensor._size_bytes,
+                                         std::align_val_t(CAIF_HOST_ALIGNMENT));
+    tensor._owns_data=true;
+  }
+  return tensor;
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::ZerosHost(const std::vector<uint32_t> &shape)
+{
+  return ZerosHost(shape,CAIF_DataType::CAIF_DataType_e::Float32);
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::ZerosHost(const std::vector<uint32_t> &shape,
+                                               CAIF_DataType::CAIF_DataType_e dtype)
+{
+  CAIF_DeviceTensor tensor=UninitializedHost(shape,dtype);
+  if(tensor._device_data!=nullptr && tensor._size_bytes>0)
+  {
+    std::memset(tensor._device_data,0,tensor._size_bytes);
+  }
+  return tensor;
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::ToDevice(CAIF_CudaStream &stream)const
+{
+  if(_location==Location_e::Device_e)
+  {
+    THROW_CAIFE("CAIF_DeviceTensor::ToDevice called on an already-device tensor");
+  }
+  CAIF_DeviceTensor out(_shape,stream,true,_dtype.Value());
+#ifdef USE_CAIF_CUDA
+  cudaError_t status=cudaMemcpyAsync(out._device_data,
+                                     _device_data,
+                                     _size_bytes,
+                                     cudaMemcpyHostToDevice,
+                                     stream.Handle());
+  if(status!=cudaSuccess)
+  {
+    THROW_CAIFE("CAIF_DeviceTensor::ToDevice: cudaMemcpyAsync failed");
+  }
+#endif
+  return out;
+}
+
+CAIF_DeviceTensor CAIF_DeviceTensor::ToHostLocation()const
+{
+  if(_location==Location_e::Host_e)
+  {
+    THROW_CAIFE("CAIF_DeviceTensor::ToHostLocation called on an already-host tensor");
+  }
+  CAIF_DeviceTensor out=UninitializedHost(_shape,_dtype.Value());
+#ifdef USE_CAIF_CUDA
+  if(_stream==nullptr)
+  {
+    THROW_CAIFE("CAIF_DeviceTensor::ToHostLocation: source tensor has no stream");
+  }
+  cudaError_t status=cudaMemcpyAsync(out._device_data,
+                                     _device_data,
+                                     _size_bytes,
+                                     cudaMemcpyDeviceToHost,
+                                     _stream->Handle());
+  if(status!=cudaSuccess)
+  {
+    THROW_CAIFE("CAIF_DeviceTensor::ToHostLocation: cudaMemcpyAsync failed");
+  }
+  _stream->Synchronize();
+#endif
+  return out;
+}
+
+}//end instance namespace

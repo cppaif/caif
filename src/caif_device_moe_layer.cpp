@@ -17,686 +17,928 @@
 // Device-resident MoE Layer implementation
 //------------------------------------------------------------------------------
 #include "caif_device_moe_layer.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
+#include "caif_constants.h"
 #include "caif_exception.h"
+#include "ise_lib/ise_out.h"
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <utility>
+#include <vector>
 
-using namespace instance;
+#ifdef USE_CAIF_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
-CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(const Config_t &config,CAIF_CudaStream &stream)
-  :CAIF_DeviceLayer(stream)
-  ,_config(config)
+namespace instance
+{
+
+
+// Build internal Router/Expert primitives from scalar args. Used by the
+// primary constructor. Experts are always sized to _hidden_dim; if the
+// caller wants a distinct shared-expert width they pass shared_hidden_dim.
+template<typename ComputeT,typename StorageT>
+void BuildPrimitives(uint32_t input_dim,
+                     uint32_t hidden_dim,
+                     uint32_t num_experts,
+                     uint32_t top_k,
+                     bool expert_use_gated,
+                     bool expert_use_bias,
+                     uint32_t num_shared_experts,
+                     uint32_t shared_hidden_dim,
+                     bool router_use_bias,
+                     float router_noise_std,
+                     CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+                     bool norm_topk_prob,
+                     float routed_scaling_factor,
+                     CAIF_CudaStream &stream,
+                     std::unique_ptr<CAIF_DeviceMoERouter<ComputeT,StorageT>> &out_router,
+                     std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &out_experts,
+                     std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &out_shared)
+{
+  typename CAIF_DeviceMoERouter<ComputeT,StorageT>::Config_t router_cfg;
+  router_cfg.input_dim=input_dim;
+  router_cfg.num_experts=num_experts;
+  router_cfg.top_k=top_k;
+  router_cfg.routing_type=CAIF_DeviceMoERouter<ComputeT,StorageT>::RoutingType_e::TopK;
+  router_cfg.use_bias=router_use_bias;
+  router_cfg.noise_std=router_noise_std;
+  router_cfg.gating_kind=gating_kind;
+  router_cfg.norm_topk_prob=norm_topk_prob;
+  router_cfg.routed_scaling_factor=routed_scaling_factor;
+
+  out_router=std::make_unique<CAIF_DeviceMoERouter<ComputeT,StorageT>>(router_cfg,stream);
+
+  typename CAIF_DeviceMoEExpert<ComputeT,StorageT>::Config_t expert_cfg;
+  expert_cfg.input_dim=input_dim;
+  expert_cfg.hidden_dim=hidden_dim;
+  expert_cfg.use_gated=expert_use_gated;
+  expert_cfg.use_bias=expert_use_bias;
+
+  out_experts.clear();
+  out_experts.reserve(num_experts);
+  for(uint32_t i=0;i<num_experts;++i)
+  {
+    out_experts.push_back(std::make_unique<CAIF_DeviceMoEExpert<ComputeT,StorageT>>(expert_cfg,stream));
+  }
+
+  out_shared.clear();
+  if(num_shared_experts>0)
+  {
+    typename CAIF_DeviceMoEExpert<ComputeT,StorageT>::Config_t shared_cfg=expert_cfg;
+    if(shared_hidden_dim>0)
+    {
+      shared_cfg.hidden_dim=shared_hidden_dim;
+    }
+    out_shared.reserve(num_shared_experts);
+    for(uint32_t i=0;i<num_shared_experts;++i)
+    {
+      out_shared.push_back(std::make_unique<CAIF_DeviceMoEExpert<ComputeT,StorageT>>(shared_cfg,stream));
+    }
+  }
+}
+
+void ValidateCore(uint32_t input_dim,
+                  uint32_t hidden_dim,
+                  uint32_t num_experts,
+                  uint32_t top_k)
+{
+  if(input_dim==0)
+  {
+    THROW_CAIFE("MoELayer: input_dim must be > 0");
+  }
+  if(hidden_dim==0)
+  {
+    THROW_CAIFE("MoELayer: hidden_dim must be > 0");
+  }
+  if(num_experts==0)
+  {
+    THROW_CAIFE("MoELayer: num_experts must be > 0");
+  }
+  if(top_k==0||top_k>num_experts)
+  {
+    THROW_CAIFE("MoELayer: top_k must be > 0 and <= num_experts");
+  }
+}
+
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
+                                         uint32_t hidden_dim,
+                                         uint32_t num_experts,
+                                         uint32_t top_k,
+                                         bool expert_use_gated,
+                                         bool expert_use_bias,
+                                         uint32_t num_shared_experts,
+                                         uint32_t shared_hidden_dim,
+                                         bool router_use_bias,
+                                         float router_noise_std,
+                                         float capacity_factor,
+                                         OverflowStrategy_e overflow_strategy,
+                                         float balance_loss_weight,
+                                         float z_loss_weight,
+                                         CAIF_CudaStream &stream,
+                                         CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+                                         bool norm_topk_prob,
+                                         float routed_scaling_factor):
+                                           CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                           _input_dim(input_dim),
+                                           _hidden_dim(hidden_dim),
+                                           _top_k(top_k),
+                                           _capacity_factor(capacity_factor),
+                                           _overflow_strategy(overflow_strategy),
+                                           _balance_loss_weight(balance_loss_weight),
+                                           _z_loss_weight(z_loss_weight),
+                                           _last_balance_loss(0.0f),
+                                           _last_z_loss(0.0f)
 {
   try
   {
-    // Validate config
-    if(_config.input_dim==0)
-    {
-      THROW_CAIFE("MoELayer: input_dim must be > 0");
-    }
-    if(_config.hidden_dim==0)
-    {
-      THROW_CAIFE("MoELayer: hidden_dim must be > 0");
-    }
-    if(_config.num_experts==0)
-    {
-      THROW_CAIFE("MoELayer: num_experts must be > 0");
-    }
-    if(_config.top_k==0||_config.top_k>_config.num_experts)
-    {
-      THROW_CAIFE("MoELayer: top_k must be > 0 and <= num_experts");
-    }
+    ValidateCore(input_dim,hidden_dim,num_experts,top_k);
 
-    // Compute actual expert dimensions for fine-grained mode
-    uint32_t actual_num_experts=_config.num_experts;
-    uint32_t actual_hidden_dim=_config.hidden_dim;
+    BuildPrimitives<ComputeT,StorageT>(input_dim,
+                    hidden_dim,
+                    num_experts,
+                    top_k,
+                    expert_use_gated,
+                    expert_use_bias,
+                    num_shared_experts,
+                    shared_hidden_dim,
+                    router_use_bias,
+                    router_noise_std,
+                    gating_kind,
+                    norm_topk_prob,
+                    routed_scaling_factor,
+                    stream,
+                    _router,
+                    _experts,
+                    _shared_experts);
 
-    if(_config.fine_grained&&_config.fine_grained_factor>1)
-    {
-      // Fine-grained: more experts with smaller hidden dimensions
-      // E.g., factor=4 means 4x experts with 1/4 hidden dim each
-      actual_num_experts=_config.num_experts*_config.fine_grained_factor;
-      actual_hidden_dim=_config.hidden_dim/_config.fine_grained_factor;
-      if(actual_hidden_dim==0)
-      {
-        actual_hidden_dim=1;  // Minimum hidden dim
-      }
-    }
-
-    // Create router (routes to all routed experts)
-    CAIF_DeviceMoERouter::Config_t router_config;
-    router_config.input_dim=_config.input_dim;
-    router_config.num_experts=actual_num_experts;
-    router_config.top_k=_config.top_k;
-    router_config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::TopK;
-    router_config.use_bias=_config.router_use_bias;
-    router_config.noise_std=_config.router_noise_std;
-
-    _router=std::make_unique<CAIF_DeviceMoERouter>(router_config,stream);
-
-    // Create routed experts
-    CAIF_DeviceMoEExpert::Config_t expert_config;
-    expert_config.input_dim=_config.input_dim;
-    expert_config.hidden_dim=actual_hidden_dim;
-    expert_config.use_gated=_config.expert_use_gated;
-    expert_config.use_bias=_config.expert_use_bias;
-
-    _experts.reserve(actual_num_experts);
-    for(uint32_t i=0;i<actual_num_experts;++i)
-    {
-      _experts.push_back(std::make_unique<CAIF_DeviceMoEExpert>(expert_config,stream));
-    }
-
-    // Create shared experts (DeepSeekMoE style - always active for all tokens)
-    if(_config.num_shared_experts>0)
-    {
-      CAIF_DeviceMoEExpert::Config_t shared_config;
-      shared_config.input_dim=_config.input_dim;
-      if(_config.shared_hidden_dim>0)
-      {
-        shared_config.hidden_dim=_config.shared_hidden_dim;
-      }
-      else
-      {
-        shared_config.hidden_dim=_config.hidden_dim;
-      }
-      shared_config.use_gated=_config.expert_use_gated;
-      shared_config.use_bias=_config.expert_use_bias;
-
-      _shared_experts.reserve(_config.num_shared_experts);
-      for(uint32_t i=0;i<_config.num_shared_experts;++i)
-      {
-        _shared_experts.push_back(std::make_unique<CAIF_DeviceMoEExpert>(shared_config,stream));
-      }
-    }
-
-    _stream->Synchronize();
+    Stream().Synchronize();
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(const Config_t &config,
-                                       std::vector<std::unique_ptr<CAIF_DeviceMoEExpert>> routed_experts,
-                                       std::vector<std::unique_ptr<CAIF_DeviceMoEExpert>> shared_experts,
-                                       CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
-                                                                _config(config)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
+                                         uint32_t hidden_dim,
+                                         uint32_t top_k,
+                                         bool router_use_bias,
+                                         float router_noise_std,
+                                         float capacity_factor,
+                                         OverflowStrategy_e overflow_strategy,
+                                         float balance_loss_weight,
+                                         float z_loss_weight,
+                                         std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> routed_experts,
+                                         std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> shared_experts,
+                                         CAIF_CudaStream &stream,
+                                         CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+                                         bool norm_topk_prob,
+                                         float routed_scaling_factor):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                                                  _input_dim(input_dim),
+                                                                  _hidden_dim(hidden_dim),
+                                                                  _top_k(top_k),
+                                                                  _capacity_factor(capacity_factor),
+                                                                  _overflow_strategy(overflow_strategy),
+                                                                  _balance_loss_weight(balance_loss_weight),
+                                                                  _z_loss_weight(z_loss_weight),
+                                                                  _experts(std::move(routed_experts)),
+                                                                  _shared_experts(std::move(shared_experts)),
+                                                                  _last_balance_loss(0.0f),
+                                                                  _last_z_loss(0.0f)
 {
   try
   {
-    if(_config.input_dim==0)
-    {
-      THROW_CAIFE("MoELayer: input_dim must be > 0");
-    }
-    if(_config.num_experts==0)
-    {
-      THROW_CAIFE("MoELayer: num_experts must be > 0");
-    }
-    if(_config.top_k==0||_config.top_k>_config.num_experts)
-    {
-      THROW_CAIFE("MoELayer: top_k must be > 0 and <= num_experts");
-    }
+    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
+    ValidateCore(input_dim,hidden_dim,num_experts,top_k);
 
-    // Compute actual number of routed experts for router
-    uint32_t actual_num_experts=_config.num_experts;
-    if(_config.fine_grained&&_config.fine_grained_factor>1)
-    {
-      actual_num_experts=_config.num_experts*_config.fine_grained_factor;
-    }
+    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::Config_t router_cfg;
+    router_cfg.input_dim=input_dim;
+    router_cfg.num_experts=num_experts;
+    router_cfg.top_k=top_k;
+    router_cfg.routing_type=CAIF_DeviceMoERouter<ComputeT,StorageT>::RoutingType_e::TopK;
+    router_cfg.use_bias=router_use_bias;
+    router_cfg.noise_std=router_noise_std;
+    router_cfg.gating_kind=gating_kind;
+    router_cfg.norm_topk_prob=norm_topk_prob;
+    router_cfg.routed_scaling_factor=routed_scaling_factor;
 
-    // Create router
-    CAIF_DeviceMoERouter::Config_t router_config;
-    router_config.input_dim=_config.input_dim;
-    router_config.num_experts=actual_num_experts;
-    router_config.top_k=_config.top_k;
-    router_config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::TopK;
-    router_config.use_bias=_config.router_use_bias;
-    router_config.noise_std=_config.router_noise_std;
+    _router=std::make_unique<CAIF_DeviceMoERouter<ComputeT,StorageT>>(router_cfg,stream);
 
-    _router=std::make_unique<CAIF_DeviceMoERouter>(router_config,stream);
-
-    // Take ownership of caller-provided experts
-    _experts=std::move(routed_experts);
-    _shared_experts=std::move(shared_experts);
-
-    _stream->Synchronize();
+    Stream().Synchronize();
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceMoELayer::CAIF_DeviceMoELayer(CAIF_DeviceMoELayer &&other)
-  :CAIF_DeviceLayer(std::move(other))
-  ,_config(other._config)
-  ,_router(std::move(other._router))
-  ,_experts(std::move(other._experts))
-  ,_shared_experts(std::move(other._shared_experts))
-  ,_cached_input(std::move(other._cached_input))
-  ,_cached_router_output(std::move(other._cached_router_output))
-  ,_cached_expert_inputs(std::move(other._cached_expert_inputs))
-  ,_cached_expert_outputs(std::move(other._cached_expert_outputs))
-  ,_cached_shared_outputs(std::move(other._cached_shared_outputs))
-  ,_cached_token_counts(std::move(other._cached_token_counts))
-  ,_dispatch_indices(std::move(other._dispatch_indices))
-  ,_dispatch_weights(std::move(other._dispatch_weights))
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(CAIF_DeviceMoELayer<ComputeT,StorageT> &&other):CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                                                                     _input_dim(other._input_dim),
+                                                                     _hidden_dim(other._hidden_dim),
+                                                                     _top_k(other._top_k),
+                                                                     _capacity_factor(other._capacity_factor),
+                                                                     _overflow_strategy(other._overflow_strategy),
+                                                                     _balance_loss_weight(other._balance_loss_weight),
+                                                                     _z_loss_weight(other._z_loss_weight),
+                                                                     _router(std::move(other._router)),
+                                                                     _experts(std::move(other._experts)),
+                                                                     _shared_experts(std::move(other._shared_experts)),
+                                                                     _cached_routing(std::move(other._cached_routing)),
+                                                                     _cached_token_counts(std::move(other._cached_token_counts)),
+                                                                     _cached_logsumexp(std::move(other._cached_logsumexp)),
+                                                                     _last_balance_loss(other._last_balance_loss),
+                                                                     _last_z_loss(other._last_z_loss),
+                                                                     _overflow_tokens(std::move(other._overflow_tokens)),
+                                                                     _ws_dispatch_map(std::move(other._ws_dispatch_map)),
+                                                                     _ws_expert_offsets(std::move(other._ws_expert_offsets)),
+                                                                     _ws_expert_input_buffer(std::move(other._ws_expert_input_buffer)),
+                                                                     _ws_expert_output_buffer(std::move(other._ws_expert_output_buffer)),
+                                                                     _ws_grad_expert_output_buffer(std::move(other._ws_grad_expert_output_buffer)),
+                                                                     _ws_grad_expert_input_buffer(std::move(other._ws_grad_expert_input_buffer))
 {
 }
 
-CAIF_DeviceMoELayer &CAIF_DeviceMoELayer::operator=(CAIF_DeviceMoELayer &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMoELayer<ComputeT,StorageT> &CAIF_DeviceMoELayer<ComputeT,StorageT>::operator=(CAIF_DeviceMoELayer<ComputeT,StorageT> &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
-    _config=other._config;
+    CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
+    _input_dim=other._input_dim;
+    _hidden_dim=other._hidden_dim;
+    _top_k=other._top_k;
+    _capacity_factor=other._capacity_factor;
+    _overflow_strategy=other._overflow_strategy;
+    _balance_loss_weight=other._balance_loss_weight;
+    _z_loss_weight=other._z_loss_weight;
     _router=std::move(other._router);
     _experts=std::move(other._experts);
     _shared_experts=std::move(other._shared_experts);
-    _cached_input=std::move(other._cached_input);
-    _cached_router_output=std::move(other._cached_router_output);
-    _cached_expert_inputs=std::move(other._cached_expert_inputs);
-    _cached_expert_outputs=std::move(other._cached_expert_outputs);
-    _cached_shared_outputs=std::move(other._cached_shared_outputs);
+    _cached_routing=std::move(other._cached_routing);
     _cached_token_counts=std::move(other._cached_token_counts);
-    _dispatch_indices=std::move(other._dispatch_indices);
-    _dispatch_weights=std::move(other._dispatch_weights);
+    _cached_logsumexp=std::move(other._cached_logsumexp);
+    _last_balance_loss=other._last_balance_loss;
+    _last_z_loss=other._last_z_loss;
+    _overflow_tokens=std::move(other._overflow_tokens);
+    _ws_dispatch_map=std::move(other._ws_dispatch_map);
+    _ws_expert_offsets=std::move(other._ws_expert_offsets);
+    _ws_expert_input_buffer=std::move(other._ws_expert_input_buffer);
+    _ws_expert_output_buffer=std::move(other._ws_expert_output_buffer);
+    _ws_grad_expert_output_buffer=std::move(other._ws_grad_expert_output_buffer);
+    _ws_grad_expert_input_buffer=std::move(other._ws_grad_expert_input_buffer);
   }
   return *this;
 }
 
-CAIF_DeviceMoELayer::MoEOutput_t CAIF_DeviceMoELayer::ForwardMoE(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)
 {
   try
   {
-    // Input: [batch, seq_len, dim] or [num_tokens, dim]
-    const auto &shape=input.Shape();
-    uint32_t num_tokens=0;
+    const auto &in_shape=input.Shape();
     uint32_t batch_size=1;
     uint32_t seq_len=1;
+    uint32_t num_tokens=0;
+    uint32_t flat_dim=0;
 
-    // Clone input for potential reshape
-    CAIF_DeviceTensor flat_input=input.Clone();
-
-    if(shape.size()==2)
+    if(in_shape.size()==2)
     {
-      num_tokens=shape[0];
+      num_tokens=in_shape[0];
+      flat_dim=in_shape[1];
     }
-    else if(shape.size()==3)
+    else if(in_shape.size()==3)
     {
-      batch_size=shape[0];
-      seq_len=shape[1];
+      batch_size=in_shape[0];
+      seq_len=in_shape[1];
       num_tokens=batch_size*seq_len;
-      flat_input.Reshape({num_tokens,shape[2]});
+      flat_dim=in_shape[2];
     }
     else
     {
-      THROW_CAIFE("MoELayer::ForwardMoE: expected input shape [N, dim] or [batch, seq, dim]");
+      THROW_CAIFE("MoELayer::Forward: expected input shape [N, dim] or [batch, seq, dim]");
     }
 
-    if(flat_input.Shape()[1]!=_config.input_dim)
+    if(flat_dim!=_input_dim)
     {
-      THROW_CAIFE("MoELayer::ForwardMoE: input dimension mismatch");
+      THROW_CAIFE("MoELayer::Forward: input dimension mismatch");
     }
 
-    // Cache input for backward
-    if(training==true)
+    // Non-owning view — downstream reads (router, dispatch, experts) are const,
+    // so aliasing the caller's buffer is safe and avoids a full device clone.
+    CAIF_DeviceTensor flat_input=CAIF_DeviceTensor::WrapView(
+      const_cast<void*>(input.DeviceDataRaw()),
+      {num_tokens,flat_dim},
+      Stream(),
+      input.Dtype());
+
+#ifdef USE_CAIF_CUDA
+    cudaEvent_t mt_ev_start=nullptr;
+    cudaEvent_t mt_ev_router=nullptr;
+    cudaEvent_t mt_ev_dispatch_map=nullptr;
+    cudaEvent_t mt_ev_dispatch_gpu=nullptr;
+    cudaEvent_t mt_ev_experts=nullptr;
+    cudaEvent_t mt_ev_combine=nullptr;
+    if(g_caif_moe_forward_trace_enabled==true)
     {
-      _cached_input=flat_input.Clone();
+      cudaEventCreate(&mt_ev_start);
+      cudaEventCreate(&mt_ev_router);
+      cudaEventCreate(&mt_ev_dispatch_map);
+      cudaEventCreate(&mt_ev_dispatch_gpu);
+      cudaEventCreate(&mt_ev_experts);
+      cudaEventCreate(&mt_ev_combine);
+      cudaEventRecord(mt_ev_start,Stream().Handle());
     }
+#endif
 
-    // Route tokens to experts
-    CAIF_DeviceMoERouter::RouterOutput_t router_output=_router->Route(flat_input,training);
+    // ---- Route once. Always route once per forward; cache for backward
+    //      only in training mode. Dispatch, combine, and aux-loss grads all
+    //      read from this single RouterOutput_t.
+    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t routing=_router->Route(flat_input,ctx);
+    const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &r=routing;
 
-    if(training==true)
+#ifdef USE_CAIF_CUDA
+    if(g_caif_moe_forward_trace_enabled==true)
     {
-      _cached_router_output=std::move(router_output);
-      // Need to re-route to get fresh output (router_output was moved)
-      router_output=_router->Route(flat_input,false);
+      cudaEventRecord(mt_ev_router,Stream().Handle());
+    }
+#endif
+
+    // ---- Device-resident dispatch/combine path.
+    //
+    //   Old: MoEDispatch + MoECombine ran entirely on the host — CopyToHost
+    //   for input tokens + indices, host loop rearranging into per-expert
+    //   buffers, CopyFromHost back. That round-trip of N*dim floats per op
+    //   dominated MoE Forward time (5-10 ms on a 4096x512 workload). The
+    //   GPU variants (MoEDispatchGPU / MoECombineGPU) concatenate all expert
+    //   inputs into a single [total_assigned, dim] buffer addressed via a
+    //   dispatch_map (slot per token-expert assignment) + expert_offsets
+    //   (start of each expert's block in the buffer).
+    //
+    //   MoEBuildDispatchMap still does one small host sync to read back the
+    //   expert_indices (N*K int32 — tiny compared to the N*dim tensor data
+    //   we used to round-trip). Only Drop overflow is supported on the GPU
+    //   fast path; NoOp/Redistribute aren't benched or covered by MoE
+    //   parity so we fail loudly if requested.
+    if(_overflow_strategy!=OverflowStrategy_e::Drop)
+    {
+      THROW_CAIFE("MoELayer::Forward: only Drop overflow supported on GPU dispatch path");
     }
 
-    // Dispatch tokens to experts
-    std::vector<CAIF_DeviceTensor> expert_inputs=DispatchTokens(flat_input,
-                                                                router_output.expert_indices,
-                                                                _cached_token_counts);
+    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
+    const uint32_t capacity=static_cast<uint32_t>(
+      std::ceil(static_cast<float>(num_tokens)/num_experts*_capacity_factor*_top_k));
 
-    // Run each expert on its assigned tokens
+    if(_ws_dispatch_map.TotalElements()!=static_cast<size_t>(num_tokens)*_top_k)
+    {
+      _ws_dispatch_map=CAIF_DeviceTensor::Uninitialized({num_tokens,_top_k},
+                                                        Stream(),
+                                                        CAIF_DataType::CAIF_DataType_e::Int32);
+    }
+    if(_ws_expert_offsets.TotalElements()!=num_experts+1)
+    {
+      _ws_expert_offsets=CAIF_DeviceTensor::Uninitialized({num_experts+1},
+                                                          Stream(),
+                                                          CAIF_DataType::CAIF_DataType_e::Int32);
+    }
+
+    const uint32_t total_assigned=CAIF_Ops::MoEBuildDispatchMap(r.expert_indices,
+                                                                      num_experts,
+                                                                      _top_k,
+                                                                      capacity,
+                                                                      _ws_dispatch_map,
+                                                                      _ws_expert_offsets);
+
+    std::vector<int32_t> offsets_host(num_experts+1);
+    _ws_expert_offsets.CopyToHostRaw(offsets_host.data());
+
+    _cached_token_counts.assign(num_experts,0u);
+    for(uint32_t e=0;e<num_experts;++e)
+    {
+      _cached_token_counts[e]=static_cast<uint32_t>(offsets_host[e+1]-offsets_host[e]);
+    }
+
+#ifdef USE_CAIF_CUDA
+    if(g_caif_moe_forward_trace_enabled==true)
+    {
+      cudaEventRecord(mt_ev_dispatch_map,Stream().Handle());
+    }
+#endif
+
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const size_t elem_bytes=CAIF_DataType(sd).ElementSizeBytes();
+
+    const uint32_t buf_rows=std::max<uint32_t>(total_assigned,1u);
+    if(_ws_expert_input_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
+       ||_ws_expert_input_buffer.Dtype()!=sd)
+    {
+      _ws_expert_input_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+    }
+    if(_ws_expert_output_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
+       ||_ws_expert_output_buffer.Dtype()!=sd)
+    {
+      _ws_expert_output_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+    }
+
+    if(total_assigned>0)
+    {
+      CAIF_Ops::MoEDispatchGPU(flat_input,
+                                     r.expert_indices,
+                                     _ws_dispatch_map,
+                                     _ws_expert_offsets,
+                                     _top_k,
+                                     _ws_expert_input_buffer);
+    }
+
+#ifdef USE_CAIF_CUDA
+    if(g_caif_moe_forward_trace_enabled==true)
+    {
+      cudaEventRecord(mt_ev_dispatch_gpu,Stream().Handle());
+    }
+#endif
+
+    // Per-expert forward: write each expert's output directly into its
+    // pre-assigned slice of the packed `_ws_expert_output_buffer`,
+    // mirroring the same offset layout as `_ws_expert_input_buffer`.
+    //
+    // Why the in-place write matters:
+    //   The pre-ForwardInto code did `out=_experts[i]->Forward(in_view)`
+    //   (allocating a per-expert owning tensor) and then a separate
+    //   `cudaMemcpyAsync(out_ptr_bytes, out.DeviceDataRaw(), ...)` to
+    //   copy that tensor into the workspace slice. Per-expert that's
+    //   1 alloc + 1 D2D copy of cnt*input_dim*elem_bytes per token group.
+    //   With num_experts up to 64 in production MoE shapes, that adds
+    //   up to a measurable hot path (compare_multirun.py min-vs-min
+    //   confirms: MoE Backward prod fp32 -1.282 ms, MoE Forward prod
+    //   training fp32 -0.406 ms vs the post-phase4 peak baseline).
+    //
+    // Why ForwardInto can't just be ForwardImpl with an output param:
+    //   Some experts use the projection-pluggable path
+    //   (`_use_projections==true`), where the down-projection layer
+    //   allocates its own output tensor inside its Forward(). For those,
+    //   ForwardInto still falls back to a D2D copy (see moe_expert.cpp).
+    //   The non-projection path — which is the bench/perf-critical path
+    //   — runs `MatMul(hidden, _w_down, output)` writing straight into
+    //   the caller's slice, and *that* is what avoids the alloc + copy.
+    //
+    // Why the views are safe:
+    //   - `in_view` and `out_view` reference distinct byte ranges in
+    //     two different workspace tensors (_ws_expert_input_buffer vs
+    //     _ws_expert_output_buffer), so the expert's forward never
+    //     reads and writes the same bytes through different aliases.
+    //   - The workspaces are member tensors of the layer; they live
+    //     until the layer is destroyed, so the views are valid for the
+    //     entire forward + backward window. Backward (BackwardImpl)
+    //     reads `_ws_expert_output_buffer` directly via offsets, so the
+    //     `expert_outputs` vector below is purely a forward-local
+    //     bookkeeping list, not a backward dependency.
+    //   - `Stream()` is the layer's stream, which is also the stream
+    //     the workspaces were allocated against and the experts run on.
+    //     No cross-stream race.
+    //
+    // expert_outputs[i] holds a non-owning view into the workspace slice
+    // for expert i. It exists for two reasons:
+    //   a) the empty `CAIF_DeviceTensor()` placeholder slot for
+    //      cnt==0 experts keeps the vector index aligned with expert
+    //      index, which the combine stage reads from indirectly via
+    //      offsets. Moving an empty placeholder is cheap.
+    //   b) some downstream code paths (shared experts, expert-choice
+    //      routing variants in derived classes) iterate the expert
+    //      outputs by index. Keeping the vector populated preserves
+    //      that contract even though combine itself doesn't use it.
     std::vector<CAIF_DeviceTensor> expert_outputs;
-    expert_outputs.reserve(_config.num_experts);
+    expert_outputs.reserve(num_experts);
 
-    if(training==true)
+    for(uint32_t i=0;i<num_experts;++i)
     {
-      _cached_expert_inputs.clear();
-      _cached_expert_inputs.reserve(_config.num_experts);
-      _cached_expert_outputs.clear();
-      _cached_expert_outputs.reserve(_config.num_experts);
-    }
-
-    for(uint32_t i=0;i<_config.num_experts;++i)
-    {
-      if(_cached_token_counts[i]>0)
+      const uint32_t cnt=_cached_token_counts[i];
+      if(cnt==0)
       {
-        CAIF_DeviceTensor expert_out=_experts[i]->Forward(expert_inputs[i],training);
-        expert_outputs.push_back(std::move(expert_out));
-
-        if(training==true)
-        {
-          _cached_expert_inputs.push_back(expert_inputs[i].Clone());
-          _cached_expert_outputs.push_back(expert_outputs.back().Clone());
-        }
-      }
-      else
-      {
-        // No tokens for this expert
         expert_outputs.push_back(CAIF_DeviceTensor());
-        if(training==true)
-        {
-          _cached_expert_inputs.push_back(CAIF_DeviceTensor());
-          _cached_expert_outputs.push_back(CAIF_DeviceTensor());
-        }
+        continue;
       }
+      const uint32_t off=static_cast<uint32_t>(offsets_host[i]);
+      uint8_t *in_ptr_bytes=static_cast<uint8_t*>(_ws_expert_input_buffer.DeviceDataRaw())
+                            +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      uint8_t *out_ptr_bytes=static_cast<uint8_t*>(_ws_expert_output_buffer.DeviceDataRaw())
+                             +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      CAIF_DeviceTensor in_view=CAIF_DeviceTensor::WrapView(in_ptr_bytes,
+                                                            {cnt,_input_dim},
+                                                            Stream(),
+                                                            _ws_expert_input_buffer.Dtype());
+      CAIF_DeviceTensor out_view=CAIF_DeviceTensor::WrapView(out_ptr_bytes,
+                                                             {cnt,_input_dim},
+                                                             Stream(),
+                                                             _ws_expert_output_buffer.Dtype());
+      _experts[i]->ForwardInto(in_view,out_view,ctx);
+      expert_outputs.push_back(std::move(out_view));
     }
 
-    // Combine expert outputs back to original positions
-    CAIF_DeviceTensor combined=CombineOutputs(expert_outputs,
-                                              router_output.expert_indices,
-                                              router_output.expert_weights,
-                                              _cached_token_counts,
-                                              num_tokens);
+#ifdef USE_CAIF_CUDA
+    if(g_caif_moe_forward_trace_enabled==true)
+    {
+      cudaEventRecord(mt_ev_experts,Stream().Handle());
+    }
+#endif
 
-    // Run shared experts on ALL tokens and add to output (DeepSeekMoE style)
+    CAIF_DeviceTensor combined=CAIF_DeviceTensor::Zeros({num_tokens,_input_dim},Stream(),sd);
+    if(total_assigned>0)
+    {
+      CAIF_Ops::MoECombineGPU(_ws_expert_output_buffer,
+                                    r.expert_indices,
+                                    r.expert_weights,
+                                    _ws_dispatch_map,
+                                    _ws_expert_offsets,
+                                    _top_k,
+                                    combined);
+    }
+
+#ifdef USE_CAIF_CUDA
+    if(g_caif_moe_forward_trace_enabled==true)
+    {
+      cudaEventRecord(mt_ev_combine,Stream().Handle());
+      cudaEventSynchronize(mt_ev_combine);
+      float ms_router=0.0f;
+      float ms_dispatch_map=0.0f;
+      float ms_dispatch_gpu=0.0f;
+      float ms_experts=0.0f;
+      float ms_combine=0.0f;
+      cudaEventElapsedTime(&ms_router,mt_ev_start,mt_ev_router);
+      cudaEventElapsedTime(&ms_dispatch_map,mt_ev_router,mt_ev_dispatch_map);
+      cudaEventElapsedTime(&ms_dispatch_gpu,mt_ev_dispatch_map,mt_ev_dispatch_gpu);
+      cudaEventElapsedTime(&ms_experts,mt_ev_dispatch_gpu,mt_ev_experts);
+      cudaEventElapsedTime(&ms_combine,mt_ev_experts,mt_ev_combine);
+      std::fprintf(stderr,
+                   "[MoE-FWD] tokens=%u experts=%u "
+                   "router=%.3f dispatch_map=%.3f dispatch_gpu=%.3f "
+                   "experts=%.3f combine=%.3f\n",
+                   num_tokens,
+                   num_experts,
+                   static_cast<double>(ms_router),
+                   static_cast<double>(ms_dispatch_map),
+                   static_cast<double>(ms_dispatch_gpu),
+                   static_cast<double>(ms_experts),
+                   static_cast<double>(ms_combine));
+      cudaEventDestroy(mt_ev_start);
+      cudaEventDestroy(mt_ev_router);
+      cudaEventDestroy(mt_ev_dispatch_map);
+      cudaEventDestroy(mt_ev_dispatch_gpu);
+      cudaEventDestroy(mt_ev_experts);
+      cudaEventDestroy(mt_ev_combine);
+    }
+#endif
+
+    // ---- Shared experts: run on full flat_input, add to combined
+    std::vector<CAIF_DeviceTensor> shared_outputs;
     if(_shared_experts.size()>0)
     {
-      if(training==true)
-      {
-        _cached_shared_outputs.clear();
-        _cached_shared_outputs.reserve(_shared_experts.size());
-      }
-
+      shared_outputs.reserve(_shared_experts.size());
       for(size_t i=0;i<_shared_experts.size();++i)
       {
-        CAIF_DeviceTensor shared_out=_shared_experts[i]->Forward(flat_input,training);
-
-        if(training==true)
-        {
-          _cached_shared_outputs.push_back(shared_out.Clone());
-        }
-
-        // Add shared expert output to combined output
-        // Output = routed_output + shared_output (for each shared expert)
-        CAIF_DeviceOps::Add(combined,shared_out,combined);
+        CAIF_DeviceTensor s=_shared_experts[i]->Forward(flat_input,ctx);
+        CAIF_Ops::Add(combined,s,combined);
+        shared_outputs.push_back(std::move(s));
       }
     }
 
-    // Reshape back to original shape if needed
-    if(shape.size()==3)
+    // ---- Aux losses (training only)
+    _last_balance_loss=0.0f;
+    _last_z_loss=0.0f;
+    _cached_logsumexp=CAIF_DeviceTensor();
+
+    if(ctx.Training()==true)
     {
-      combined.Reshape({batch_size,seq_len,_config.input_dim});
-    }
-
-    // Compute auxiliary losses
-    float balance_loss=0.0f;
-    float z_loss=0.0f;
-
-    if(training==true&&_config.balance_loss_weight>0.0f)
-    {
-      balance_loss=ComputeBalanceLoss(_cached_router_output.router_probs,
-                                       _cached_router_output.expert_indices);
-    }
-
-    if(training==true&&_config.z_loss_weight>0.0f)
-    {
-      z_loss=ComputeZLoss(_cached_router_output.router_logits);
-    }
-
-    // Compute expert token counts
-    CAIF_DeviceTensor expert_counts=CAIF_DeviceTensor::Uninitialized({_config.num_experts},*_stream);
-    std::vector<float> counts_host(_config.num_experts);
-    for(uint32_t i=0;i<_config.num_experts;++i)
-    {
-      counts_host[i]=static_cast<float>(_cached_token_counts[i]);
-    }
-    expert_counts.CopyFromHost(counts_host.data(),counts_host.size());
-
-    MoEOutput_t moe_output;
-    moe_output.output=std::move(combined);
-    moe_output.balance_loss=balance_loss;
-    moe_output.z_loss=z_loss;
-    moe_output.expert_counts=std::move(expert_counts);
-
-    return moe_output;
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-CAIF_DeviceTensor CAIF_DeviceMoELayer::Forward(const CAIF_DeviceTensor &input,bool training)
-{
-  try
-  {
-    MoEOutput_t output=ForwardMoE(input,training);
-    return std::move(output.output);
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-std::vector<CAIF_DeviceTensor> CAIF_DeviceMoELayer::DispatchTokens(const CAIF_DeviceTensor &input,
-                                                                  const CAIF_DeviceTensor &expert_indices,
-                                                                  std::vector<uint32_t> &token_counts)
-{
-  try
-  {
-    // input: [num_tokens, dim]
-    // expert_indices: [num_tokens, top_k]
-    const uint32_t num_tokens=input.Shape()[0];
-    const uint32_t dim=input.Shape()[1];
-
-    // Compute expert capacity
-    // capacity = (tokens_per_batch / num_experts) * capacity_factor * top_k
-    const uint32_t capacity=static_cast<uint32_t>(
-      std::ceil(static_cast<float>(num_tokens)/_config.num_experts*_config.capacity_factor*_config.top_k));
-
-    // Count tokens per expert from indices (respecting capacity based on strategy)
-    token_counts.resize(_config.num_experts,0);
-
-    // Copy indices to host for counting
-    std::vector<float> indices_float(num_tokens*_config.top_k);
-    expert_indices.CopyToHost(indices_float.data());
-
-    // Track which tokens overflow (for NoOp and Redistribute strategies)
-    _overflow_tokens.clear();
-
-    // First pass: count tokens per expert with overflow handling
-    for(uint32_t t=0;t<num_tokens;++t)
-    {
-      for(uint32_t k=0;k<_config.top_k;++k)
+      if(_balance_loss_weight>0.0f)
       {
-        const int32_t expert_idx=static_cast<int32_t>(indices_float[t*_config.top_k+k]);
-        if(expert_idx>=0&&expert_idx<static_cast<int32_t>(_config.num_experts))
-        {
-          if(token_counts[expert_idx]<capacity)
-          {
-            ++token_counts[expert_idx];
-          }
-          else
-          {
-            // Handle overflow based on strategy
-            switch(_config.overflow_strategy)
-            {
-              case OverflowStrategy_e::Drop:
-                // Token is simply not processed by this expert
-                break;
-
-              case OverflowStrategy_e::NoOp:
-                // Track overflow token for passthrough
-                _overflow_tokens.push_back(t);
-                break;
-
-              case OverflowStrategy_e::Redistribute:
-                // Try to find next-best expert with capacity
-                // Look at remaining experts in the top_k list
-                for(uint32_t k2=k+1;k2<_config.top_k;++k2)
-                {
-                  const int32_t alt_idx=static_cast<int32_t>(indices_float[t*_config.top_k+k2]);
-                  if(alt_idx>=0&&alt_idx<static_cast<int32_t>(_config.num_experts))
-                  {
-                    if(token_counts[alt_idx]<capacity)
-                    {
-                      ++token_counts[alt_idx];
-                      break;
-                    }
-                  }
-                }
-                break;
-            }
-          }
-        }
+        _last_balance_loss=ComputeBalanceLoss(r.router_probs);
       }
-    }
-
-    // Allocate expert input tensors based on actual counts
-    std::vector<CAIF_DeviceTensor> expert_inputs;
-    expert_inputs.reserve(_config.num_experts);
-
-    for(uint32_t i=0;i<_config.num_experts;++i)
-    {
-      if(token_counts[i]>0)
+      if(_z_loss_weight>0.0f)
       {
-        expert_inputs.push_back(CAIF_DeviceTensor::Uninitialized({token_counts[i],dim},*_stream));
-      }
-      else
-      {
-        expert_inputs.push_back(CAIF_DeviceTensor());
+        _last_z_loss=ComputeZLoss(r.router_logits);
       }
     }
 
-    // Use CAIF_DeviceOps for actual dispatch
-    CAIF_DeviceOps::MoEDispatch(input,expert_indices,_config.top_k,token_counts,expert_inputs);
-
-    return expert_inputs;
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-CAIF_DeviceTensor CAIF_DeviceMoELayer::CombineOutputs(const std::vector<CAIF_DeviceTensor> &expert_outputs,
-                                                     const CAIF_DeviceTensor &expert_indices,
-                                                     const CAIF_DeviceTensor &expert_weights,
-                                                     const std::vector<uint32_t> &token_counts,
-                                                     uint32_t num_tokens)
-{
-  try
-  {
-    // Combine expert outputs back to original token positions with routing weights
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Zeros({num_tokens,_config.input_dim},*_stream);
-
-    // Use CAIF_DeviceOps for actual combine
-    CAIF_DeviceOps::MoECombine(expert_outputs,
-                              expert_indices,
-                              expert_weights,
-                              _config.top_k,
-                              token_counts,
-                              output);
-
-    return output;
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-float CAIF_DeviceMoELayer::ComputeBalanceLoss(const CAIF_DeviceTensor &router_probs,
-                                              const CAIF_DeviceTensor &/*expert_indices*/)
-{
-  try
-  {
-    // Load balancing loss: L_balance = α * n * Σᵢ(fᵢ * Pᵢ)
-    // fᵢ = fraction of tokens routed to expert i
-    // Pᵢ = mean routing probability for expert i
-
-    const uint32_t num_tokens=router_probs.Shape()[0];
-
-    // Compute fraction of tokens per expert
-    std::vector<float> fractions(_config.num_experts,0.0f);
-    float total_assignments=static_cast<float>(num_tokens*_config.top_k);
-
-    for(uint32_t i=0;i<_config.num_experts;++i)
+    // ---- Commit caches for backward
+    // BackwardImpl reads `_ws_expert_output_buffer` directly (the packed
+    // workspace ForwardInto wrote into above) plus `_cached_routing`
+    // and `_cached_token_counts`. The `expert_outputs` vector is a
+    // forward-local list of non-owning views and is intentionally NOT
+    // cached — caching the views would just duplicate pointers into the
+    // same workspace, and dropping it lets the views' destructors run
+    // (they don't free anything, they just zero out their device-pointer
+    // fields, which is correct now that forward is done with them).
+    if(ctx.Training()==true)
     {
-      fractions[i]=static_cast<float>(_cached_token_counts[i])/total_assignments;
+      _cached_routing=std::move(routing);
     }
+    (void)expert_outputs;
 
-    // Compute mean probability per expert
-    std::vector<float> mean_probs(_config.num_experts,0.0f);
-    CAIF_DeviceTensor sum_probs=CAIF_DeviceTensor::Uninitialized({_config.num_experts},*_stream);
-    CAIF_DeviceOps::SumAxis(router_probs,0,sum_probs);
-
-    std::vector<float> sum_probs_host(_config.num_experts);
-    sum_probs.CopyToHost(sum_probs_host.data());
-
-    for(uint32_t i=0;i<_config.num_experts;++i)
+    if(in_shape.size()==3)
     {
-      mean_probs[i]=sum_probs_host[i]/static_cast<float>(num_tokens);
+      combined.Reshape({batch_size,seq_len,_input_dim});
     }
-
-    // Compute loss
-    float loss=0.0f;
-    for(uint32_t i=0;i<_config.num_experts;++i)
-    {
-      loss+=fractions[i]*mean_probs[i];
-    }
-
-    return _config.balance_loss_weight*static_cast<float>(_config.num_experts)*loss;
+    return combined;
   }
   CAIF_CATCH_BLOCK()
 }
 
-float CAIF_DeviceMoELayer::ComputeZLoss(const CAIF_DeviceTensor &router_logits)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)
 {
   try
   {
-    // Router z-loss: L_z = β * (1/n) * Σᵢ(log Σⱼ exp(rᵢⱼ))²
-    // Stabilizes router logits by penalizing large values
-
-    const uint32_t num_tokens=router_logits.Shape()[0];
-
-    // Compute log-sum-exp per token
-    CAIF_DeviceTensor logsumexp=CAIF_DeviceTensor::Uninitialized({num_tokens},*_stream);
-    CAIF_DeviceOps::LogSumExp(router_logits,logsumexp);
-
-    // Square the log-sum-exp values
-    CAIF_DeviceTensor logsumexp_sq=CAIF_DeviceTensor::Uninitialized({num_tokens},*_stream);
-    CAIF_DeviceOps::Multiply(logsumexp,logsumexp,logsumexp_sq);
-
-    // Sum and average
-    CAIF_DeviceTensor total=CAIF_DeviceTensor::Uninitialized({1},*_stream);
-    CAIF_DeviceOps::Sum(logsumexp_sq,total);
-
-    float total_host=0.0f;
-    total.CopyToHost(&total_host);
-
-    return _config.z_loss_weight*total_host/static_cast<float>(num_tokens);
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-CAIF_DeviceTensor CAIF_DeviceMoELayer::Backward(const CAIF_DeviceTensor &grad_output)
-{
-  try
-  {
-    // grad_output: [batch, seq_len, dim] or [num_tokens, dim]
-    const auto &shape=grad_output.Shape();
+    const auto &g_shape=grad_output.Shape();
     uint32_t num_tokens=0;
+    uint32_t flat_dim=0;
 
-    // Clone for potential reshape
-    CAIF_DeviceTensor flat_grad=grad_output.Clone();
-
-    if(shape.size()==2)
+    if(g_shape.size()==2)
     {
-      num_tokens=shape[0];
+      num_tokens=g_shape[0];
+      flat_dim=g_shape[1];
     }
-    else if(shape.size()==3)
+    else if(g_shape.size()==3)
     {
-      num_tokens=shape[0]*shape[1];
-      flat_grad.Reshape({num_tokens,shape[2]});
+      num_tokens=g_shape[0]*g_shape[1];
+      flat_dim=g_shape[2];
     }
     else
     {
       THROW_CAIFE("MoELayer::Backward: expected grad shape [N, dim] or [batch, seq, dim]");
     }
 
-    // Backward through combine: distribute gradients to experts
-    std::vector<CAIF_DeviceTensor> grad_expert_outputs;
-    CAIF_DeviceTensor grad_weights;
+    CAIF_DeviceTensor flat_grad=CAIF_DeviceTensor::WrapView(
+      const_cast<void*>(grad_output.DeviceDataRaw()),
+      {num_tokens,flat_dim},
+      Stream(),
+      grad_output.Dtype());
 
-    CAIF_DeviceOps::MoECombineBackward(flat_grad,
-                                       _cached_expert_outputs,
-                                       _cached_router_output.expert_indices,
-                                       _cached_router_output.expert_weights,
-                                       _config.top_k,
-                                       _cached_token_counts,
-                                       grad_expert_outputs,
-                                       grad_weights);
+    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
+    const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &r=_cached_routing;
 
-    // Backward through each expert
-    std::vector<CAIF_DeviceTensor> grad_expert_inputs;
-    grad_expert_inputs.reserve(_config.num_experts);
-
-    for(uint32_t i=0;i<_config.num_experts;++i)
+    // ---- GPU combine/dispatch backward using workspace buffers
+    //
+    //   Forward left _ws_expert_output_buffer populated with per-expert outputs
+    //   concatenated by expert_offsets, and _ws_dispatch_map / _ws_expert_offsets
+    //   describing the token-to-slot mapping. MoECombineBackwardGPU scatters
+    //   grad_output into the grad_expert_output buffer and computes grad_weights
+    //   in one kernel pair, fully on device. After per-expert Backward fills the
+    //   grad_expert_input buffer, MoEDispatchBackwardGPU gathers per-token input
+    //   gradients from it. This replaces the old host-roundtrip MoECombineBackward
+    //   / MoEDispatchBackward path.
+    uint32_t total_assigned=0;
+    for(uint32_t e=0;e<num_experts;++e)
     {
-      if(_cached_token_counts[i]>0)
-      {
-        CAIF_DeviceTensor grad_in=_experts[i]->Backward(grad_expert_outputs[i]);
-        grad_expert_inputs.push_back(std::move(grad_in));
-      }
-      else
-      {
-        grad_expert_inputs.push_back(CAIF_DeviceTensor());
-      }
+      total_assigned+=_cached_token_counts[e];
+    }
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const size_t elem_bytes=CAIF_DataType(sd).ElementSizeBytes();
+    const uint32_t buf_rows=std::max<uint32_t>(total_assigned,1u);
+    if(_ws_grad_expert_output_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
+       ||_ws_grad_expert_output_buffer.Dtype()!=sd)
+    {
+      _ws_grad_expert_output_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+    }
+    if(_ws_grad_expert_input_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
+       ||_ws_grad_expert_input_buffer.Dtype()!=sd)
+    {
+      _ws_grad_expert_input_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
     }
 
-    // Backward through dispatch: combine gradients back to original positions
-    CAIF_DeviceTensor grad_input_from_experts=CAIF_DeviceTensor::Zeros({num_tokens,_config.input_dim},*_stream);
-    CAIF_DeviceOps::MoEDispatchBackward(grad_expert_inputs,
-                                        _cached_router_output.expert_indices,
-                                        _config.top_k,
-                                        _cached_token_counts,
-                                        grad_input_from_experts);
+    CAIF_DeviceTensor grad_weights=CAIF_DeviceTensor::Zeros({num_tokens,_top_k},Stream(),sd);
 
-    // Backward through router
-    CAIF_DeviceTensor grad_input_from_router=_router->BackwardRouting(grad_weights);
-
-    // Combine gradients from routed experts and router
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_config.input_dim},*_stream);
-    CAIF_DeviceOps::Add(grad_input_from_experts,grad_input_from_router,grad_input);
-
-    // Backward through shared experts
-    // Shared experts receive the same gradient as the combined output (since output = routed + shared)
-    if(_shared_experts.size()>0)
+    if(total_assigned>0)
     {
-      for(size_t i=0;i<_shared_experts.size();++i)
-      {
-        CAIF_DeviceTensor grad_from_shared=_shared_experts[i]->Backward(flat_grad);
-        // Add gradient contribution from shared expert
-        CAIF_DeviceOps::Add(grad_input,grad_from_shared,grad_input);
-      }
+      CAIF_Ops::MoECombineBackwardGPU(flat_grad,
+                                            _ws_expert_output_buffer,
+                                            r.expert_indices,
+                                            r.expert_weights,
+                                            _ws_dispatch_map,
+                                            _ws_expert_offsets,
+                                            _top_k,
+                                            _ws_grad_expert_output_buffer,
+                                            grad_weights);
     }
 
-    // Reshape if needed
-    if(shape.size()==3)
+    // ---- Per-expert Backward: slice grad_output buffer, run expert Backward,
+    //      copy result into grad_input buffer at the same offset.
+    std::vector<int32_t> offsets_host(num_experts+1,0);
+    for(uint32_t e=0;e<num_experts;++e)
     {
-      grad_input.Reshape({shape[0],shape[1],shape[2]});
+      offsets_host[e+1]=offsets_host[e]+static_cast<int32_t>(_cached_token_counts[e]);
+    }
+
+    for(uint32_t i=0;i<num_experts;++i)
+    {
+      const uint32_t cnt=_cached_token_counts[i];
+      if(cnt==0)
+      {
+        continue;
+      }
+      const uint32_t off=static_cast<uint32_t>(offsets_host[i]);
+      uint8_t *g_out_ptr_bytes=static_cast<uint8_t*>(_ws_grad_expert_output_buffer.DeviceDataRaw())
+                               +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      CAIF_DeviceTensor g_out_view=CAIF_DeviceTensor::WrapView(g_out_ptr_bytes,
+                                                                {cnt,_input_dim},
+                                                                Stream(),
+                                                                _ws_grad_expert_output_buffer.Dtype());
+      CAIF_DeviceTensor g_in=_experts[i]->Backward(g_out_view,ctx);
+#ifdef USE_CAIF_CUDA
+      uint8_t *g_in_ptr_bytes=static_cast<uint8_t*>(_ws_grad_expert_input_buffer.DeviceDataRaw())
+                              +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      cudaMemcpyAsync(g_in_ptr_bytes,
+                      g_in.DeviceDataRaw(),
+                      static_cast<size_t>(cnt)*_input_dim*elem_bytes,
+                      cudaMemcpyDeviceToDevice,
+                      Stream().Handle());
+#endif
+    }
+
+    // ---- Dispatch backward -> grad_input_from_experts
+    CAIF_DeviceTensor grad_input_from_experts=CAIF_DeviceTensor::Zeros({num_tokens,_input_dim},Stream(),sd);
+    if(total_assigned>0)
+    {
+      CAIF_Ops::MoEDispatchBackwardGPU(_ws_grad_expert_input_buffer,
+                                             r.expert_indices,
+                                             _ws_dispatch_map,
+                                             _ws_expert_offsets,
+                                             _top_k,
+                                             grad_input_from_experts);
+    }
+
+    // ---- Aux-loss gradient injection via router backward.
+    //
+    //   L_balance = bw * E * sum_e(f_e * P_e),  f_e = count[e] / (N*K)
+    //   dL_balance / dprobs_{t,e} = bw * E * count[e] / (N^2 * K)
+    //     — constant per expert column, uploaded as an [E]-shaped bias.
+    //
+    //   L_z = zw * (1/N) * sum_t (logsumexp_t)^2
+    //   dL_z / dlogit_{t,e} = (2 * zw / N) * logsumexp_t * probs_{t,e}
+    //     — row-broadcast multiply-add in the aux-aware router backward.
+    CAIF_DeviceTensor balance_bias;
+    CAIF_DeviceTensor z_logsumexp_scaled;
+
+    if(_balance_loss_weight>0.0f)
+    {
+      const float denom=static_cast<float>(num_tokens)*
+                         static_cast<float>(num_tokens)*
+                         static_cast<float>(_top_k);
+      const float scale=_balance_loss_weight*static_cast<float>(num_experts)/denom;
+      std::vector<float> balance_bias_host(num_experts);
+      for(uint32_t e=0;e<num_experts;++e)
+      {
+        balance_bias_host[e]=scale*static_cast<float>(_cached_token_counts[e]);
+      }
+      // Allocate the destination tensor at StorageT directly and upload
+      // host-side fp32 with conversion at the boundary — no device-side
+      // fp32 staging tensor.
+      balance_bias=CAIF_DeviceTensor::Uninitialized({num_experts},Stream(),sd);
+      balance_bias.CopyFromHostFp32(balance_bias_host.data(),balance_bias_host.size());
+    }
+
+    if(_z_loss_weight>0.0f&&_cached_logsumexp.Shape().size()>0)
+    {
+      const float scale=2.0f*_z_loss_weight/static_cast<float>(num_tokens);
+      z_logsumexp_scaled=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
+      CAIF_Ops::Scale(_cached_logsumexp,scale,z_logsumexp_scaled);
+    }
+
+    CAIF_DeviceTensor grad_input_from_router=_router->BackwardRoutingAuxAware(grad_weights,
+                                                                               balance_bias,
+                                                                               z_logsumexp_scaled,
+                                                                               ctx);
+
+    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_input_dim},Stream(),sd);
+    CAIF_Ops::Add(grad_input_from_experts,grad_input_from_router,grad_input);
+
+    // ---- Shared experts backward: they saw flat_grad as their grad_output.
+    for(size_t i=0;i<_shared_experts.size();++i)
+    {
+      CAIF_DeviceTensor gs=_shared_experts[i]->Backward(flat_grad,ctx);
+      CAIF_Ops::Add(grad_input,gs,grad_input);
+    }
+
+    if(g_shape.size()==3)
+    {
+      grad_input.Reshape({g_shape[0],g_shape[1],g_shape[2]});
     }
     return grad_input;
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceMoELayer::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeBalanceLoss(const CAIF_DeviceTensor &router_probs)
+{
+  try
+  {
+    const uint32_t num_tokens=router_probs.Shape()[0];
+    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
+    const float total_assignments=static_cast<float>(num_tokens)*static_cast<float>(_top_k);
+
+    std::vector<float> fractions(num_experts,0.0f);
+    for(uint32_t i=0;i<num_experts;++i)
+    {
+      fractions[i]=static_cast<float>(_cached_token_counts[i])/total_assignments;
+    }
+
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    CAIF_DeviceTensor sum_probs=CAIF_DeviceTensor::Uninitialized({num_experts},Stream(),sd);
+    CAIF_Ops::SumAxis(router_probs,0,sum_probs);
+
+    std::vector<float> sum_probs_host(num_experts);
+    if(sd==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      sum_probs.CopyToHost(sum_probs_host.data());
+    }
+    else
+    {
+      CAIF_DeviceTensor sum_probs_fp32=sum_probs.To(CAIF_DataType::CAIF_DataType_e::Float32);
+      sum_probs_fp32.CopyToHost(sum_probs_host.data());
+    }
+
+    float loss=0.0f;
+    for(uint32_t i=0;i<num_experts;++i)
+    {
+      const float mean_p=sum_probs_host[i]/static_cast<float>(num_tokens);
+      loss+=fractions[i]*mean_p;
+    }
+    return _balance_loss_weight*static_cast<float>(num_experts)*loss;
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeZLoss(const CAIF_DeviceTensor &router_logits)
+{
+  try
+  {
+    const uint32_t num_tokens=router_logits.Shape()[0];
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+
+    _cached_logsumexp=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
+    CAIF_Ops::LogSumExp(router_logits,_cached_logsumexp);
+
+    CAIF_DeviceTensor logsumexp_sq=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
+    CAIF_Ops::Multiply(_cached_logsumexp,_cached_logsumexp,logsumexp_sq);
+
+    // Sum is an atomicAdd accumulator — must start from zero, not
+    // uninitialized memory. Uninitialized garbage was getting added
+    // into the result, producing huge values (e.g. -2.4e24 at bf16
+    // storage on layer 2 in the DSv2-Lite full-depth smoke).
+    CAIF_DeviceTensor total=CAIF_DeviceTensor::Zeros({1},Stream(),sd);
+    CAIF_Ops::Sum(logsumexp_sq,total);
+
+    float total_host=0.0f;
+    if(sd==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      total.CopyToHost(&total_host);
+    }
+    else
+    {
+      CAIF_DeviceTensor total_fp32=total.To(CAIF_DataType::CAIF_DataType_e::Float32);
+      total_fp32.CopyToHost(&total_host);
+    }
+
+    return _z_loss_weight*total_host/static_cast<float>(num_tokens);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoELayer<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
     _router->ZeroGradients();
-    for(auto &expert:_experts)
+    for(auto &e:_experts)
     {
-      expert->ZeroGradients();
+      e->ZeroGradients();
     }
-    for(auto &shared:_shared_experts)
+    for(auto &s:_shared_experts)
     {
-      shared->ZeroGradients();
+      s->ZeroGradients();
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceMoELayer::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensorCount()const
 {
   size_t count=_router->ParameterTensorCount();
-  for(const auto &expert:_experts)
+  for(const auto &e:_experts)
   {
-    count+=expert->ParameterTensorCount();
+    count+=e->ParameterTensorCount();
   }
-  for(const auto &shared:_shared_experts)
+  for(const auto &s:_shared_experts)
   {
-    count+=shared->ParameterTensorCount();
+    count+=s->ParameterTensorCount();
   }
   return count;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMoELayer::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
-  // Router parameters first
   size_t router_count=_router->ParameterTensorCount();
   if(index<router_count)
   {
@@ -704,39 +946,36 @@ CAIF_DeviceTensor &CAIF_DeviceMoELayer::ParameterTensor(size_t index)
   }
   index-=router_count;
 
-  // Then routed expert parameters
-  for(auto &expert:_experts)
+  for(auto &e:_experts)
   {
-    size_t expert_count=expert->ParameterTensorCount();
-    if(index<expert_count)
+    size_t n=e->ParameterTensorCount();
+    if(index<n)
     {
-      return expert->ParameterTensor(index);
+      return e->ParameterTensor(index);
     }
-    index-=expert_count;
+    index-=n;
   }
-
-  // Then shared expert parameters
-  for(auto &shared:_shared_experts)
+  for(auto &s:_shared_experts)
   {
-    size_t shared_count=shared->ParameterTensorCount();
-    if(index<shared_count)
+    size_t n=s->ParameterTensorCount();
+    if(index<n)
     {
-      return shared->ParameterTensor(index);
+      return s->ParameterTensor(index);
     }
-    index-=shared_count;
+    index-=n;
   }
-
   THROW_CAIFE("MoELayer::ParameterTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMoELayer::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
   return const_cast<CAIF_DeviceMoELayer*>(this)->ParameterTensor(index);
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMoELayer::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::GradientTensor(size_t index)
 {
-  // Router gradients first
   size_t router_count=_router->ParameterTensorCount();
   if(index<router_count)
   {
@@ -744,96 +983,98 @@ CAIF_DeviceTensor &CAIF_DeviceMoELayer::GradientTensor(size_t index)
   }
   index-=router_count;
 
-  // Then routed expert gradients
-  for(auto &expert:_experts)
+  for(auto &e:_experts)
   {
-    size_t expert_count=expert->ParameterTensorCount();
-    if(index<expert_count)
+    size_t n=e->ParameterTensorCount();
+    if(index<n)
     {
-      return expert->GradientTensor(index);
+      return e->GradientTensor(index);
     }
-    index-=expert_count;
+    index-=n;
   }
-
-  // Then shared expert gradients
-  for(auto &shared:_shared_experts)
+  for(auto &s:_shared_experts)
   {
-    size_t shared_count=shared->ParameterTensorCount();
-    if(index<shared_count)
+    size_t n=s->ParameterTensorCount();
+    if(index<n)
     {
-      return shared->GradientTensor(index);
+      return s->GradientTensor(index);
     }
-    index-=shared_count;
+    index-=n;
   }
-
   THROW_CAIFE("MoELayer::GradientTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMoELayer::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   return const_cast<CAIF_DeviceMoELayer*>(this)->GradientTensor(index);
 }
 
-size_t CAIF_DeviceMoELayer::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMoELayer<ComputeT,StorageT>::TotalParameterCount()const
 {
   size_t count=_router->TotalParameterCount();
-  for(const auto &expert:_experts)
+  for(const auto &e:_experts)
   {
-    count+=expert->TotalParameterCount();
+    count+=e->TotalParameterCount();
   }
-  for(const auto &shared:_shared_experts)
+  for(const auto &s:_shared_experts)
   {
-    count+=shared->TotalParameterCount();
+    count+=s->TotalParameterCount();
   }
   return count;
 }
 
-std::string CAIF_DeviceMoELayer::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceMoELayer<ComputeT,StorageT>::Description()const
 {
   std::string desc="MoELayer[";
-  desc+=std::to_string(_config.input_dim)+"->"+std::to_string(_config.hidden_dim);
+  desc+=std::to_string(_input_dim)+"->"+std::to_string(_hidden_dim);
   desc+=",experts="+std::to_string(_experts.size());
-  if(_config.num_shared_experts>0)
+  if(_shared_experts.size()>0)
   {
-    desc+=",shared="+std::to_string(_config.num_shared_experts);
+    desc+=",shared="+std::to_string(_shared_experts.size());
   }
-  desc+=",top_k="+std::to_string(_config.top_k);
-  if(_config.expert_use_gated==true)
-  {
-    desc+=",gated";
-  }
-  if(_config.fine_grained==true)
-  {
-    desc+=",fine_grained("+std::to_string(_config.fine_grained_factor)+"x)";
-  }
-  desc+=",cap="+std::to_string(_config.capacity_factor);
+  desc+=",top_k="+std::to_string(_top_k);
+  desc+=",cap="+std::to_string(_capacity_factor);
   desc+="]";
   return desc;
 }
 
-std::vector<std::string> CAIF_DeviceMoELayer::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string> CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   std::vector<std::string> names;
 
-  // Router parameters
   std::vector<std::string> router_names=_router->ParameterNames(prefix+"router.");
   names.insert(names.end(),router_names.begin(),router_names.end());
 
-  // Routed expert parameters
   for(size_t i=0;i<_experts.size();++i)
   {
     std::string expert_prefix=prefix+"expert_"+std::to_string(i)+".";
-    std::vector<std::string> expert_names=_experts[i]->ParameterNames(expert_prefix);
-    names.insert(names.end(),expert_names.begin(),expert_names.end());
+    std::vector<std::string> en=_experts[i]->ParameterNames(expert_prefix);
+    names.insert(names.end(),en.begin(),en.end());
   }
 
-  // Shared expert parameters
   for(size_t i=0;i<_shared_experts.size();++i)
   {
     std::string shared_prefix=prefix+"shared_expert_"+std::to_string(i)+".";
-    std::vector<std::string> shared_names=_shared_experts[i]->ParameterNames(shared_prefix);
-    names.insert(names.end(),shared_names.begin(),shared_names.end());
+    std::vector<std::string> sn=_shared_experts[i]->ParameterNames(shared_prefix);
+    names.insert(names.end(),sn.begin(),sn.end());
   }
-
   return names;
 }
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceMoELayer<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceMoELayer<float,__half>;
+template class CAIF_DeviceMoELayer<float,__nv_bfloat16>;
+template class CAIF_DeviceMoELayer<__half,float>;
+template class CAIF_DeviceMoELayer<__half,__half>;
+template class CAIF_DeviceMoELayer<__half,__nv_bfloat16>;
+template class CAIF_DeviceMoELayer<__nv_bfloat16,float>;
+template class CAIF_DeviceMoELayer<__nv_bfloat16,__half>;
+template class CAIF_DeviceMoELayer<__nv_bfloat16,__nv_bfloat16>;
+#endif
+
+}//end instance namespace

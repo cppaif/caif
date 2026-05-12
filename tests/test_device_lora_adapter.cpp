@@ -14,10 +14,12 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Test: CAIF_DeviceLoRAAdapter (LoRA low-rank adapter)
+// Test: CAIF_DeviceLoRAAdapter<float,float> (LoRA low-rank adapter)
 //------------------------------------------------------------------------------
 #include "caif_device_lora_adapter.h"
+#include "caif_test_harness.h"
 #include "caif_device_frozen_linear.h"
+#include "caif_int4_packed_t.h"
 #include "caif_device_dense_layer.h"
 #include "caif_device_pre_norm_block.h"
 #include "caif_device_rmsnorm.h"
@@ -26,6 +28,7 @@
 #include "caif_cuda_kernels.h"
 #include "caif_constants.h"
 #include "caif_exception.h"
+#include "caif_run_context.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
@@ -35,21 +38,9 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    ISE_Out::Out()<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    ISE_Out::Out()<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -63,10 +54,9 @@ static const float g_test_alpha=8.0f;
 //------------------------------------------------------------------------------
 // Helper: create a LoRA adapter wrapping a FP32 FrozenLinear
 //------------------------------------------------------------------------------
-static CAIF_DeviceLoRAAdapter MakeLoRA(CAIF_CudaStream &stream,uint32_t seed=42)
+static CAIF_DeviceLoRAAdapter<float,float> MakeLoRA(CAIF_CudaStream &stream,uint32_t seed=42)
 {
-  auto frozen=std::make_unique<CAIF_DeviceFrozenLinear>(g_test_input_dim,g_test_output_dim,
-                                                       CAIF_DataType::CAIF_DataType_e::Float32,stream);
+  auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<float,float>>(g_test_input_dim,g_test_output_dim,stream);
   // Load random weights
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-0.5f,0.5f);
@@ -80,13 +70,13 @@ static CAIF_DeviceLoRAAdapter MakeLoRA(CAIF_CudaStream &stream,uint32_t seed=42)
                                                           {g_test_input_dim,g_test_output_dim},stream);
   frozen->LoadFromTensor(std::move(weight));
 
-  CAIF_DeviceLoRAAdapter::LoRAConfig_t config;
+  CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t config;
   config.rank=g_test_rank;
   config.alpha=g_test_alpha;
   config.input_dim=g_test_input_dim;
   config.output_dim=g_test_output_dim;
 
-  return CAIF_DeviceLoRAAdapter(config,std::move(frozen),stream,seed+1);
+  return CAIF_DeviceLoRAAdapter<float,float>(config,std::move(frozen),stream,seed+1);
 }
 
 //------------------------------------------------------------------------------
@@ -112,12 +102,16 @@ static void TestForwardShape()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=lora.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -129,11 +123,7 @@ static void TestForwardShape()
     }
     ReportResult("LoRAAdapter::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -144,12 +134,16 @@ static void TestForwardFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=lora.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -164,11 +158,7 @@ static void TestForwardFinite()
     }
     ReportResult("LoRAAdapter::ForwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ForwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ForwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -181,35 +171,37 @@ static void TestZeroInitBMatchesBase()
     CAIF_CudaStream stream;
 
     // Create frozen linear
-    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear>(g_test_input_dim,g_test_output_dim,
-                                                         CAIF_DataType::CAIF_DataType_e::Float32,stream);
+    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<float,float>>(g_test_input_dim,g_test_output_dim,stream);
     std::vector<float> w(static_cast<size_t>(g_test_input_dim)*g_test_output_dim,0.1f);
     CAIF_DeviceTensor weight=CAIF_DeviceTensor::FromHostData(w.data(),
                                                             {g_test_input_dim,g_test_output_dim},stream);
 
     // Get base output before wrapping
-    CAIF_DeviceFrozenLinear frozen_copy(g_test_input_dim,g_test_output_dim,
-                                       CAIF_DataType::CAIF_DataType_e::Float32,stream);
+    CAIF_DeviceFrozenLinear<float,float> frozen_copy(g_test_input_dim,g_test_output_dim,stream);
     CAIF_DeviceTensor w_copy=CAIF_DeviceTensor::FromHostData(w.data(),
                                                             {g_test_input_dim,g_test_output_dim},stream);
     frozen_copy.LoadFromTensor(std::move(w_copy));
 
     frozen->LoadFromTensor(std::move(weight));
 
-    CAIF_DeviceLoRAAdapter::LoRAConfig_t config;
+    CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t config;
     config.rank=g_test_rank;
     config.alpha=g_test_alpha;
     config.input_dim=g_test_input_dim;
     config.output_dim=g_test_output_dim;
 
-    CAIF_DeviceLoRAAdapter lora(config,std::move(frozen),stream,42);
+    CAIF_DeviceLoRAAdapter<float,float> lora(config,std::move(frozen),stream,42);
 
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim,777);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
 
-    CAIF_DeviceTensor base_out=frozen_copy.Forward(input,false);
-    CAIF_DeviceTensor lora_out=lora.Forward(input,false);
+    CAIF_DeviceTensor base_out=frozen_copy.Forward(input,ctx);
+    CAIF_DeviceTensor lora_out=lora.Forward(input,ctx);
 
     CAIF_HostTensor h_base=base_out.ToHost();
     CAIF_HostTensor h_lora=lora_out.ToHost();
@@ -228,11 +220,7 @@ static void TestZeroInitBMatchesBase()
     }
     ReportResult("LoRAAdapter::ZeroInitBMatchesBase",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ZeroInitBMatchesBase",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ZeroInitBMatchesBase")
 }
 
 //------------------------------------------------------------------------------
@@ -243,7 +231,7 @@ static void TestParameterTensorCount()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     bool passed=lora.ParameterTensorCount()==2;
     if(passed==false)
@@ -252,11 +240,7 @@ static void TestParameterTensorCount()
     }
     ReportResult("LoRAAdapter::ParameterTensorCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -267,7 +251,7 @@ static void TestTotalParameterCount()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     const size_t expected=static_cast<size_t>(g_test_rank)*g_test_input_dim+
                           static_cast<size_t>(g_test_output_dim)*g_test_rank;
@@ -278,11 +262,7 @@ static void TestTotalParameterCount()
     }
     ReportResult("LoRAAdapter::TotalParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::TotalParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::TotalParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -293,7 +273,7 @@ static void TestParameterNames()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto names=lora.ParameterNames("layer.");
     bool passed=true;
@@ -317,11 +297,7 @@ static void TestParameterNames()
     }
     ReportResult("LoRAAdapter::ParameterNames",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ParameterNames",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ParameterNames")
 }
 
 //------------------------------------------------------------------------------
@@ -332,17 +308,22 @@ static void TestBackwardFiniteInputGradients()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    lora.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    lora.Forward(input,ctx);
 
     std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                               {g_test_batch,g_test_output_dim},stream);
-    CAIF_DeviceTensor grad_input=lora.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=lora.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -362,11 +343,7 @@ static void TestBackwardFiniteInputGradients()
     }
     ReportResult("LoRAAdapter::BackwardFiniteInputGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::BackwardFiniteInputGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::BackwardFiniteInputGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -377,7 +354,7 @@ static void TestBackwardNonZeroLoRAGradients()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     // Set lora_b to non-zero so grad_lora_a is also non-zero
     // (when B=0, d_lora_hidden=grad@B=0, so grad_a=0 is mathematically correct)
@@ -385,15 +362,20 @@ static void TestBackwardNonZeroLoRAGradients()
     std::vector<float> b_data(b_count,0.1f);
     lora.ParameterTensor(1).CopyFromHost(b_data.data(),b_count);
 
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    lora.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    lora.Forward(input,ctx);
 
     std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                               {g_test_batch,g_test_output_dim},stream);
-    lora.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    lora.Backward(grad_out,ctx);
 
     bool passed=true;
     // Check both LoRA gradient tensors are non-zero
@@ -422,11 +404,7 @@ static void TestBackwardNonZeroLoRAGradients()
     }
     ReportResult("LoRAAdapter::BackwardNonZeroLoRAGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::BackwardNonZeroLoRAGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::BackwardNonZeroLoRAGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -437,17 +415,22 @@ static void TestZeroGradients()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    lora.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    lora.Forward(input,ctx);
 
     std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                               {g_test_batch,g_test_output_dim},stream);
-    lora.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    lora.Backward(grad_out,ctx);
     lora.ZeroGradients();
 
     bool passed=true;
@@ -470,11 +453,7 @@ static void TestZeroGradients()
     }
     ReportResult("LoRAAdapter::ZeroGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::ZeroGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::ZeroGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -485,7 +464,7 @@ static void TestDescription()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
     const std::string desc=lora.Description();
 
     bool passed=true;
@@ -501,11 +480,7 @@ static void TestDescription()
     }
     ReportResult("LoRAAdapter::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::Description")
 }
 
 //------------------------------------------------------------------------------
@@ -519,12 +494,16 @@ static void Test3DInputForwardShape()
     const uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceLoRAAdapter lora=MakeLoRA(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceLoRAAdapter<float,float> lora=MakeLoRA(stream);
 
     auto host_input=MakeRandomInput(batch*seq_len,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=lora.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -536,11 +515,7 @@ static void Test3DInputForwardShape()
     }
     ReportResult("LoRAAdapter::3DInputForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::3DInputForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::3DInputForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -552,8 +527,9 @@ static void TestLoRAWithFP16Frozen()
   {
     CAIF_CudaStream stream;
 
-    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear>(g_test_input_dim,g_test_output_dim,
-                                                         CAIF_DataType::CAIF_DataType_e::Float16,stream);
+    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<float,__half>>(g_test_input_dim,
+                                                                        g_test_output_dim,
+                                                                        stream);
     std::vector<float> w(static_cast<size_t>(g_test_input_dim)*g_test_output_dim);
     std::mt19937 gen(11);
     std::uniform_real_distribution<float> dist(-0.5f,0.5f);
@@ -566,18 +542,22 @@ static void TestLoRAWithFP16Frozen()
     CAIF_DeviceTensor fp16_w=fp32_w.To(CAIF_DataType::CAIF_DataType_e::Float16);
     frozen->LoadFromTensor(std::move(fp16_w));
 
-    CAIF_DeviceLoRAAdapter::LoRAConfig_t config;
+    CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t config;
     config.rank=g_test_rank;
     config.alpha=g_test_alpha;
     config.input_dim=g_test_input_dim;
     config.output_dim=g_test_output_dim;
 
-    CAIF_DeviceLoRAAdapter lora(config,std::move(frozen),stream,22);
+    CAIF_DeviceLoRAAdapter<float,float> lora(config,std::move(frozen),stream,22);
 
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=lora.Forward(input,true);
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -597,7 +577,8 @@ static void TestLoRAWithFP16Frozen()
       std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
       CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                                 {g_test_batch,g_test_output_dim},stream);
-      CAIF_DeviceTensor grad_input=lora.Backward(grad_out);
+      ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+      CAIF_DeviceTensor grad_input=lora.Backward(grad_out,ctx);
       CAIF_HostTensor h_grad=grad_input.ToHost();
       for(size_t i=0;i<h_grad.TotalElements();++i)
       {
@@ -611,11 +592,7 @@ static void TestLoRAWithFP16Frozen()
     }
     ReportResult("LoRAAdapter::LoRAWithFP16Frozen",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::LoRAWithFP16Frozen",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::LoRAWithFP16Frozen")
 }
 
 //------------------------------------------------------------------------------
@@ -628,9 +605,11 @@ static void TestLoRAWithINT4Frozen()
     const uint32_t group_size=g_caif_quant_default_group_size;
     CAIF_CudaStream stream;
 
-    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear>(g_test_input_dim,g_test_output_dim,
-                                                         CAIF_DataType::CAIF_DataType_e::Int4,
-                                                         stream,group_size);
+    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<float,caif_int4_packed_t>>(
+                                                            g_test_input_dim,
+                                                            g_test_output_dim,
+                                                            stream,
+                                                            group_size);
 
     const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
     std::vector<float> w(count);
@@ -650,9 +629,11 @@ static void TestLoRAWithINT4Frozen()
                                                      CAIF_DataType::CAIF_DataType_e::UInt8);
     CAIF_DeviceTensor scales=CAIF_DeviceTensor::Zeros({num_groups},stream,
                                                      CAIF_DataType::CAIF_DataType_e::Float16);
-    launch_quantize_to_int4(static_cast<const float*>(fp32_w.DevicePtr()),
-                             packed.DevicePtr(),
-                             scales.DevicePtr(),
+    // scales is fp16 storage; route through DeviceDataRaw to bypass the
+    // fp16/bf16 DevicePtr() tripwire (caif_device_tensor.h).
+    launch_quantize_to_int4(fp32_w.DevicePtr<float>(),
+                             packed.DeviceDataRaw(),
+                             scales.DeviceDataRaw(),
                              static_cast<int>(count),
                              static_cast<int>(group_size),
                              stream.Handle());
@@ -664,18 +645,22 @@ static void TestLoRAWithINT4Frozen()
     scales.CopyToHostRaw(host_scales.data());
     frozen->LoadScalesFromHost(host_scales.data(),scales_bytes);
 
-    CAIF_DeviceLoRAAdapter::LoRAConfig_t config;
+    CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t config;
     config.rank=g_test_rank;
     config.alpha=g_test_alpha;
     config.input_dim=g_test_input_dim;
     config.output_dim=g_test_output_dim;
 
-    CAIF_DeviceLoRAAdapter lora(config,std::move(frozen),stream,44);
+    CAIF_DeviceLoRAAdapter<float,float> lora(config,std::move(frozen),stream,44);
 
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=lora.Forward(input,true);
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -695,7 +680,8 @@ static void TestLoRAWithINT4Frozen()
       std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
       CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                                 {g_test_batch,g_test_output_dim},stream);
-      CAIF_DeviceTensor grad_input=lora.Backward(grad_out);
+      ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+      CAIF_DeviceTensor grad_input=lora.Backward(grad_out,ctx);
       CAIF_HostTensor h_grad=grad_input.ToHost();
       for(size_t i=0;i<h_grad.TotalElements();++i)
       {
@@ -709,11 +695,7 @@ static void TestLoRAWithINT4Frozen()
     }
     ReportResult("LoRAAdapter::LoRAWithINT4Frozen",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::LoRAWithINT4Frozen",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::LoRAWithINT4Frozen")
 }
 
 //------------------------------------------------------------------------------
@@ -727,38 +709,41 @@ static void TestLoRAInPreNormBlock()
     CAIF_CudaStream stream;
 
     // Build a FrozenLinear(dim->dim) + LoRA as a sub-layer inside PreNormBlock
-    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear>(dim,dim,
-                                                         CAIF_DataType::CAIF_DataType_e::Float32,stream);
+    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<float,float>>(dim,dim,stream);
     std::vector<float> w(static_cast<size_t>(dim)*dim,0.01f);
     CAIF_DeviceTensor weight=CAIF_DeviceTensor::FromHostData(w.data(),{dim,dim},stream);
     frozen->LoadFromTensor(std::move(weight));
 
-    CAIF_DeviceLoRAAdapter::LoRAConfig_t config;
+    CAIF_DeviceLoRAAdapter<float,float>::LoRAConfig_t config;
     config.rank=g_test_rank;
     config.alpha=g_test_alpha;
     config.input_dim=dim;
     config.output_dim=dim;
 
-    auto lora=std::make_unique<CAIF_DeviceLoRAAdapter>(config,std::move(frozen),stream,77);
+    auto lora=std::make_unique<CAIF_DeviceLoRAAdapter<float,float>>(config,std::move(frozen),stream,77);
 
     // Build PreNormBlock with RMSNorm + LoRA
-    CAIF_DevicePreNormBlock::SubLayerVec_t sub_layers;
-    CAIF_DevicePreNormBlock::SubLayer_t stage;
+    CAIF_DevicePreNormBlock<float,float>::SubLayerVec_t sub_layers;
+    CAIF_DevicePreNormBlock<float,float>::SubLayer_t stage;
     stage.norm_prefix="norm.";
     stage.layer_prefix="linear.";
-    stage.norm=std::make_unique<CAIF_DeviceRMSNorm>(dim,stream);
+    stage.norm=std::make_unique<CAIF_DeviceRMSNorm<float,float>>(dim,stream);
     stage.layer=std::move(lora);
     sub_layers.push_back(std::move(stage));
 
-    CAIF_DevicePreNormBlock block(std::move(sub_layers),stream);
+    CAIF_DevicePreNormBlock<float,float> block(std::move(sub_layers),stream);
 
     // Forward
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     const uint32_t batch=2;
     const uint32_t seq_len=3;
     auto host_input=MakeRandomInput(batch*seq_len,dim,555);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,true);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -783,7 +768,8 @@ static void TestLoRAInPreNormBlock()
       std::vector<float> grad_data(static_cast<size_t>(batch)*seq_len*dim,1.0f);
       CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                                 {batch,seq_len,dim},stream);
-      CAIF_DeviceTensor grad_input=block.Backward(grad_out);
+      ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+      CAIF_DeviceTensor grad_input=block.Backward(grad_out,ctx);
       CAIF_HostTensor h_grad=grad_input.ToHost();
       for(size_t i=0;i<h_grad.TotalElements();++i)
       {
@@ -805,11 +791,144 @@ static void TestLoRAInPreNormBlock()
 
     ReportResult("LoRAAdapter::LoRAInPreNormBlock",passed);
   }
-  catch(const std::exception &e)
+  CAIF_TEST_CATCH_BLOCK("LoRAAdapter::LoRAInPreNormBlock")
+}
+
+//------------------------------------------------------------------------------
+// Phase 7 dtype-sweep: exercise LoRA at every <ComputeT,StorageT> cell that
+// `CAIF_DeviceLoRAAdapter` instantiates against same-cell FrozenLinear bases.
+// Forward+backward must be finite end-to-end; this verifies the templated
+// LoRA cells aren't paper-only ("looks fine on paper, untested in practice"
+// is what bit the dispatch sweep — Tier G of TYPE_DISPATCH_FULL_PLAN.md).
+//------------------------------------------------------------------------------
+template<typename T> static CAIF_DataType::CAIF_DataType_e DtypeFromCpp();
+template<> CAIF_DataType::CAIF_DataType_e DtypeFromCpp<float>(){return CAIF_DataType::CAIF_DataType_e::Float32;}
+template<> CAIF_DataType::CAIF_DataType_e DtypeFromCpp<__half>(){return CAIF_DataType::CAIF_DataType_e::Float16;}
+template<> CAIF_DataType::CAIF_DataType_e DtypeFromCpp<__nv_bfloat16>(){return CAIF_DataType::CAIF_DataType_e::BFloat16;}
+
+template<typename ComputeT,typename StorageT>
+static void TestLoRACellForwardBackward(const char *cell_name,uint32_t seed)
+{
+  try
   {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("LoRAAdapter::LoRAInPreNormBlock",false);
+    CAIF_CudaStream stream;
+    auto frozen=std::make_unique<CAIF_DeviceFrozenLinear<ComputeT,StorageT>>(
+                  g_test_input_dim,
+                  g_test_output_dim,
+                  stream);
+    std::vector<float> w(static_cast<size_t>(g_test_input_dim)*g_test_output_dim);
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+    for(size_t i=0;i<w.size();++i)
+    {
+      w[i]=dist(gen);
+    }
+    CAIF_DeviceTensor fp32_w=CAIF_DeviceTensor::FromHostData(w.data(),
+                                                              {g_test_input_dim,g_test_output_dim},
+                                                              stream);
+    const CAIF_DataType::CAIF_DataType_e storage_dtype=DtypeFromCpp<StorageT>();
+    CAIF_DeviceTensor storage_w;
+    if(storage_dtype==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      storage_w=std::move(fp32_w);
+    }
+    else
+    {
+      storage_w=fp32_w.To(storage_dtype);
+    }
+    frozen->LoadFromTensor(std::move(storage_w));
+
+    typename CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::LoRAConfig_t config;
+    config.rank=g_test_rank;
+    config.alpha=g_test_alpha;
+    config.input_dim=g_test_input_dim;
+    config.output_dim=g_test_output_dim;
+    CAIF_DeviceLoRAAdapter<ComputeT,StorageT> lora(config,std::move(frozen),stream,seed+1u);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+
+    auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim,seed*7u+1u);
+    CAIF_DeviceTensor input_fp32=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                                  {g_test_batch,g_test_input_dim},
+                                                                  stream);
+    CAIF_DeviceTensor input;
+    if(storage_dtype==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      input=std::move(input_fp32);
+    }
+    else
+    {
+      input=input_fp32.To(storage_dtype);
+    }
+
+    CAIF_DeviceTensor output=lora.Forward(input,ctx);
+    CAIF_DeviceTensor output_fp32;
+    if(output.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      output_fp32=std::move(output);
+    }
+    else
+    {
+      output_fp32=output.To(CAIF_DataType::CAIF_DataType_e::Float32);
+    }
+    CAIF_HostTensor h_out=output_fp32.ToHost();
+
+    bool passed=true;
+    for(size_t i=0;i<h_out.TotalElements();++i)
+    {
+      if(std::isfinite(h_out.Data()[i])==false)
+      {
+        ISE_Out::Out()<<"  ["<<cell_name<<"] non-finite forward at "<<i<<"\n";
+        passed=false;
+        break;
+      }
+    }
+
+    if(passed==true)
+    {
+      std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
+      CAIF_DeviceTensor grad_fp32=CAIF_DeviceTensor::FromHostData(grad_data.data(),
+                                                                   {g_test_batch,g_test_output_dim},
+                                                                   stream);
+      CAIF_DeviceTensor grad_out;
+      if(storage_dtype==CAIF_DataType::CAIF_DataType_e::Float32)
+      {
+        grad_out=std::move(grad_fp32);
+      }
+      else
+      {
+        grad_out=grad_fp32.To(storage_dtype);
+      }
+      ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+      CAIF_DeviceTensor grad_input=lora.Backward(grad_out,ctx);
+      CAIF_DeviceTensor grad_input_fp32;
+      if(grad_input.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
+      {
+        grad_input_fp32=std::move(grad_input);
+      }
+      else
+      {
+        grad_input_fp32=grad_input.To(CAIF_DataType::CAIF_DataType_e::Float32);
+      }
+      CAIF_HostTensor h_grad=grad_input_fp32.ToHost();
+      for(size_t i=0;i<h_grad.TotalElements();++i)
+      {
+        if(std::isfinite(h_grad.Data()[i])==false)
+        {
+          ISE_Out::Out()<<"  ["<<cell_name<<"] non-finite backward at "<<i<<"\n";
+          passed=false;
+          break;
+        }
+      }
+    }
+
+    std::string label=std::string("LoRAAdapter::Cell::")+cell_name;
+    ReportResult(label.c_str(),passed);
   }
+  CAIF_TEST_CATCH_BLOCK((std::string("LoRAAdapter::Cell::")+cell_name).c_str())
 }
 
 #endif  // USE_CAIF_CUDA
@@ -818,7 +937,7 @@ int main()
 {
   try
   {
-    ISE_Out::Out()<<"=== CAIF_DeviceLoRAAdapter Tests ===\n\n";
+    ISE_Out::Out()<<"=== CAIF_DeviceLoRAAdapter<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
     TestForwardShape();
@@ -835,15 +954,24 @@ int main()
     TestLoRAWithFP16Frozen();
     TestLoRAWithINT4Frozen();
     TestLoRAInPreNormBlock();
+
+    // Phase 7 dtype-sweep: 4 representative cells covering both mixed
+    // (compute=float, storage=fp16/bf16) and same-cell (fp16/bf16 both
+    // sides). The <float,float> cell is already exercised by every
+    // test above.
+    TestLoRACellForwardBackward<float,__half>("float_half",101u);
+    TestLoRACellForwardBackward<float,__nv_bfloat16>("float_bfloat16",202u);
+    TestLoRACellForwardBackward<__half,__half>("half_half",303u);
+    TestLoRACellForwardBackward<__nv_bfloat16,__nv_bfloat16>("bfloat16_bfloat16",404u);
 #else
     ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
     ISE_Out::Out()<<"\n=== Summary ===\n";
-    ISE_Out::Out()<<"Passed: "<<g_tests_passed<<"\n";
-    ISE_Out::Out()<<"Failed: "<<g_tests_failed<<"\n";
+    ISE_Out::Out()<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+    ISE_Out::Out()<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-    if(g_tests_failed>0)
+    if(CAIF_TestHarness::FailedCount()>0)
     {
       return 1;
     }

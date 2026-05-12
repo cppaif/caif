@@ -15,25 +15,38 @@
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
 // Multi-head Latent Attention (MLA) layer implementation
+//
+// Per-site dispositions per the type-dispatch full plan (Phases 2+3):
+//   - `_q_norm_gamma`, `_kv_norm_gamma`, `_grad_q_norm_gamma`,
+//     `_grad_kv_norm_gamma`, `q_rms` / `kv_rms`, `_cached_q_rms` /
+//     `_cached_kv_rms` are fp32 RMSNorm scale/grad/cache —
+//     `DevicePtr<float>()`.
+//   - `ctx.PrefixLengths()` is uint32_t — passed directly via
+//     `DevicePtr<uint32_t>()`. Phase 3 changed the kernel signatures
+//     from `const int *` to `const uint32_t *`, so no reinterpret_cast
+//     remains at the call sites.
 //------------------------------------------------------------------------------
 #include "caif_device_ml_attention.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_cuda_kernels.h"
 #include "caif_exception.h"
 #include <cmath>
 #include <random>
 #include <sstream>
 
-using namespace instance;
+namespace instance
+{
 
 //------------------------------------------------------------------------------
 // Constructor
 //------------------------------------------------------------------------------
 
-CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
-                                             CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMLAttention<ComputeT,StorageT>::CAIF_DeviceMLAttention(const MLAConfig_t &config,
+                                             CAIF_CudaStream &stream):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                                                       _config(config),
                                                                       _use_projections(false),
+                                                                      _use_q_lora(config.q_lora_rank>0),
                                                                       _cached_batch(0),
                                                                       _cached_seq_len(0),
                                                                       _kv_cache_len(0),
@@ -43,34 +56,61 @@ CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
 {
   try
   {
-    // Compute derived dimensions
-    _qk_head_dim=_config.qk_nope_head_dim+_config.qk_rope_head_dim;
-    _q_proj_dim=_config.num_heads*_qk_head_dim;
-    _kv_compress_dim=_config.kv_lora_rank+_config.qk_rope_head_dim;
-    _kv_decomp_dim=_config.num_heads*(_config.qk_nope_head_dim+_config.v_head_dim);
-    _o_input_dim=_config.num_heads*_config.v_head_dim;
+    const MLAConfig_t &cfg=Config();
+    const uint32_t qk_head_dim=cfg.qk_nope_head_dim+cfg.qk_rope_head_dim;
+    SetQKHeadDim(qk_head_dim);
+    SetQProjDim(cfg.num_heads*qk_head_dim);
+    SetKVCompressDim(cfg.kv_lora_rank+cfg.qk_rope_head_dim);
+    SetKVDecompDim(cfg.num_heads*(cfg.qk_nope_head_dim+cfg.v_head_dim));
+    SetOInputDim(cfg.num_heads*cfg.v_head_dim);
 
-    // Allocate parameters
-    _w_q_compress=CAIF_DeviceTensor::Zeros({_config.dim,_config.q_lora_rank},stream);
-    _q_norm_gamma=CAIF_DeviceTensor::Zeros({_config.q_lora_rank},stream);
-    _w_q_decompress=CAIF_DeviceTensor::Zeros({_config.q_lora_rank,_q_proj_dim},stream);
-    _w_kv_compress=CAIF_DeviceTensor::Zeros({_config.dim,_kv_compress_dim},stream);
-    _kv_norm_gamma=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank},stream);
-    _w_kv_decompress=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank,_kv_decomp_dim},stream);
-    _w_o=CAIF_DeviceTensor::Zeros({_o_input_dim,_config.dim},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
-    // Allocate gradients (same shapes)
-    _grad_w_q_compress=CAIF_DeviceTensor::Zeros({_config.dim,_config.q_lora_rank},stream);
-    _grad_q_norm_gamma=CAIF_DeviceTensor::Zeros({_config.q_lora_rank},stream);
-    _grad_w_q_decompress=CAIF_DeviceTensor::Zeros({_config.q_lora_rank,_q_proj_dim},stream);
-    _grad_w_kv_compress=CAIF_DeviceTensor::Zeros({_config.dim,_kv_compress_dim},stream);
-    _grad_kv_norm_gamma=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank},stream);
-    _grad_w_kv_decompress=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank,_kv_decomp_dim},stream);
-    _grad_w_o=CAIF_DeviceTensor::Zeros({_o_input_dim,_config.dim},stream);
+    // Q parameters: LoRA path (compress + norm + decompress) when
+    // q_lora_rank>0; otherwise a single direct projection (DeepSeek-V2-Lite
+    // and other configs that omit Q-LoRA).
+    if(UsesQLoRA()==true)
+    {
+      SetWQCompress(CAIF_DeviceTensor::Uninitialized({cfg.dim,cfg.q_lora_rank},stream,sdt));
+      // Norm gammas always live at fp32 — the launch_rmsnorm_backward
+      // kernel reads/writes them via `DevicePtr<float>()`. Allocating at
+      // a smaller dtype (fp16/bf16) overruns the buffer on backward
+      // (writes 4 bytes into 2-byte slots) and corrupts the gamma grad.
+      SetQNormGamma(CAIF_DeviceTensor::Zeros({cfg.q_lora_rank},stream,
+                                              CAIF_DataType::CAIF_DataType_e::Float32));
+      SetWQDecompress(CAIF_DeviceTensor::Uninitialized({cfg.q_lora_rank,QProjDim()},stream,sdt));
+      SetGradWQCompress(CAIF_DeviceTensor::Zeros({cfg.dim,cfg.q_lora_rank},stream,sdt));
+      SetGradQNormGamma(CAIF_DeviceTensor::Zeros({cfg.q_lora_rank},stream,
+                                                  CAIF_DataType::CAIF_DataType_e::Float32));
+      SetGradWQDecompress(CAIF_DeviceTensor::Zeros({cfg.q_lora_rank,QProjDim()},stream,sdt));
+    }
+    else
+    {
+      SetWQ(CAIF_DeviceTensor::Uninitialized({cfg.dim,QProjDim()},stream,sdt));
+      SetGradWQ(CAIF_DeviceTensor::Zeros({cfg.dim,QProjDim()},stream,sdt));
+    }
 
-    // Initialize gamma to 1.0 (RMSNorm convention)
-    _q_norm_gamma.Fill(1.0f);
-    _kv_norm_gamma.Fill(1.0f);
+    // KV path (always LoRA) and output projection.
+    SetWKVCompress(CAIF_DeviceTensor::Uninitialized({cfg.dim,KVCompressDim()},stream,sdt));
+    // KV norm gamma always at fp32 — see Q-norm comment above.
+    SetKVNormGamma(CAIF_DeviceTensor::Zeros({cfg.kv_lora_rank},stream,
+                                             CAIF_DataType::CAIF_DataType_e::Float32));
+    SetWKVDecompress(CAIF_DeviceTensor::Uninitialized({cfg.kv_lora_rank,KVDecompDim()},stream,sdt));
+    SetWO(CAIF_DeviceTensor::Uninitialized({OInputDim(),cfg.dim},stream,sdt));
+
+    SetGradWKVCompress(CAIF_DeviceTensor::Zeros({cfg.dim,KVCompressDim()},stream,sdt));
+    SetGradKVNormGamma(CAIF_DeviceTensor::Zeros({cfg.kv_lora_rank},stream,
+                                                 CAIF_DataType::CAIF_DataType_e::Float32));
+    SetGradWKVDecompress(CAIF_DeviceTensor::Zeros({cfg.kv_lora_rank,KVDecompDim()},stream,sdt));
+    SetGradWO(CAIF_DeviceTensor::Zeros({OInputDim(),cfg.dim},stream,sdt));
+
+    // Initialize gamma to 1.0 (RMSNorm convention). Norm gammas are
+    // always fp32 — Fill(float) works directly with no stage-and-cast.
+    if(UsesQLoRA()==true)
+    {
+      MutableQNormGamma().Fill(1.0f);
+    }
+    MutableKVNormGamma().Fill(1.0f);
 
     InitializeWeights(0);
   }
@@ -81,12 +121,14 @@ CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
 // Constructor (projections-based)
 //------------------------------------------------------------------------------
 
-CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMLAttention<ComputeT,StorageT>::CAIF_DeviceMLAttention(const MLAConfig_t &config,
                                              MLAProjections_t projections,
-                                             CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
+                                             CAIF_CudaStream &stream):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                                                       _config(config),
                                                                       _projections(std::move(projections)),
                                                                       _use_projections(true),
+                                                                      _use_q_lora(config.q_lora_rank>0),
                                                                       _cached_batch(0),
                                                                       _cached_seq_len(0),
                                                                       _kv_cache_len(0),
@@ -96,427 +138,430 @@ CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(const MLAConfig_t &config,
 {
   try
   {
-    // Compute derived dimensions
-    _qk_head_dim=_config.qk_nope_head_dim+_config.qk_rope_head_dim;
-    _q_proj_dim=_config.num_heads*_qk_head_dim;
-    _kv_compress_dim=_config.kv_lora_rank+_config.qk_rope_head_dim;
-    _kv_decomp_dim=_config.num_heads*(_config.qk_nope_head_dim+_config.v_head_dim);
-    _o_input_dim=_config.num_heads*_config.v_head_dim;
+    if(UsesQLoRA()==false)
+    {
+      THROW_CAIFE("MLA projections constructor requires q_lora_rank>0; the no-LoRA"
+                  " Q path uses the basic-tensor constructor with LoadWQ()");
+    }
+    const MLAConfig_t &cfg=Config();
+    const uint32_t qk_head_dim=cfg.qk_nope_head_dim+cfg.qk_rope_head_dim;
+    SetQKHeadDim(qk_head_dim);
+    SetQProjDim(cfg.num_heads*qk_head_dim);
+    SetKVCompressDim(cfg.kv_lora_rank+cfg.qk_rope_head_dim);
+    SetKVDecompDim(cfg.num_heads*(cfg.qk_nope_head_dim+cfg.v_head_dim));
+    SetOInputDim(cfg.num_heads*cfg.v_head_dim);
 
-    // Allocate internal norm parameters (not owned by projections)
-    _q_norm_gamma=CAIF_DeviceTensor::Zeros({_config.q_lora_rank},stream);
-    _kv_norm_gamma=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank},stream);
-    _grad_q_norm_gamma=CAIF_DeviceTensor::Zeros({_config.q_lora_rank},stream);
-    _grad_kv_norm_gamma=CAIF_DeviceTensor::Zeros({_config.kv_lora_rank},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
-    // Initialize gamma to 1.0 (RMSNorm convention)
-    _q_norm_gamma.Fill(1.0f);
-    _kv_norm_gamma.Fill(1.0f);
+    // Norm parameters (not owned by projections).
+    // Norm gammas always live at fp32 — see no-projections ctor comment.
+    SetQNormGamma(CAIF_DeviceTensor::Zeros({cfg.q_lora_rank},stream,
+                                            CAIF_DataType::CAIF_DataType_e::Float32));
+    SetKVNormGamma(CAIF_DeviceTensor::Zeros({cfg.kv_lora_rank},stream,
+                                             CAIF_DataType::CAIF_DataType_e::Float32));
+    SetGradQNormGamma(CAIF_DeviceTensor::Zeros({cfg.q_lora_rank},stream,
+                                                CAIF_DataType::CAIF_DataType_e::Float32));
+    SetGradKVNormGamma(CAIF_DeviceTensor::Zeros({cfg.kv_lora_rank},stream,
+                                                 CAIF_DataType::CAIF_DataType_e::Float32));
+
+    // Initialize gamma to 1.0 (RMSNorm convention).
+    MutableQNormGamma().Fill(1.0f);
+    MutableKVNormGamma().Fill(1.0f);
   }
   CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
-// Move semantics
+// Move semantics — init list zero-inits the primitive scalars (the language
+// requires they be initialized before any method body, including
+// MoveAssignFrom, runs); MoveAssignFrom then routes every state transfer
+// through SetXxx setters and TakeXxx move-outs so subclasses can override
+// the mutation site.
 //------------------------------------------------------------------------------
 
-CAIF_DeviceMLAttention::CAIF_DeviceMLAttention(
-                     CAIF_DeviceMLAttention &&other):CAIF_DeviceLayer(std::move(other)),
-                                                    _config(other._config),
-                                                    _projections(std::move(other._projections)),
-                                                    _use_projections(other._use_projections),
-                                                    _qk_head_dim(other._qk_head_dim),
-                                                    _q_proj_dim(other._q_proj_dim),
-                                                    _kv_compress_dim(other._kv_compress_dim),
-                                                    _kv_decomp_dim(other._kv_decomp_dim),
-                                                    _o_input_dim(other._o_input_dim),
-                                                    _w_q_compress(std::move(other._w_q_compress)),
-                                                    _q_norm_gamma(std::move(other._q_norm_gamma)),
-                                                    _w_q_decompress(std::move(other._w_q_decompress)),
-                                                    _w_kv_compress(std::move(other._w_kv_compress)),
-                                                    _kv_norm_gamma(std::move(other._kv_norm_gamma)),
-                                                    _w_kv_decompress(std::move(other._w_kv_decompress)),
-                                                    _w_o(std::move(other._w_o)),
-                                                    _grad_w_q_compress(std::move(other._grad_w_q_compress)),
-                                                    _grad_q_norm_gamma(std::move(other._grad_q_norm_gamma)),
-                                                    _grad_w_q_decompress(std::move(other._grad_w_q_decompress)),
-                                                    _grad_w_kv_compress(std::move(other._grad_w_kv_compress)),
-                                                    _grad_kv_norm_gamma(std::move(other._grad_kv_norm_gamma)),
-                                                    _grad_w_kv_decompress(std::move(other._grad_w_kv_decompress)),
-                                                    _grad_w_o(std::move(other._grad_w_o)),
-                                                    _cached_input(std::move(other._cached_input)),
-                                                    _cached_q_compressed(std::move(other._cached_q_compressed)),
-                                                    _cached_q_rms(std::move(other._cached_q_rms)),
-                                                    _cached_q_normed(std::move(other._cached_q_normed)),
-                                                    _cached_kv_compressed(std::move(other._cached_kv_compressed)),
-                                                    _cached_kv_rms(std::move(other._cached_kv_rms)),
-                                                    _cached_kv_normed(std::move(other._cached_kv_normed)),
-                                                    _cached_q(std::move(other._cached_q)),
-                                                    _cached_k(std::move(other._cached_k)),
-                                                    _cached_v(std::move(other._cached_v)),
-                                                    _cached_attn_output(std::move(other._cached_attn_output)),
-                                                    _cached_logsumexp(std::move(other._cached_logsumexp)),
-                                                    _cached_merged(std::move(other._cached_merged)),
-                                                    _cached_batch(other._cached_batch),
-                                                    _cached_seq_len(other._cached_seq_len),
-                                                    _kv_cache_compressed(std::move(other._kv_cache_compressed)),
-                                                    _kv_cache_k_pe(std::move(other._kv_cache_k_pe)),
-                                                    _kv_cache_len(other._kv_cache_len),
-                                                    _kv_cache_max_len(other._kv_cache_max_len),
-                                                    _kv_cache_batch(other._kv_cache_batch),
-                                                    _kv_cache_enabled(other._kv_cache_enabled)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMLAttention<ComputeT,StorageT>::CAIF_DeviceMLAttention(
+                     CAIF_DeviceMLAttention &&other):CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                                                    _use_projections(false),
+                                                    _use_q_lora(false),
+                                                    _qk_head_dim(0),
+                                                    _q_proj_dim(0),
+                                                    _kv_compress_dim(0),
+                                                    _kv_decomp_dim(0),
+                                                    _o_input_dim(0),
+                                                    _cached_batch(0),
+                                                    _cached_seq_len(0),
+                                                    _kv_cache_len(0),
+                                                    _kv_cache_max_len(0),
+                                                    _kv_cache_batch(0),
+                                                    _kv_cache_enabled(false)
 {
+  MoveAssignFrom(std::move(other));
 }
 
-CAIF_DeviceMLAttention &CAIF_DeviceMLAttention::operator=(CAIF_DeviceMLAttention &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceMLAttention<ComputeT,StorageT> &CAIF_DeviceMLAttention<ComputeT,StorageT>::operator=(CAIF_DeviceMLAttention<ComputeT,StorageT> &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
-    _config=other._config;
-    _projections=std::move(other._projections);
-    _use_projections=other._use_projections;
-    _qk_head_dim=other._qk_head_dim;
-    _q_proj_dim=other._q_proj_dim;
-    _kv_compress_dim=other._kv_compress_dim;
-    _kv_decomp_dim=other._kv_decomp_dim;
-    _o_input_dim=other._o_input_dim;
-
-    _w_q_compress=std::move(other._w_q_compress);
-    _q_norm_gamma=std::move(other._q_norm_gamma);
-    _w_q_decompress=std::move(other._w_q_decompress);
-    _w_kv_compress=std::move(other._w_kv_compress);
-    _kv_norm_gamma=std::move(other._kv_norm_gamma);
-    _w_kv_decompress=std::move(other._w_kv_decompress);
-    _w_o=std::move(other._w_o);
-
-    _grad_w_q_compress=std::move(other._grad_w_q_compress);
-    _grad_q_norm_gamma=std::move(other._grad_q_norm_gamma);
-    _grad_w_q_decompress=std::move(other._grad_w_q_decompress);
-    _grad_w_kv_compress=std::move(other._grad_w_kv_compress);
-    _grad_kv_norm_gamma=std::move(other._grad_kv_norm_gamma);
-    _grad_w_kv_decompress=std::move(other._grad_w_kv_decompress);
-    _grad_w_o=std::move(other._grad_w_o);
-
-    _cached_input=std::move(other._cached_input);
-    _cached_q_compressed=std::move(other._cached_q_compressed);
-    _cached_q_rms=std::move(other._cached_q_rms);
-    _cached_q_normed=std::move(other._cached_q_normed);
-    _cached_kv_compressed=std::move(other._cached_kv_compressed);
-    _cached_kv_rms=std::move(other._cached_kv_rms);
-    _cached_kv_normed=std::move(other._cached_kv_normed);
-    _cached_q=std::move(other._cached_q);
-    _cached_k=std::move(other._cached_k);
-    _cached_v=std::move(other._cached_v);
-    _cached_attn_output=std::move(other._cached_attn_output);
-    _cached_logsumexp=std::move(other._cached_logsumexp);
-    _cached_merged=std::move(other._cached_merged);
-    _cached_batch=other._cached_batch;
-    _cached_seq_len=other._cached_seq_len;
-
-    _kv_cache_compressed=std::move(other._kv_cache_compressed);
-    _kv_cache_k_pe=std::move(other._kv_cache_k_pe);
-    _kv_cache_len=other._kv_cache_len;
-    _kv_cache_max_len=other._kv_cache_max_len;
-    _kv_cache_batch=other._kv_cache_batch;
-    _kv_cache_enabled=other._kv_cache_enabled;
+    CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
+    MoveAssignFrom(std::move(other));
   }
   return *this;
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::MoveAssignFrom(CAIF_DeviceMLAttention &&other)
+{
+  SetConfig(other.Config());
+  SetProjections(other.TakeProjections());
+  SetUseProjections(other.UsesProjections());
+  SetUseQLoRA(other.UsesQLoRA());
+  SetQKHeadDim(other.QKHeadDim());
+  SetQProjDim(other.QProjDim());
+  SetKVCompressDim(other.KVCompressDim());
+  SetKVDecompDim(other.KVDecompDim());
+  SetOInputDim(other.OInputDim());
+
+  SetWQ(other.TakeWQ());
+  SetWQCompress(other.TakeWQCompress());
+  SetQNormGamma(other.TakeQNormGamma());
+  SetWQDecompress(other.TakeWQDecompress());
+  SetWKVCompress(other.TakeWKVCompress());
+  SetKVNormGamma(other.TakeKVNormGamma());
+  SetWKVDecompress(other.TakeWKVDecompress());
+  SetWO(other.TakeWO());
+
+  SetGradWQ(other.TakeGradWQ());
+  SetGradWQCompress(other.TakeGradWQCompress());
+  SetGradQNormGamma(other.TakeGradQNormGamma());
+  SetGradWQDecompress(other.TakeGradWQDecompress());
+  SetGradWKVCompress(other.TakeGradWKVCompress());
+  SetGradKVNormGamma(other.TakeGradKVNormGamma());
+  SetGradWKVDecompress(other.TakeGradWKVDecompress());
+  SetGradWO(other.TakeGradWO());
+
+  SetCachedInput(other.TakeCachedInput());
+  SetCachedQCompressed(other.TakeCachedQCompressed());
+  SetCachedQRMS(other.TakeCachedQRMS());
+  SetCachedQNormed(other.TakeCachedQNormed());
+  SetCachedKVCompressed(other.TakeCachedKVCompressed());
+  SetCachedKVRMS(other.TakeCachedKVRMS());
+  SetCachedKVNormed(other.TakeCachedKVNormed());
+  SetCachedQ(other.TakeCachedQ());
+  SetCachedK(other.TakeCachedK());
+  SetCachedV(other.TakeCachedV());
+  SetCachedAttnOutput(other.TakeCachedAttnOutput());
+  SetCachedLogsumexp(other.TakeCachedLogsumexp());
+  SetCachedMerged(other.TakeCachedMerged());
+  SetCachedBatch(other.CachedBatch());
+  SetCachedSeqLen(other.CachedSeqLen());
+
+  SetKVCacheCompressed(other.TakeKVCacheCompressed());
+  SetKVCacheKPE(other.TakeKVCacheKPE());
+  SetKVCacheLen(other.KVCacheLength());
+  SetKVCacheMaxLen(other.KVCacheMaxLen());
+  SetKVCacheBatch(other.KVCacheBatch());
+  SetKVCacheEnabled(other.IsKVCacheEnabled());
 }
 
 //------------------------------------------------------------------------------
 // Forward pass
 //------------------------------------------------------------------------------
 
-CAIF_DeviceTensor CAIF_DeviceMLAttention::Forward(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMLAttention<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)
 {
   try
   {
     const auto &shape=input.Shape();
-    if(shape.size()!=3||shape[2]!=_config.dim)
+    const MLAConfig_t &cfg=Config();
+    if(shape.size()!=3||shape[2]!=cfg.dim)
     {
       THROW_CAIFE("MLA Forward: input must be [batch, seq_len, dim]");
     }
+    if(input.Dtype()!=StorageDtype())
+    {
+      THROW_CAIFE("MLA Forward: input dtype must match config.storage_dtype (caller must Cast upstream)");
+    }
+
+    const bool has_prefix=ctx.HasPrefixLengths();
 
     const uint32_t batch=shape[0];
     const uint32_t seq_len=shape[1];
     const uint32_t bs=batch*seq_len;
-    const uint32_t bh=batch*_config.num_heads;
-    const uint32_t nope=_config.qk_nope_head_dim;
-    const uint32_t rope=_config.qk_rope_head_dim;
-    const uint32_t v_dim=_config.v_head_dim;
-    const float scale=1.0f/std::sqrt(static_cast<float>(_qk_head_dim));
+    const uint32_t bh=batch*cfg.num_heads;
+    const uint32_t nope=cfg.qk_nope_head_dim;
+    const uint32_t rope=cfg.qk_rope_head_dim;
+    const uint32_t v_dim=cfg.v_head_dim;
+    const float scale=1.0f/std::sqrt(static_cast<float>(QKHeadDim()));
 
     // Flatten input to [bs, dim]
     CAIF_DeviceTensor flat_input=input.Clone();
-    flat_input.Reshape({bs,_config.dim});
+    flat_input.Reshape({bs,cfg.dim});
 
     //------------------------------------------------------------------
     // Q path
+    //
+    // q_lora_rank>0: input -> compress -> RMSNorm -> decompress -> q_full
+    // q_lora_rank==0 (DeepSeek-V2-Lite): input -> direct projection -> q_full
     //------------------------------------------------------------------
-
-    // 1. Q compress: [bs, dim] -> [bs, q_lora_rank]
     CAIF_DeviceTensor q_compressed;
-    if(_use_projections==true)
-    {
-      q_compressed=_projections.q_compress->Forward(flat_input,training);
-    }
-    else
-    {
-      q_compressed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-      CAIF_DeviceOps::MatMul(flat_input,_w_q_compress,q_compressed);
-    }
-
-    // 2. Q RMSNorm
-    CAIF_DeviceTensor q_normed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-    CAIF_DeviceTensor q_rms=CAIF_DeviceTensor::Uninitialized({bs},*_stream);
-    launch_rmsnorm_forward(q_compressed.DevicePtr(),
-                           _q_norm_gamma.DevicePtr(),
-                           q_normed.DevicePtr(),
-                           q_rms.DevicePtr(),
-                           _config.rms_norm_eps,
-                           static_cast<int>(bs),
-                           static_cast<int>(_config.q_lora_rank),
-                           _stream->Handle());
-
-    // 3. Q decompress: [bs, q_lora_rank] -> [bs, q_proj_dim]
+    CAIF_DeviceTensor q_normed;
+    CAIF_DeviceTensor q_rms;
     CAIF_DeviceTensor q_full;
-    if(_use_projections==true)
+
+    if(UsesQLoRA()==true)
     {
-      q_full=_projections.q_decompress->Forward(q_normed,training);
+      if(UsesProjections()==true)
+      {
+        q_compressed=Projections().q_compress->Forward(flat_input,ctx);
+      }
+      else
+      {
+        q_compressed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+        CAIF_Ops::MatMul(flat_input,WQCompress(),q_compressed,ctx,ComputeDtype());
+      }
+
+      q_normed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+      q_rms=CAIF_DeviceTensor::Uninitialized({bs},Stream());
+      launch_rmsnorm_forward<StorageT>(q_compressed.template DevicePtr<StorageT>(),
+                                        QNormGamma().template DevicePtr<float>(),
+                                        q_normed.template DevicePtr<StorageT>(),
+                                        q_rms.template DevicePtr<float>(),
+                                        cfg.rms_norm_eps,
+                                        static_cast<int>(bs),
+                                        static_cast<int>(cfg.q_lora_rank),
+                                        Stream().Handle());
+
+      if(UsesProjections()==true)
+      {
+        q_full=Projections().q_decompress->Forward(q_normed,ctx);
+      }
+      else
+      {
+        q_full=CAIF_DeviceTensor::Uninitialized({bs,QProjDim()},Stream(),StorageDtype());
+        CAIF_Ops::MatMul(q_normed,WQDecompress(),q_full,ctx,ComputeDtype());
+      }
     }
     else
     {
-      q_full=CAIF_DeviceTensor::Uninitialized({bs,_q_proj_dim},*_stream);
-      CAIF_DeviceOps::MatMul(q_normed,_w_q_decompress,q_full);
+      // q_lora_rank==0: a single [dim, q_proj_dim] matmul produces q_full
+      // directly. No compress/norm/decompress chain.
+      q_full=CAIF_DeviceTensor::Uninitialized({bs,QProjDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(flat_input,WQ(),q_full,ctx,ComputeDtype());
     }
 
-    // 4. Reshape to [batch, seq, heads, qk_head_dim] and transpose to [bh, seq, qk_head_dim]
-    q_full.Reshape({batch,seq_len,_config.num_heads,_qk_head_dim});
-    CAIF_DeviceTensor q_transposed=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    launch_transpose_0213(q_full.DevicePtr(),
-                          q_transposed.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(_qk_head_dim),
-                          _stream->Handle());
+    // Reshape to [batch, seq, heads, qk_head_dim] and transpose to [bh, seq, qk_head_dim]
+    q_full.Reshape({batch,seq_len,cfg.num_heads,QKHeadDim()});
+    CAIF_DeviceTensor q_transposed=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(q_full.template DevicePtr<StorageT>(),
+                                     q_transposed.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(QKHeadDim()),
+                                     Stream().Handle());
 
-    // 5. Slice Q into nope and rope portions: [bh, seq, nope] + [bh, seq, rope]
-    const int q_rows=static_cast<int>(bh*seq_len);
-    CAIF_DeviceTensor q_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},*_stream);
-    CAIF_DeviceTensor q_rope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},*_stream);
-    launch_slice_last_dim(q_transposed.DevicePtr(),q_nope.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(q_transposed.DevicePtr(),q_rope.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),
-                          static_cast<int>(nope),static_cast<int>(rope),
-                          _stream->Handle());
+    // Slice Q into nope and rope portions: [bh, seq, nope] + [bh, seq, rope]
+    CAIF_DeviceTensor q_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor q_rope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(q_transposed,q_nope,0);
+    CAIF_Ops::SliceLastDim(q_transposed,q_rope,static_cast<uint32_t>(nope));
 
-    // 6. Apply RoPE to q_rope only
-    launch_rope_forward(q_rope.DevicePtr(),
-                        static_cast<int>(bh),
-                        static_cast<int>(seq_len),
-                        static_cast<int>(rope),
-                        _config.rope_base,
-                        _stream->Handle());
+    // Apply RoPE to q_rope only
+    launch_rope_forward<StorageT>(q_rope.template DevicePtr<StorageT>(),
+                                   static_cast<int>(bh),
+                                   static_cast<int>(seq_len),
+                                   static_cast<int>(rope),
+                                   cfg.rope_base,
+                                   cfg.rope_style,
+                                   Stream().Handle());
 
     //------------------------------------------------------------------
     // KV path
     //------------------------------------------------------------------
-
-    // 7. KV compress: [bs, dim] -> [bs, kv_compress_dim]
     CAIF_DeviceTensor kv_out;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      kv_out=_projections.kv_compress->Forward(flat_input,training);
+      kv_out=Projections().kv_compress->Forward(flat_input,ctx);
     }
     else
     {
-      kv_out=CAIF_DeviceTensor::Uninitialized({bs,_kv_compress_dim},*_stream);
-      CAIF_DeviceOps::MatMul(flat_input,_w_kv_compress,kv_out);
+      kv_out=CAIF_DeviceTensor::Uninitialized({bs,KVCompressDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(flat_input,WKVCompress(),kv_out,ctx,ComputeDtype());
     }
 
-    // 8. Slice into compressed_kv [bs, kv_lora_rank] and k_pe_flat [bs, rope]
-    CAIF_DeviceTensor kv_compressed=CAIF_DeviceTensor::Uninitialized({bs,_config.kv_lora_rank},*_stream);
-    CAIF_DeviceTensor k_pe_flat=CAIF_DeviceTensor::Uninitialized({bs,rope},*_stream);
-    launch_slice_last_dim(kv_out.DevicePtr(),kv_compressed.DevicePtr(),
-                          static_cast<int>(bs),static_cast<int>(_kv_compress_dim),
-                          0,static_cast<int>(_config.kv_lora_rank),
-                          _stream->Handle());
-    launch_slice_last_dim(kv_out.DevicePtr(),k_pe_flat.DevicePtr(),
-                          static_cast<int>(bs),static_cast<int>(_kv_compress_dim),
-                          static_cast<int>(_config.kv_lora_rank),static_cast<int>(rope),
-                          _stream->Handle());
+    // Slice into compressed_kv [bs, kv_lora_rank] and k_pe_flat [bs, rope]
+    CAIF_DeviceTensor kv_compressed=CAIF_DeviceTensor::Uninitialized({bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+    CAIF_DeviceTensor k_pe_flat=CAIF_DeviceTensor::Uninitialized({bs,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(kv_out,kv_compressed,0);
+    CAIF_Ops::SliceLastDim(kv_out,k_pe_flat,cfg.kv_lora_rank);
 
-    // 9. KV RMSNorm on compressed_kv
-    CAIF_DeviceTensor kv_normed=CAIF_DeviceTensor::Uninitialized({bs,_config.kv_lora_rank},*_stream);
-    CAIF_DeviceTensor kv_rms=CAIF_DeviceTensor::Uninitialized({bs},*_stream);
-    launch_rmsnorm_forward(kv_compressed.DevicePtr(),
-                           _kv_norm_gamma.DevicePtr(),
-                           kv_normed.DevicePtr(),
-                           kv_rms.DevicePtr(),
-                           _config.rms_norm_eps,
-                           static_cast<int>(bs),
-                           static_cast<int>(_config.kv_lora_rank),
-                           _stream->Handle());
+    // KV RMSNorm on compressed_kv
+    CAIF_DeviceTensor kv_normed=CAIF_DeviceTensor::Uninitialized({bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+    CAIF_DeviceTensor kv_rms=CAIF_DeviceTensor::Uninitialized({bs},Stream());
+    launch_rmsnorm_forward<StorageT>(kv_compressed.template DevicePtr<StorageT>(),
+                                      KVNormGamma().template DevicePtr<float>(),
+                                      kv_normed.template DevicePtr<StorageT>(),
+                                      kv_rms.template DevicePtr<float>(),
+                                      cfg.rms_norm_eps,
+                                      static_cast<int>(bs),
+                                      static_cast<int>(cfg.kv_lora_rank),
+                                      Stream().Handle());
 
-    // 10. KV decompress: [bs, kv_lora_rank] -> [bs, kv_decomp_dim]
+    // KV decompress: [bs, kv_lora_rank] -> [bs, kv_decomp_dim]
     CAIF_DeviceTensor kv_full;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      kv_full=_projections.kv_decompress->Forward(kv_normed,training);
+      kv_full=Projections().kv_decompress->Forward(kv_normed,ctx);
     }
     else
     {
-      kv_full=CAIF_DeviceTensor::Uninitialized({bs,_kv_decomp_dim},*_stream);
-      CAIF_DeviceOps::MatMul(kv_normed,_w_kv_decompress,kv_full);
+      kv_full=CAIF_DeviceTensor::Uninitialized({bs,KVDecompDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(kv_normed,WKVDecompress(),kv_full,ctx,ComputeDtype());
     }
 
-    // 11. Reshape to [batch, seq, heads, nope+v_dim] and transpose to [bh, seq, nope+v_dim]
+    // Reshape to [batch, seq, heads, nope+v_dim] and transpose
     const uint32_t kv_per_head=nope+v_dim;
-    kv_full.Reshape({batch,seq_len,_config.num_heads,kv_per_head});
-    CAIF_DeviceTensor kv_transposed=CAIF_DeviceTensor::Uninitialized({bh,seq_len,kv_per_head},*_stream);
-    launch_transpose_0213(kv_full.DevicePtr(),
-                          kv_transposed.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(kv_per_head),
-                          _stream->Handle());
+    kv_full.Reshape({batch,seq_len,cfg.num_heads,kv_per_head});
+    CAIF_DeviceTensor kv_transposed=CAIF_DeviceTensor::Uninitialized({bh,seq_len,kv_per_head},Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(kv_full.template DevicePtr<StorageT>(),
+                                     kv_transposed.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(kv_per_head),
+                                     Stream().Handle());
 
-    // 12. Split KV into k_nope [bh, seq, nope] and v [bh, seq, v_dim]
-    const int kv_rows=static_cast<int>(bh*seq_len);
-    CAIF_DeviceTensor k_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},*_stream);
-    CAIF_DeviceTensor v=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},*_stream);
-    launch_slice_last_dim(kv_transposed.DevicePtr(),k_nope.DevicePtr(),
-                          kv_rows,static_cast<int>(kv_per_head),0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(kv_transposed.DevicePtr(),v.DevicePtr(),
-                          kv_rows,static_cast<int>(kv_per_head),
-                          static_cast<int>(nope),static_cast<int>(v_dim),
-                          _stream->Handle());
+    // Split KV into k_nope [bh, seq, nope] and v [bh, seq, v_dim]
+    CAIF_DeviceTensor k_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor v=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(kv_transposed,k_nope,0);
+    CAIF_Ops::SliceLastDim(kv_transposed,v,nope);
 
-    // 13. Broadcast k_pe from [batch, seq, rope] to [bh, seq, rope]
+    // Broadcast k_pe from [batch, seq, rope] to [bh, seq, rope]
     k_pe_flat.Reshape({batch,seq_len,rope});
-    CAIF_DeviceTensor k_pe=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},*_stream);
-    launch_gqa_repeat_kv(k_pe_flat.DevicePtr(),
-                         k_pe.DevicePtr(),
-                         static_cast<int>(batch),
-                         1,
-                         static_cast<int>(_config.num_heads),
-                         static_cast<int>(seq_len),
-                         static_cast<int>(rope),
-                         _stream->Handle());
+    CAIF_DeviceTensor k_pe=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},Stream(),StorageDtype());
+    launch_gqa_repeat_kv<StorageT>(k_pe_flat.template DevicePtr<StorageT>(),
+                                    k_pe.template DevicePtr<StorageT>(),
+                                    static_cast<int>(batch),
+                                    1,
+                                    static_cast<int>(cfg.num_heads),
+                                    static_cast<int>(seq_len),
+                                    static_cast<int>(rope),
+                                    Stream().Handle());
 
-    // 14. Apply RoPE to k_pe
-    launch_rope_forward(k_pe.DevicePtr(),
-                        static_cast<int>(bh),
-                        static_cast<int>(seq_len),
-                        static_cast<int>(rope),
-                        _config.rope_base,
-                        _stream->Handle());
+    // Apply RoPE to k_pe
+    launch_rope_forward<StorageT>(k_pe.template DevicePtr<StorageT>(),
+                                   static_cast<int>(bh),
+                                   static_cast<int>(seq_len),
+                                   static_cast<int>(rope),
+                                   cfg.rope_base,
+                                   cfg.rope_style,
+                                   Stream().Handle());
 
     //------------------------------------------------------------------
     // Assemble Q, K and run attention
     //------------------------------------------------------------------
+    CAIF_DeviceTensor q=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(q_nope,q_rope,q);
 
-    // 15. Concat Q: [q_nope | q_rope] -> [bh, seq, qk_head_dim]
-    CAIF_DeviceTensor q=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    launch_concat_last_dim(q_nope.DevicePtr(),q_rope.DevicePtr(),q.DevicePtr(),
-                           q_rows,static_cast<int>(nope),static_cast<int>(rope),
-                           _stream->Handle());
+    CAIF_DeviceTensor k=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(k_nope,k_pe,k);
 
-    // 16. Concat K: [k_nope | k_pe] -> [bh, seq, qk_head_dim]
-    CAIF_DeviceTensor k=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    launch_concat_last_dim(k_nope.DevicePtr(),k_pe.DevicePtr(),k.DevicePtr(),
-                           kv_rows,static_cast<int>(nope),static_cast<int>(rope),
-                           _stream->Handle());
-
-    // 17. Standard attention: scores=Q@K^T, softmax, output=attn@V
-    //     Flash attention kernel only supports head_dim<=128; GLM uses 256.
-    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeB(q,
-                                           k,
-                                           scores,
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(_qk_head_dim),
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(bh));
-    CAIF_DeviceOps::Scale(scores,scale);
-    if(_config.causal==true)
+    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMulTransposeB(q,
+                                       k,
+                                       scores,
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(QKHeadDim()),
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(bh),
+                                       ctx);
+    CAIF_Ops::Scale(scores,scale);
+    if(has_prefix==true)
     {
-      launch_causal_mask_fill(scores.DevicePtr(),
-                              static_cast<int>(bh),
-                              static_cast<int>(seq_len),
-                              _stream->Handle());
+      launch_prefix_mask_fill<StorageT>(scores.template DevicePtr<StorageT>(),
+                                         ctx.PrefixLengths().DevicePtr<uint32_t>(),
+                                         static_cast<int>(batch),
+                                         static_cast<int>(cfg.num_heads),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
     }
-    CAIF_DeviceTensor attn_weights=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    launch_attention_softmax(scores.DevicePtr(),
-                             attn_weights.DevicePtr(),
-                             static_cast<int>(bh*seq_len),
+    else if(cfg.causal==true)
+    {
+      launch_causal_mask_fill<StorageT>(scores.template DevicePtr<StorageT>(),
+                                         static_cast<int>(bh),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
+    }
+    // Templated softmax dispatch on StorageT (Phase 9 sweep extending the
+    // 5.1 MHA fix to MLA; MLA's constructor rejects Int8/Int4 storage so
+    // reaching this site with a non-fp32/fp16/bf16 StorageT is impossible).
+    CAIF_DeviceTensor attn_weights=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),scores.Dtype());
+    launch_attention_softmax<StorageT>(scores.template DevicePtr<StorageT>(),
+                                       attn_weights.template DevicePtr<StorageT>(),
+                                       static_cast<int>(bh*seq_len),
+                                       static_cast<int>(seq_len),
+                                       Stream().Handle());
+    CAIF_DeviceTensor attn_output=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMul(attn_weights,
+                             v,
+                             attn_output,
                              static_cast<int>(seq_len),
-                             _stream->Handle());
-    CAIF_DeviceTensor attn_output=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},*_stream);
-    CAIF_DeviceOps::BatchedMatMul(attn_weights,
-                                 v,
-                                 attn_output,
-                                 static_cast<int>(seq_len),
-                                 static_cast<int>(seq_len),
-                                 static_cast<int>(v_dim),
-                                 static_cast<int>(bh));
+                             static_cast<int>(seq_len),
+                             static_cast<int>(v_dim),
+                             static_cast<int>(bh),
+                             ctx);
 
     //------------------------------------------------------------------
     // Output projection
     //------------------------------------------------------------------
+    const std::vector<uint32_t> merged_shape={batch,seq_len,cfg.num_heads,v_dim};
+    CAIF_DeviceTensor attn_merged=CAIF_DeviceTensor::Uninitialized(merged_shape,Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(attn_output.template DevicePtr<StorageT>(),
+                                     attn_merged.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(v_dim),
+                                     Stream().Handle());
+    attn_merged.Reshape({bs,OInputDim()});
 
-    // 18. Merge heads: transpose [bh, seq, v_dim] -> [batch, seq, heads, v_dim] -> [bs, o_input_dim]
-    CAIF_DeviceTensor attn_merged=CAIF_DeviceTensor::Uninitialized(
-        {batch,seq_len,_config.num_heads,v_dim},*_stream);
-    launch_transpose_0213(attn_output.DevicePtr(),
-                          attn_merged.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(v_dim),
-                          _stream->Handle());
-    attn_merged.Reshape({bs,_o_input_dim});
-
-    // 19. Output projection: [bs, o_input_dim] -> [bs, dim]
     CAIF_DeviceTensor output;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      output=_projections.o_proj->Forward(attn_merged,training);
+      output=Projections().o_proj->Forward(attn_merged,ctx);
     }
     else
     {
-      output=CAIF_DeviceTensor::Uninitialized({bs,_config.dim},*_stream);
-      CAIF_DeviceOps::MatMul(attn_merged,_w_o,output);
+      output=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(attn_merged,WO(),output,ctx,ComputeDtype());
     }
 
     //------------------------------------------------------------------
     // Cache for backward
     //------------------------------------------------------------------
-    if(training==true)
+    if(ctx.Training()==true)
     {
-      _cached_input=std::move(flat_input);
-      _cached_q_compressed=std::move(q_compressed);
-      _cached_q_rms=std::move(q_rms);
-      _cached_q_normed=std::move(q_normed);
-      _cached_kv_compressed=std::move(kv_compressed);
-      _cached_kv_rms=std::move(kv_rms);
-      _cached_kv_normed=std::move(kv_normed);
-      _cached_q=std::move(q);
-      _cached_k=std::move(k);
-      _cached_v=std::move(v);
-      _cached_attn_output=std::move(attn_output);
-      _cached_merged=std::move(attn_merged);
-      _cached_batch=batch;
-      _cached_seq_len=seq_len;
+      SetCachedInput(std::move(flat_input));
+      SetCachedQCompressed(std::move(q_compressed));
+      SetCachedQRMS(std::move(q_rms));
+      SetCachedQNormed(std::move(q_normed));
+      SetCachedKVCompressed(std::move(kv_compressed));
+      SetCachedKVRMS(std::move(kv_rms));
+      SetCachedKVNormed(std::move(kv_normed));
+      SetCachedQ(std::move(q));
+      SetCachedK(std::move(k));
+      SetCachedV(std::move(v));
+      SetCachedAttnOutput(std::move(attn_output));
+      SetCachedMerged(std::move(attn_merged));
+      SetCachedBatch(batch);
+      SetCachedSeqLen(seq_len);
     }
 
-    output.Reshape({batch,seq_len,_config.dim});
+    output.Reshape({batch,seq_len,cfg.dim});
     return output;
   }
   CAIF_CATCH_BLOCK()
@@ -526,350 +571,349 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::Forward(const CAIF_DeviceTensor &input
 // Backward pass
 //------------------------------------------------------------------------------
 
-CAIF_DeviceTensor CAIF_DeviceMLAttention::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMLAttention<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)
 {
   try
   {
-    const uint32_t batch=_cached_batch;
-    const uint32_t seq_len=_cached_seq_len;
-    const uint32_t bs=batch*seq_len;
-    const uint32_t bh=batch*_config.num_heads;
-    const uint32_t nope=_config.qk_nope_head_dim;
-    const uint32_t rope=_config.qk_rope_head_dim;
-    const uint32_t v_dim=_config.v_head_dim;
-    const float scale=1.0f/std::sqrt(static_cast<float>(_qk_head_dim));
+    const bool has_prefix=ctx.HasPrefixLengths();
+    const MLAConfig_t &cfg=Config();
 
-    // Flatten grad_output to [bs, dim]
-    CAIF_DeviceTensor grad_flat=grad_output.Clone();
-    grad_flat.Reshape({bs,_config.dim});
+    const uint32_t batch=CachedBatch();
+    const uint32_t seq_len=CachedSeqLen();
+    const uint32_t bs=batch*seq_len;
+    const uint32_t bh=batch*cfg.num_heads;
+    const uint32_t nope=cfg.qk_nope_head_dim;
+    const uint32_t rope=cfg.qk_rope_head_dim;
+    const uint32_t v_dim=cfg.v_head_dim;
+    const float scale=1.0f/std::sqrt(static_cast<float>(QKHeadDim()));
+
+    // Flatten grad_output to [bs, dim] — zero-copy view
+    const std::vector<uint32_t> flat_shape={bs,cfg.dim};
+    CAIF_DeviceTensor grad_flat=CAIF_DeviceTensor::WrapView(
+                                 const_cast<void *>(grad_output.DeviceDataRaw()),
+                                 flat_shape,
+                                 Stream(),
+                                 grad_output.Dtype());
 
     //------------------------------------------------------------------
     // Output projection backward
     //------------------------------------------------------------------
     CAIF_DeviceTensor grad_merged;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      grad_merged=_projections.o_proj->Backward(grad_flat);
+      grad_merged=Projections().o_proj->Backward(grad_flat,ctx);
     }
     else
     {
-      // grad_merged = grad_flat @ W_o^T -> [bs, o_input_dim]
-      grad_merged=CAIF_DeviceTensor::Uninitialized({bs,_o_input_dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_flat,_w_o,grad_merged);
+      grad_merged=CAIF_DeviceTensor::Uninitialized({bs,OInputDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeB(grad_flat,WO(),grad_merged,ctx,ComputeDtype());
 
-      // grad_w_o += merged^T @ grad_flat
-      CAIF_DeviceTensor grad_w_o_delta=CAIF_DeviceTensor::Uninitialized(
-          {_o_input_dim,_config.dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_merged,grad_flat,grad_w_o_delta);
-      CAIF_DeviceOps::Add(_grad_w_o,grad_w_o_delta,_grad_w_o);
+      const std::vector<uint32_t> w_o_shape={OInputDim(),cfg.dim};
+      CAIF_DeviceTensor grad_w_o_delta=CAIF_DeviceTensor::Uninitialized(w_o_shape,Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeA(CachedMerged(),grad_flat,grad_w_o_delta,ctx,ComputeDtype());
+      CAIF_Ops::Add(GradWO(),grad_w_o_delta,MutableGradWO());
     }
 
     //------------------------------------------------------------------
     // Reverse merge heads: [bs, o_input_dim] -> [bh, seq, v_dim]
     //------------------------------------------------------------------
-    grad_merged.Reshape({batch,seq_len,_config.num_heads,v_dim});
-    CAIF_DeviceTensor grad_attn_output=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},*_stream);
-    launch_transpose_0213(grad_merged.DevicePtr(),
-                          grad_attn_output.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(v_dim),
-                          _stream->Handle());
+    grad_merged.Reshape({batch,seq_len,cfg.num_heads,v_dim});
+    CAIF_DeviceTensor grad_attn_output=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(grad_merged.template DevicePtr<StorageT>(),
+                                     grad_attn_output.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(v_dim),
+                                     Stream().Handle());
 
     //------------------------------------------------------------------
     // Standard attention backward: recompute attn, then matmul gradients
     //------------------------------------------------------------------
-
-    // Recompute attention weights from cached Q, K
-    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeB(_cached_q,
-                                           _cached_k,
-                                           scores,
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(_qk_head_dim),
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(bh));
-    CAIF_DeviceOps::Scale(scores,scale);
-    if(_config.causal==true)
+    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMulTransposeB(CachedQ(),
+                                       CachedK(),
+                                       scores,
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(QKHeadDim()),
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(bh),
+                                       ctx);
+    CAIF_Ops::Scale(scores,scale);
+    if(has_prefix==true)
     {
-      launch_causal_mask_fill(scores.DevicePtr(),
-                              static_cast<int>(bh),
-                              static_cast<int>(seq_len),
-                              _stream->Handle());
+      launch_prefix_mask_fill<StorageT>(scores.template DevicePtr<StorageT>(),
+                                         ctx.PrefixLengths().DevicePtr<uint32_t>(),
+                                         static_cast<int>(batch),
+                                         static_cast<int>(cfg.num_heads),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
     }
-    CAIF_DeviceTensor attn=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    launch_attention_softmax(scores.DevicePtr(),
-                             attn.DevicePtr(),
-                             static_cast<int>(bh*seq_len),
+    else if(cfg.causal==true)
+    {
+      launch_causal_mask_fill<StorageT>(scores.template DevicePtr<StorageT>(),
+                                         static_cast<int>(bh),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
+    }
+    CAIF_DeviceTensor attn=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),scores.Dtype());
+    launch_attention_softmax<StorageT>(scores.template DevicePtr<StorageT>(),
+                                       attn.template DevicePtr<StorageT>(),
+                                       static_cast<int>(bh*seq_len),
+                                       static_cast<int>(seq_len),
+                                       Stream().Handle());
+
+    CAIF_DeviceTensor grad_attn=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),scores.Dtype());
+    CAIF_Ops::BatchedMatMulTransposeB(grad_attn_output,
+                                       CachedV(),
+                                       grad_attn,
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(v_dim),
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(bh),
+                                       ctx);
+
+    CAIF_DeviceTensor grad_v=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMulTransposeA(attn,
+                                       grad_attn_output,
+                                       grad_v,
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(v_dim),
+                                       static_cast<int>(bh),
+                                       ctx);
+
+    CAIF_DeviceTensor grad_scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},Stream(),attn.Dtype());
+    launch_attention_softmax_backward<StorageT>(grad_attn.template DevicePtr<StorageT>(),
+                                                attn.template DevicePtr<StorageT>(),
+                                                grad_scores.template DevicePtr<StorageT>(),
+                                                static_cast<int>(bh*seq_len),
+                                                static_cast<int>(seq_len),
+                                                Stream().Handle());
+    if(has_prefix==true)
+    {
+      launch_prefix_mask_grad<StorageT>(grad_scores.template DevicePtr<StorageT>(),
+                                         ctx.PrefixLengths().DevicePtr<uint32_t>(),
+                                         static_cast<int>(batch),
+                                         static_cast<int>(cfg.num_heads),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
+    }
+    else if(cfg.causal==true)
+    {
+      launch_causal_mask_grad<StorageT>(grad_scores.template DevicePtr<StorageT>(),
+                                         static_cast<int>(bh),
+                                         static_cast<int>(seq_len),
+                                         Stream().Handle());
+    }
+    CAIF_Ops::Scale(grad_scores,scale);
+
+    CAIF_DeviceTensor grad_q=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMul(grad_scores,
+                             CachedK(),
+                             grad_q,
                              static_cast<int>(seq_len),
-                             _stream->Handle());
+                             static_cast<int>(seq_len),
+                             static_cast<int>(QKHeadDim()),
+                             static_cast<int>(bh),
+                             ctx);
 
-    // grad_attn = grad_attn_output @ V^T
-    CAIF_DeviceTensor grad_attn=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeB(grad_attn_output,
-                                           _cached_v,
-                                           grad_attn,
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(v_dim),
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(bh));
-
-    // grad_v = attn^T @ grad_attn_output
-    CAIF_DeviceTensor grad_v=CAIF_DeviceTensor::Uninitialized({bh,seq_len,v_dim},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeA(attn,
-                                           grad_attn_output,
-                                           grad_v,
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(v_dim),
-                                           static_cast<int>(bh));
-
-    // Softmax backward
-    CAIF_DeviceTensor grad_scores=CAIF_DeviceTensor::Uninitialized({bh,seq_len,seq_len},*_stream);
-    launch_attention_softmax_backward(grad_attn.DevicePtr(),
-                                      attn.DevicePtr(),
-                                      grad_scores.DevicePtr(),
-                                      static_cast<int>(bh*seq_len),
-                                      static_cast<int>(seq_len),
-                                      _stream->Handle());
-    if(_config.causal==true)
-    {
-      launch_causal_mask_grad(grad_scores.DevicePtr(),
-                              static_cast<int>(bh),
-                              static_cast<int>(seq_len),
-                              _stream->Handle());
-    }
-    CAIF_DeviceOps::Scale(grad_scores,scale);
-
-    // grad_q = grad_scores @ K
-    CAIF_DeviceTensor grad_q=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    CAIF_DeviceOps::BatchedMatMul(grad_scores,
-                                 _cached_k,
-                                 grad_q,
-                                 static_cast<int>(seq_len),
-                                 static_cast<int>(seq_len),
-                                 static_cast<int>(_qk_head_dim),
-                                 static_cast<int>(bh));
-
-    // grad_k = grad_scores^T @ Q
-    CAIF_DeviceTensor grad_k=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeA(grad_scores,
-                                           _cached_q,
-                                           grad_k,
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(seq_len),
-                                           static_cast<int>(_qk_head_dim),
-                                           static_cast<int>(bh));
+    CAIF_DeviceTensor grad_k=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMulTransposeA(grad_scores,
+                                       CachedQ(),
+                                       grad_k,
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(seq_len),
+                                       static_cast<int>(QKHeadDim()),
+                                       static_cast<int>(bh),
+                                       ctx);
 
     //------------------------------------------------------------------
     // Q path backward
     //------------------------------------------------------------------
-    const int q_rows=static_cast<int>(bh*seq_len);
+    CAIF_DeviceTensor grad_q_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor grad_q_rope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(grad_q,grad_q_nope,0);
+    CAIF_Ops::SliceLastDim(grad_q,grad_q_rope,static_cast<uint32_t>(nope));
 
-    // Split grad_q into grad_q_nope [bh,seq,nope] + grad_q_rope [bh,seq,rope]
-    CAIF_DeviceTensor grad_q_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},*_stream);
-    CAIF_DeviceTensor grad_q_rope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},*_stream);
-    launch_slice_last_dim(grad_q.DevicePtr(),grad_q_nope.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(grad_q.DevicePtr(),grad_q_rope.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),
-                          static_cast<int>(nope),static_cast<int>(rope),
-                          _stream->Handle());
+    launch_rope_backward<StorageT>(grad_q_rope.template DevicePtr<StorageT>(),
+                                    static_cast<int>(bh),
+                                    static_cast<int>(seq_len),
+                                    static_cast<int>(rope),
+                                    cfg.rope_base,
+                                    cfg.rope_style,
+                                    Stream().Handle());
 
-    // Inverse RoPE on grad_q_rope
-    launch_rope_backward(grad_q_rope.DevicePtr(),
-                         static_cast<int>(bh),
-                         static_cast<int>(seq_len),
-                         static_cast<int>(rope),
-                         _config.rope_base,
-                         _stream->Handle());
+    CAIF_DeviceTensor grad_q_full=CAIF_DeviceTensor::Uninitialized({bh,seq_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(grad_q_nope,grad_q_rope,grad_q_full);
 
-    // Reassemble grad_q_full [bh, seq, qk_head_dim]
-    CAIF_DeviceTensor grad_q_full=CAIF_DeviceTensor::Uninitialized({bh,seq_len,_qk_head_dim},*_stream);
-    launch_concat_last_dim(grad_q_nope.DevicePtr(),grad_q_rope.DevicePtr(),
-                           grad_q_full.DevicePtr(),
-                           q_rows,static_cast<int>(nope),static_cast<int>(rope),
-                           _stream->Handle());
+    const std::vector<uint32_t> q_merged_shape={batch,seq_len,cfg.num_heads,QKHeadDim()};
+    CAIF_DeviceTensor grad_q_merged=CAIF_DeviceTensor::Uninitialized(q_merged_shape,Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(grad_q_full.template DevicePtr<StorageT>(),
+                                     grad_q_merged.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(QKHeadDim()),
+                                     Stream().Handle());
+    grad_q_merged.Reshape({bs,QProjDim()});
 
-    // Reverse transpose: [bh, seq, qk_head_dim] -> [batch, seq, heads, qk_head_dim] -> [bs, q_proj_dim]
-    CAIF_DeviceTensor grad_q_merged=CAIF_DeviceTensor::Uninitialized(
-        {batch,seq_len,_config.num_heads,_qk_head_dim},*_stream);
-    launch_transpose_0213(grad_q_full.DevicePtr(),
-                          grad_q_merged.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(_qk_head_dim),
-                          _stream->Handle());
-    grad_q_merged.Reshape({bs,_q_proj_dim});
-
-    // Q decompress backward: grad_q_merged -> grad_q_normed
-    CAIF_DeviceTensor grad_q_normed;
-    if(_use_projections==true)
-    {
-      grad_q_normed=_projections.q_decompress->Backward(grad_q_merged);
-    }
-    else
-    {
-      grad_q_normed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_q_merged,_w_q_decompress,grad_q_normed);
-
-      CAIF_DeviceTensor grad_w_qd=CAIF_DeviceTensor::Uninitialized(
-          {_config.q_lora_rank,_q_proj_dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_q_normed,grad_q_merged,grad_w_qd);
-      CAIF_DeviceOps::Add(_grad_w_q_decompress,grad_w_qd,_grad_w_q_decompress);
-    }
-
-    // Q RMSNorm backward
-    CAIF_DeviceTensor grad_q_compressed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-    launch_rmsnorm_backward(grad_q_normed.DevicePtr(),
-                            _cached_q_compressed.DevicePtr(),
-                            _q_norm_gamma.DevicePtr(),
-                            _cached_q_rms.DevicePtr(),
-                            grad_q_compressed.DevicePtr(),
-                            _grad_q_norm_gamma.DevicePtr(),
-                            _config.rms_norm_eps,
-                            static_cast<int>(bs),
-                            static_cast<int>(_config.q_lora_rank),
-                            _stream->Handle());
-
-    // Q compress backward: grad_q_compressed -> grad_input_q
     CAIF_DeviceTensor grad_input_q;
-    if(_use_projections==true)
+    if(UsesQLoRA()==true)
     {
-      grad_input_q=_projections.q_compress->Backward(grad_q_compressed);
+      // grad_q_merged -> grad_q_normed -> grad_q_compressed -> grad_input_q
+      CAIF_DeviceTensor grad_q_normed;
+      if(UsesProjections()==true)
+      {
+        grad_q_normed=Projections().q_decompress->Backward(grad_q_merged,ctx);
+      }
+      else
+      {
+        grad_q_normed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+        CAIF_Ops::MatMulTransposeB(grad_q_merged,WQDecompress(),grad_q_normed,ctx,ComputeDtype());
+
+        const std::vector<uint32_t> w_qd_shape={cfg.q_lora_rank,QProjDim()};
+        CAIF_DeviceTensor grad_w_qd=CAIF_DeviceTensor::Uninitialized(w_qd_shape,Stream(),StorageDtype());
+        CAIF_Ops::MatMulTransposeA(CachedQNormed(),grad_q_merged,grad_w_qd,ctx,ComputeDtype());
+        CAIF_Ops::Add(GradWQDecompress(),grad_w_qd,MutableGradWQDecompress());
+      }
+
+      CAIF_DeviceTensor grad_q_compressed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+      launch_rmsnorm_backward<StorageT>(grad_q_normed.template DevicePtr<StorageT>(),
+                                         CachedQCompressed().template DevicePtr<StorageT>(),
+                                         QNormGamma().template DevicePtr<float>(),
+                                         CachedQRMS().template DevicePtr<float>(),
+                                         grad_q_compressed.template DevicePtr<StorageT>(),
+                                         MutableGradQNormGamma().template DevicePtr<float>(),
+                                         cfg.rms_norm_eps,
+                                         static_cast<int>(bs),
+                                         static_cast<int>(cfg.q_lora_rank),
+                                         Stream().Handle());
+
+      if(UsesProjections()==true)
+      {
+        grad_input_q=Projections().q_compress->Backward(grad_q_compressed,ctx);
+      }
+      else
+      {
+        grad_input_q=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+        CAIF_Ops::MatMulTransposeB(grad_q_compressed,WQCompress(),grad_input_q,ctx,ComputeDtype());
+
+        const std::vector<uint32_t> w_qc_shape={cfg.dim,cfg.q_lora_rank};
+        CAIF_DeviceTensor grad_w_qc=CAIF_DeviceTensor::Uninitialized(w_qc_shape,Stream(),StorageDtype());
+        CAIF_Ops::MatMulTransposeA(CachedInput(),grad_q_compressed,grad_w_qc,ctx,ComputeDtype());
+        CAIF_Ops::Add(GradWQCompress(),grad_w_qc,MutableGradWQCompress());
+      }
     }
     else
     {
-      grad_input_q=CAIF_DeviceTensor::Uninitialized({bs,_config.dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_q_compressed,_w_q_compress,grad_input_q);
+      // q_lora_rank==0: direct grad_q_merged -> grad_input_q via _w_q.
+      grad_input_q=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeB(grad_q_merged,WQ(),grad_input_q,ctx,ComputeDtype());
 
-      CAIF_DeviceTensor grad_w_qc=CAIF_DeviceTensor::Uninitialized(
-          {_config.dim,_config.q_lora_rank},*_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_input,grad_q_compressed,grad_w_qc);
-      CAIF_DeviceOps::Add(_grad_w_q_compress,grad_w_qc,_grad_w_q_compress);
+      const std::vector<uint32_t> w_q_shape={cfg.dim,QProjDim()};
+      CAIF_DeviceTensor grad_w_q_delta=CAIF_DeviceTensor::Uninitialized(w_q_shape,Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeA(CachedInput(),grad_q_merged,grad_w_q_delta,ctx,ComputeDtype());
+      CAIF_Ops::Add(GradWQ(),grad_w_q_delta,MutableGradWQ());
     }
 
     //------------------------------------------------------------------
     // KV path backward
     //------------------------------------------------------------------
-    const int kv_rows=static_cast<int>(bh*seq_len);
+    CAIF_DeviceTensor grad_k_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor grad_k_pe=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(grad_k,grad_k_nope,0);
+    CAIF_Ops::SliceLastDim(grad_k,grad_k_pe,static_cast<uint32_t>(nope));
 
-    // Split grad_k into grad_k_nope [bh,seq,nope] + grad_k_pe [bh,seq,rope]
-    CAIF_DeviceTensor grad_k_nope=CAIF_DeviceTensor::Uninitialized({bh,seq_len,nope},*_stream);
-    CAIF_DeviceTensor grad_k_pe=CAIF_DeviceTensor::Uninitialized({bh,seq_len,rope},*_stream);
-    launch_slice_last_dim(grad_k.DevicePtr(),grad_k_nope.DevicePtr(),
-                          kv_rows,static_cast<int>(_qk_head_dim),0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(grad_k.DevicePtr(),grad_k_pe.DevicePtr(),
-                          kv_rows,static_cast<int>(_qk_head_dim),
-                          static_cast<int>(nope),static_cast<int>(rope),
-                          _stream->Handle());
+    launch_rope_backward<StorageT>(grad_k_pe.template DevicePtr<StorageT>(),
+                                    static_cast<int>(bh),
+                                    static_cast<int>(seq_len),
+                                    static_cast<int>(rope),
+                                    cfg.rope_base,
+                                    cfg.rope_style,
+                                    Stream().Handle());
 
-    // Inverse RoPE on grad_k_pe
-    launch_rope_backward(grad_k_pe.DevicePtr(),
-                         static_cast<int>(bh),
-                         static_cast<int>(seq_len),
-                         static_cast<int>(rope),
-                         _config.rope_base,
-                         _stream->Handle());
-
-    // Reduce k_pe broadcast: [bh, seq, rope] -> [batch, seq, rope]
-    CAIF_DeviceTensor grad_k_pe_flat=CAIF_DeviceTensor::Zeros({batch,seq_len,rope},*_stream);
-    launch_gqa_reduce_kv(grad_k_pe.DevicePtr(),
-                         grad_k_pe_flat.DevicePtr(),
-                         static_cast<int>(batch),
-                         1,
-                         static_cast<int>(_config.num_heads),
-                         static_cast<int>(seq_len),
-                         static_cast<int>(rope),
-                         _stream->Handle());
+    CAIF_DeviceTensor grad_k_pe_flat=CAIF_DeviceTensor::Zeros({batch,seq_len,rope},Stream(),StorageDtype());
+    launch_gqa_reduce_kv<StorageT>(grad_k_pe.template DevicePtr<StorageT>(),
+                                    grad_k_pe_flat.template DevicePtr<StorageT>(),
+                                    static_cast<int>(batch),
+                                    1,
+                                    static_cast<int>(cfg.num_heads),
+                                    static_cast<int>(seq_len),
+                                    static_cast<int>(rope),
+                                    Stream().Handle());
     grad_k_pe_flat.Reshape({bs,rope});
 
-    // Reassemble grad_kv_decomp: concat [k_nope | v] per head -> [bh, seq, nope+v_dim]
     const uint32_t kv_per_head=nope+v_dim;
-    CAIF_DeviceTensor grad_kv_heads=CAIF_DeviceTensor::Uninitialized({bh,seq_len,kv_per_head},*_stream);
-    launch_concat_last_dim(grad_k_nope.DevicePtr(),grad_v.DevicePtr(),
-                           grad_kv_heads.DevicePtr(),
-                           kv_rows,static_cast<int>(nope),static_cast<int>(v_dim),
-                           _stream->Handle());
+    CAIF_DeviceTensor grad_kv_heads=CAIF_DeviceTensor::Uninitialized({bh,seq_len,kv_per_head},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(grad_k_nope,grad_v,grad_kv_heads);
 
-    // Reverse transpose: [bh, seq, kv_per_head] -> [batch, seq, heads, kv_per_head] -> [bs, kv_decomp_dim]
-    CAIF_DeviceTensor grad_kv_merged=CAIF_DeviceTensor::Uninitialized(
-        {batch,seq_len,_config.num_heads,kv_per_head},*_stream);
-    launch_transpose_0213(grad_kv_heads.DevicePtr(),
-                          grad_kv_merged.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(seq_len),
-                          static_cast<int>(kv_per_head),
-                          _stream->Handle());
-    grad_kv_merged.Reshape({bs,_kv_decomp_dim});
+    const std::vector<uint32_t> kv_merged_shape={batch,seq_len,cfg.num_heads,kv_per_head};
+    CAIF_DeviceTensor grad_kv_merged=CAIF_DeviceTensor::Uninitialized(kv_merged_shape,Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(grad_kv_heads.template DevicePtr<StorageT>(),
+                                     grad_kv_merged.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(seq_len),
+                                     static_cast<int>(kv_per_head),
+                                     Stream().Handle());
+    grad_kv_merged.Reshape({bs,KVDecompDim()});
 
-    // KV decompress backward: grad_kv_merged -> grad_kv_normed
     CAIF_DeviceTensor grad_kv_normed;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      grad_kv_normed=_projections.kv_decompress->Backward(grad_kv_merged);
+      grad_kv_normed=Projections().kv_decompress->Backward(grad_kv_merged,ctx);
     }
     else
     {
-      grad_kv_normed=CAIF_DeviceTensor::Uninitialized({bs,_config.kv_lora_rank},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_kv_merged,_w_kv_decompress,grad_kv_normed);
+      grad_kv_normed=CAIF_DeviceTensor::Uninitialized({bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeB(grad_kv_merged,WKVDecompress(),grad_kv_normed,ctx,ComputeDtype());
 
-      CAIF_DeviceTensor grad_w_kvd=CAIF_DeviceTensor::Uninitialized(
-          {_config.kv_lora_rank,_kv_decomp_dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_kv_normed,grad_kv_merged,grad_w_kvd);
-      CAIF_DeviceOps::Add(_grad_w_kv_decompress,grad_w_kvd,_grad_w_kv_decompress);
+      const std::vector<uint32_t> w_kvd_shape={cfg.kv_lora_rank,KVDecompDim()};
+      CAIF_DeviceTensor grad_w_kvd=CAIF_DeviceTensor::Uninitialized(w_kvd_shape,Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeA(CachedKVNormed(),grad_kv_merged,grad_w_kvd,ctx,ComputeDtype());
+      CAIF_Ops::Add(GradWKVDecompress(),grad_w_kvd,MutableGradWKVDecompress());
     }
 
-    // KV RMSNorm backward
     CAIF_DeviceTensor grad_kv_compressed=CAIF_DeviceTensor::Uninitialized(
-        {bs,_config.kv_lora_rank},*_stream);
-    launch_rmsnorm_backward(grad_kv_normed.DevicePtr(),
-                            _cached_kv_compressed.DevicePtr(),
-                            _kv_norm_gamma.DevicePtr(),
-                            _cached_kv_rms.DevicePtr(),
-                            grad_kv_compressed.DevicePtr(),
-                            _grad_kv_norm_gamma.DevicePtr(),
-                            _config.rms_norm_eps,
-                            static_cast<int>(bs),
-                            static_cast<int>(_config.kv_lora_rank),
-                            _stream->Handle());
+        {bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+    launch_rmsnorm_backward<StorageT>(grad_kv_normed.template DevicePtr<StorageT>(),
+                                       CachedKVCompressed().template DevicePtr<StorageT>(),
+                                       KVNormGamma().template DevicePtr<float>(),
+                                       CachedKVRMS().template DevicePtr<float>(),
+                                       grad_kv_compressed.template DevicePtr<StorageT>(),
+                                       MutableGradKVNormGamma().template DevicePtr<float>(),
+                                       cfg.rms_norm_eps,
+                                       static_cast<int>(bs),
+                                       static_cast<int>(cfg.kv_lora_rank),
+                                       Stream().Handle());
 
-    // Reassemble grad_kv_out: concat [kv_compressed | k_pe_flat] -> [bs, kv_compress_dim]
-    CAIF_DeviceTensor grad_kv_out=CAIF_DeviceTensor::Uninitialized({bs,_kv_compress_dim},*_stream);
-    launch_concat_last_dim(grad_kv_compressed.DevicePtr(),grad_k_pe_flat.DevicePtr(),
-                           grad_kv_out.DevicePtr(),
-                           static_cast<int>(bs),
-                           static_cast<int>(_config.kv_lora_rank),static_cast<int>(rope),
-                           _stream->Handle());
+    CAIF_DeviceTensor grad_kv_out=CAIF_DeviceTensor::Uninitialized({bs,KVCompressDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(grad_kv_compressed,grad_k_pe_flat,grad_kv_out);
 
-    // KV compress backward: grad_kv_out -> grad_input_kv
     CAIF_DeviceTensor grad_input_kv;
-    if(_use_projections==true)
+    if(UsesProjections()==true)
     {
-      grad_input_kv=_projections.kv_compress->Backward(grad_kv_out);
+      grad_input_kv=Projections().kv_compress->Backward(grad_kv_out,ctx);
     }
     else
     {
-      grad_input_kv=CAIF_DeviceTensor::Uninitialized({bs,_config.dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeB(grad_kv_out,_w_kv_compress,grad_input_kv);
+      grad_input_kv=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeB(grad_kv_out,WKVCompress(),grad_input_kv,ctx,ComputeDtype());
 
-      CAIF_DeviceTensor grad_w_kvc=CAIF_DeviceTensor::Uninitialized(
-          {_config.dim,_kv_compress_dim},*_stream);
-      CAIF_DeviceOps::MatMulTransposeA(_cached_input,grad_kv_out,grad_w_kvc);
-      CAIF_DeviceOps::Add(_grad_w_kv_compress,grad_w_kvc,_grad_w_kv_compress);
+      const std::vector<uint32_t> w_kvc_shape={cfg.dim,KVCompressDim()};
+      CAIF_DeviceTensor grad_w_kvc=CAIF_DeviceTensor::Uninitialized(w_kvc_shape,Stream(),StorageDtype());
+      CAIF_Ops::MatMulTransposeA(CachedInput(),grad_kv_out,grad_w_kvc,ctx,ComputeDtype());
+      CAIF_Ops::Add(GradWKVCompress(),grad_w_kvc,MutableGradWKVCompress());
     }
 
     //------------------------------------------------------------------
     // Combine input gradients
     //------------------------------------------------------------------
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({bs,_config.dim},*_stream);
-    CAIF_DeviceOps::Add(grad_input_q,grad_input_kv,grad_input);
-    grad_input.Reshape({batch,seq_len,_config.dim});
+    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+    CAIF_Ops::Add(grad_input_q,grad_input_kv,grad_input);
+    grad_input.Reshape({batch,seq_len,cfg.dim});
 
     return grad_input;
   }
@@ -880,54 +924,64 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::Backward(const CAIF_DeviceTensor &grad
 // Parameter management
 //------------------------------------------------------------------------------
 
-void CAIF_DeviceMLAttention::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::ZeroGradients()
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
-    _projections.q_compress->ZeroGradients();
-    _projections.q_decompress->ZeroGradients();
-    _projections.kv_compress->ZeroGradients();
-    _projections.kv_decompress->ZeroGradients();
-    _projections.o_proj->ZeroGradients();
-    _grad_q_norm_gamma.Fill(0.0f);
-    _grad_kv_norm_gamma.Fill(0.0f);
+    Projections().q_compress->ZeroGradients();
+    Projections().q_decompress->ZeroGradients();
+    Projections().kv_compress->ZeroGradients();
+    Projections().kv_decompress->ZeroGradients();
+    Projections().o_proj->ZeroGradients();
+    MutableGradQNormGamma().FillZero();
+    MutableGradKVNormGamma().FillZero();
+    return;
+  }
+  if(UsesQLoRA()==true)
+  {
+    MutableGradWQCompress().FillZero();
+    MutableGradQNormGamma().FillZero();
+    MutableGradWQDecompress().FillZero();
   }
   else
   {
-    _grad_w_q_compress.Fill(0.0f);
-    _grad_q_norm_gamma.Fill(0.0f);
-    _grad_w_q_decompress.Fill(0.0f);
-    _grad_w_kv_compress.Fill(0.0f);
-    _grad_kv_norm_gamma.Fill(0.0f);
-    _grad_w_kv_decompress.Fill(0.0f);
-    _grad_w_o.Fill(0.0f);
+    MutableGradWQ().FillZero();
   }
+  MutableGradWKVCompress().FillZero();
+  MutableGradKVNormGamma().FillZero();
+  MutableGradWKVDecompress().FillZero();
+  MutableGradWO().FillZero();
 }
 
-size_t CAIF_DeviceMLAttention::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMLAttention<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
-    return _projections.q_compress->ParameterTensorCount()+
-           _projections.q_decompress->ParameterTensorCount()+
-           _projections.kv_compress->ParameterTensorCount()+
-           _projections.kv_decompress->ParameterTensorCount()+
-           _projections.o_proj->ParameterTensorCount()+
+    return Projections().q_compress->ParameterTensorCount()+
+           Projections().q_decompress->ParameterTensorCount()+
+           Projections().kv_compress->ParameterTensorCount()+
+           Projections().kv_decompress->ParameterTensorCount()+
+           Projections().o_proj->ParameterTensorCount()+
            2;
   }
-  return 7;
+  // q_lora_rank>0: WQC, QNorm, WQD, WKVC, KVNorm, WKVD, WO = 7
+  // q_lora_rank==0: WQ, WKVC, KVNorm, WKVD, WO = 5
+  return UsesQLoRA()==true?7:5;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMLAttention::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMLAttention<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
     size_t offset=0;
-    CAIF_DeviceLayer *projs[]={_projections.q_compress.get(),
-                              _projections.q_decompress.get(),
-                              _projections.kv_compress.get(),
-                              _projections.kv_decompress.get(),
-                              _projections.o_proj.get()};
+    CAIF_DeviceLayer *projs[]={Projections().q_compress.get(),
+                               Projections().q_decompress.get(),
+                               Projections().kv_compress.get(),
+                               Projections().kv_decompress.get(),
+                               Projections().o_proj.get()};
     for(size_t p=0;p<5;++p)
     {
       const size_t count=projs[p]->ParameterTensorCount();
@@ -937,30 +991,42 @@ CAIF_DeviceTensor &CAIF_DeviceMLAttention::ParameterTensor(size_t index)
       }
       offset+=count;
     }
-    if(index==offset){return _q_norm_gamma;}
-    if(index==offset+1){return _kv_norm_gamma;}
+    if(index==offset){return MutableQNormGamma();}
+    if(index==offset+1){return MutableKVNormGamma();}
     THROW_CAIFE("MLA ParameterTensor: index out of range");
   }
-  if(index==0){return _w_q_compress;}
-  if(index==1){return _q_norm_gamma;}
-  if(index==2){return _w_q_decompress;}
-  if(index==3){return _w_kv_compress;}
-  if(index==4){return _kv_norm_gamma;}
-  if(index==5){return _w_kv_decompress;}
-  if(index==6){return _w_o;}
+  if(UsesQLoRA()==true)
+  {
+    if(index==0){return MutableWQCompress();}
+    if(index==1){return MutableQNormGamma();}
+    if(index==2){return MutableWQDecompress();}
+    if(index==3){return MutableWKVCompress();}
+    if(index==4){return MutableKVNormGamma();}
+    if(index==5){return MutableWKVDecompress();}
+    if(index==6){return MutableWO();}
+  }
+  else
+  {
+    if(index==0){return MutableWQ();}
+    if(index==1){return MutableWKVCompress();}
+    if(index==2){return MutableKVNormGamma();}
+    if(index==3){return MutableWKVDecompress();}
+    if(index==4){return MutableWO();}
+  }
   THROW_CAIFE("MLA ParameterTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMLAttention::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMLAttention<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
     size_t offset=0;
-    const CAIF_DeviceLayer *projs[]={_projections.q_compress.get(),
-                                    _projections.q_decompress.get(),
-                                    _projections.kv_compress.get(),
-                                    _projections.kv_decompress.get(),
-                                    _projections.o_proj.get()};
+    const CAIF_DeviceLayer *projs[]={Projections().q_compress.get(),
+                                     Projections().q_decompress.get(),
+                                     Projections().kv_compress.get(),
+                                     Projections().kv_decompress.get(),
+                                     Projections().o_proj.get()};
     for(size_t p=0;p<5;++p)
     {
       const size_t count=projs[p]->ParameterTensorCount();
@@ -970,30 +1036,42 @@ const CAIF_DeviceTensor &CAIF_DeviceMLAttention::ParameterTensor(size_t index)co
       }
       offset+=count;
     }
-    if(index==offset){return _q_norm_gamma;}
-    if(index==offset+1){return _kv_norm_gamma;}
+    if(index==offset){return QNormGamma();}
+    if(index==offset+1){return KVNormGamma();}
     THROW_CAIFE("MLA ParameterTensor: index out of range");
   }
-  if(index==0){return _w_q_compress;}
-  if(index==1){return _q_norm_gamma;}
-  if(index==2){return _w_q_decompress;}
-  if(index==3){return _w_kv_compress;}
-  if(index==4){return _kv_norm_gamma;}
-  if(index==5){return _w_kv_decompress;}
-  if(index==6){return _w_o;}
+  if(UsesQLoRA()==true)
+  {
+    if(index==0){return WQCompress();}
+    if(index==1){return QNormGamma();}
+    if(index==2){return WQDecompress();}
+    if(index==3){return WKVCompress();}
+    if(index==4){return KVNormGamma();}
+    if(index==5){return WKVDecompress();}
+    if(index==6){return WO();}
+  }
+  else
+  {
+    if(index==0){return WQ();}
+    if(index==1){return WKVCompress();}
+    if(index==2){return KVNormGamma();}
+    if(index==3){return WKVDecompress();}
+    if(index==4){return WO();}
+  }
   THROW_CAIFE("MLA ParameterTensor: index out of range");
 }
 
-CAIF_DeviceTensor &CAIF_DeviceMLAttention::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceMLAttention<ComputeT,StorageT>::GradientTensor(size_t index)
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
     size_t offset=0;
-    CAIF_DeviceLayer *projs[]={_projections.q_compress.get(),
-                              _projections.q_decompress.get(),
-                              _projections.kv_compress.get(),
-                              _projections.kv_decompress.get(),
-                              _projections.o_proj.get()};
+    CAIF_DeviceLayer *projs[]={Projections().q_compress.get(),
+                               Projections().q_decompress.get(),
+                               Projections().kv_compress.get(),
+                               Projections().kv_decompress.get(),
+                               Projections().o_proj.get()};
     for(size_t p=0;p<5;++p)
     {
       const size_t count=projs[p]->ParameterTensorCount();
@@ -1003,30 +1081,42 @@ CAIF_DeviceTensor &CAIF_DeviceMLAttention::GradientTensor(size_t index)
       }
       offset+=count;
     }
-    if(index==offset){return _grad_q_norm_gamma;}
-    if(index==offset+1){return _grad_kv_norm_gamma;}
+    if(index==offset){return MutableGradQNormGamma();}
+    if(index==offset+1){return MutableGradKVNormGamma();}
     THROW_CAIFE("MLA GradientTensor: index out of range");
   }
-  if(index==0){return _grad_w_q_compress;}
-  if(index==1){return _grad_q_norm_gamma;}
-  if(index==2){return _grad_w_q_decompress;}
-  if(index==3){return _grad_w_kv_compress;}
-  if(index==4){return _grad_kv_norm_gamma;}
-  if(index==5){return _grad_w_kv_decompress;}
-  if(index==6){return _grad_w_o;}
+  if(UsesQLoRA()==true)
+  {
+    if(index==0){return MutableGradWQCompress();}
+    if(index==1){return MutableGradQNormGamma();}
+    if(index==2){return MutableGradWQDecompress();}
+    if(index==3){return MutableGradWKVCompress();}
+    if(index==4){return MutableGradKVNormGamma();}
+    if(index==5){return MutableGradWKVDecompress();}
+    if(index==6){return MutableGradWO();}
+  }
+  else
+  {
+    if(index==0){return MutableGradWQ();}
+    if(index==1){return MutableGradWKVCompress();}
+    if(index==2){return MutableGradKVNormGamma();}
+    if(index==3){return MutableGradWKVDecompress();}
+    if(index==4){return MutableGradWO();}
+  }
   THROW_CAIFE("MLA GradientTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceMLAttention::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceMLAttention<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
     size_t offset=0;
-    const CAIF_DeviceLayer *projs[]={_projections.q_compress.get(),
-                                    _projections.q_decompress.get(),
-                                    _projections.kv_compress.get(),
-                                    _projections.kv_decompress.get(),
-                                    _projections.o_proj.get()};
+    const CAIF_DeviceLayer *projs[]={Projections().q_compress.get(),
+                                     Projections().q_decompress.get(),
+                                     Projections().kv_compress.get(),
+                                     Projections().kv_decompress.get(),
+                                     Projections().o_proj.get()};
     for(size_t p=0;p<5;++p)
     {
       const size_t count=projs[p]->ParameterTensorCount();
@@ -1036,31 +1126,43 @@ const CAIF_DeviceTensor &CAIF_DeviceMLAttention::GradientTensor(size_t index)con
       }
       offset+=count;
     }
-    if(index==offset){return _grad_q_norm_gamma;}
-    if(index==offset+1){return _grad_kv_norm_gamma;}
+    if(index==offset){return GradQNormGamma();}
+    if(index==offset+1){return GradKVNormGamma();}
     THROW_CAIFE("MLA GradientTensor: index out of range");
   }
-  if(index==0){return _grad_w_q_compress;}
-  if(index==1){return _grad_q_norm_gamma;}
-  if(index==2){return _grad_w_q_decompress;}
-  if(index==3){return _grad_w_kv_compress;}
-  if(index==4){return _grad_kv_norm_gamma;}
-  if(index==5){return _grad_w_kv_decompress;}
-  if(index==6){return _grad_w_o;}
+  if(UsesQLoRA()==true)
+  {
+    if(index==0){return GradWQCompress();}
+    if(index==1){return GradQNormGamma();}
+    if(index==2){return GradWQDecompress();}
+    if(index==3){return GradWKVCompress();}
+    if(index==4){return GradKVNormGamma();}
+    if(index==5){return GradWKVDecompress();}
+    if(index==6){return GradWO();}
+  }
+  else
+  {
+    if(index==0){return GradWQ();}
+    if(index==1){return GradWKVCompress();}
+    if(index==2){return GradKVNormGamma();}
+    if(index==3){return GradWKVDecompress();}
+    if(index==4){return GradWO();}
+  }
   THROW_CAIFE("MLA GradientTensor: index out of range");
 }
 
-size_t CAIF_DeviceMLAttention::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceMLAttention<ComputeT,StorageT>::TotalParameterCount()const
 {
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
-    return _projections.q_compress->TotalParameterCount()+
-           _projections.q_decompress->TotalParameterCount()+
-           _projections.kv_compress->TotalParameterCount()+
-           _projections.kv_decompress->TotalParameterCount()+
-           _projections.o_proj->TotalParameterCount()+
-           _config.q_lora_rank+
-           _config.kv_lora_rank;
+    return Projections().q_compress->TotalParameterCount()+
+           Projections().q_decompress->TotalParameterCount()+
+           Projections().kv_compress->TotalParameterCount()+
+           Projections().kv_decompress->TotalParameterCount()+
+           Projections().o_proj->TotalParameterCount()+
+           Config().q_lora_rank+
+           Config().kv_lora_rank;
   }
   size_t total=0;
   for(size_t i=0;i<ParameterTensorCount();++i)
@@ -1070,59 +1172,77 @@ size_t CAIF_DeviceMLAttention::TotalParameterCount()const
   return total;
 }
 
-std::string CAIF_DeviceMLAttention::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceMLAttention<ComputeT,StorageT>::Description()const
 {
   std::ostringstream ss;
-  ss<<"MLA(dim="<<_config.dim
-    <<",heads="<<_config.num_heads
-    <<",q_lora="<<_config.q_lora_rank
-    <<",kv_lora="<<_config.kv_lora_rank
-    <<",nope="<<_config.qk_nope_head_dim
-    <<",rope="<<_config.qk_rope_head_dim
-    <<",v="<<_config.v_head_dim
+  ss<<"MLA(dim="<<Config().dim
+    <<",heads="<<Config().num_heads
+    <<",q_lora="<<Config().q_lora_rank
+    <<",kv_lora="<<Config().kv_lora_rank
+    <<",nope="<<Config().qk_nope_head_dim
+    <<",rope="<<Config().qk_rope_head_dim
+    <<",v="<<Config().v_head_dim
     <<",params="<<TotalParameterCount();
-  if(_use_projections==true)
+  if(UsesProjections()==true)
   {
     ss<<",projections";
+  }
+  if(UsesQLoRA()==false)
+  {
+    ss<<",direct_q";
   }
   ss<<")";
   return ss.str();
 }
 
-std::vector<std::string> CAIF_DeviceMLAttention::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string> CAIF_DeviceMLAttention<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
-  if(_use_projections==true)
+  // CAIF-neutral role names. External naming conventions (HuggingFace
+  // safetensors, third-party checkpoint formats) are the caller's
+  // responsibility — naming profiles, weight loaders, and safetensors
+  // mappers translate these role tags to whatever their upstream system
+  // expects.
+  if(UsesProjections()==true)
   {
     std::vector<std::string> names;
     std::vector<std::string> sub;
 
-    sub=_projections.q_compress->ParameterNames(prefix+"q_a_proj.");
+    sub=Projections().q_compress->ParameterNames(prefix+"w_q_compress.");
     names.insert(names.end(),sub.begin(),sub.end());
 
-    sub=_projections.q_decompress->ParameterNames(prefix+"q_b_proj.");
+    sub=Projections().q_decompress->ParameterNames(prefix+"w_q_decompress.");
     names.insert(names.end(),sub.begin(),sub.end());
 
-    sub=_projections.kv_compress->ParameterNames(prefix+"kv_a_proj_with_mqa.");
+    sub=Projections().kv_compress->ParameterNames(prefix+"w_kv_compress.");
     names.insert(names.end(),sub.begin(),sub.end());
 
-    sub=_projections.kv_decompress->ParameterNames(prefix+"kv_b_proj.");
+    sub=Projections().kv_decompress->ParameterNames(prefix+"w_kv_decompress.");
     names.insert(names.end(),sub.begin(),sub.end());
 
-    sub=_projections.o_proj->ParameterNames(prefix+"o_proj.");
+    sub=Projections().o_proj->ParameterNames(prefix+"w_o.");
     names.insert(names.end(),sub.begin(),sub.end());
 
-    names.push_back(prefix+"q_a_layernorm.weight");
-    names.push_back(prefix+"kv_a_layernorm.weight");
+    names.push_back(prefix+"q_norm_gamma");
+    names.push_back(prefix+"kv_norm_gamma");
     return names;
   }
   std::vector<std::string> names;
-  names.push_back(prefix+"q_a_proj.weight");
-  names.push_back(prefix+"q_a_layernorm.weight");
-  names.push_back(prefix+"q_b_proj.weight");
-  names.push_back(prefix+"kv_a_proj_with_mqa.weight");
-  names.push_back(prefix+"kv_a_layernorm.weight");
-  names.push_back(prefix+"kv_b_proj.weight");
-  names.push_back(prefix+"o_proj.weight");
+  if(UsesQLoRA()==true)
+  {
+    names.push_back(prefix+"w_q_compress");
+    names.push_back(prefix+"q_norm_gamma");
+    names.push_back(prefix+"w_q_decompress");
+  }
+  else
+  {
+    names.push_back(prefix+"w_q");
+  }
+  names.push_back(prefix+"w_kv_compress");
+  names.push_back(prefix+"kv_norm_gamma");
+  names.push_back(prefix+"w_kv_decompress");
+  names.push_back(prefix+"w_o");
   return names;
 }
 
@@ -1130,38 +1250,48 @@ std::vector<std::string> CAIF_DeviceMLAttention::ParameterNames(const std::strin
 // Weight initialization
 //------------------------------------------------------------------------------
 
-void CAIF_DeviceMLAttention::InitializeWeights(uint32_t seed)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
 {
   try
   {
     std::mt19937 rng(seed);
+    const MLAConfig_t &cfg=Config();
 
-    // Xavier uniform for weight matrices
-    const float limit_qc=std::sqrt(6.0f/static_cast<float>(_config.dim+_config.q_lora_rank));
-    const float limit_qd=std::sqrt(6.0f/static_cast<float>(_config.q_lora_rank+_q_proj_dim));
-    const float limit_kvc=std::sqrt(6.0f/static_cast<float>(_config.dim+_kv_compress_dim));
-    const float limit_kvd=std::sqrt(6.0f/static_cast<float>(_config.kv_lora_rank+_kv_decomp_dim));
-    const float limit_o=std::sqrt(6.0f/static_cast<float>(_o_input_dim+_config.dim));
+    const float limit_q_direct=std::sqrt(6.0f/static_cast<float>(cfg.dim+QProjDim()));
+    const float limit_qc=std::sqrt(6.0f/static_cast<float>(cfg.dim+cfg.q_lora_rank));
+    const float limit_qd=std::sqrt(6.0f/static_cast<float>(cfg.q_lora_rank+QProjDim()));
+    const float limit_kvc=std::sqrt(6.0f/static_cast<float>(cfg.dim+KVCompressDim()));
+    const float limit_kvd=std::sqrt(6.0f/static_cast<float>(cfg.kv_lora_rank+KVDecompDim()));
+    const float limit_o=std::sqrt(6.0f/static_cast<float>(OInputDim()+cfg.dim));
 
-    // Helper to fill a tensor with uniform random values
-    auto fill_uniform=[&](CAIF_DeviceTensor &tensor,float limit)
-                      {
-                        std::uniform_real_distribution<float> dist(-limit,limit);
-                        std::vector<float> data(tensor.TotalElements());
-                        for(size_t i=0;i<data.size();++i)
-                        {
-                          data[i]=dist(rng);
-                        }
-                        tensor.CopyFromHost(data.data(),data.size());
-                      };
+    // Helper: fills a tensor with Xavier-uniform random values, casting to
+    // the layer's storage dtype for non-fp32 cells.
+    const CAIF_DataType::CAIF_DataType_e storage_dtype=StorageDtype();
+    auto fill_uniform=[&rng,storage_dtype](CAIF_DeviceTensor &tensor,float limit)
+    {
+      std::uniform_real_distribution<float> dist(-limit,limit);
+      const size_t n=tensor.TotalElements();
+      std::vector<float> data(n);
+      for(size_t i=0;i<n;++i)
+      {
+        data[i]=dist(rng);
+      }
+      tensor.CopyFromHostFp32(data.data(),n);
+    };
 
-    fill_uniform(_w_q_compress,limit_qc);
-    fill_uniform(_w_q_decompress,limit_qd);
-    fill_uniform(_w_kv_compress,limit_kvc);
-    fill_uniform(_w_kv_decompress,limit_kvd);
-    fill_uniform(_w_o,limit_o);
-
-    // Gamma stays at 1.0 (set in constructor)
+    if(UsesQLoRA()==true)
+    {
+      fill_uniform(MutableWQCompress(),limit_qc);
+      fill_uniform(MutableWQDecompress(),limit_qd);
+    }
+    else
+    {
+      fill_uniform(MutableWQ(),limit_q_direct);
+    }
+    fill_uniform(MutableWKVCompress(),limit_kvc);
+    fill_uniform(MutableWKVDecompress(),limit_kvd);
+    fill_uniform(MutableWO(),limit_o);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -1170,39 +1300,42 @@ void CAIF_DeviceMLAttention::InitializeWeights(uint32_t seed)
 // KV-Cache management
 //------------------------------------------------------------------------------
 
-void CAIF_DeviceMLAttention::EnableKVCache(uint32_t batch_size,uint32_t max_seq_len)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::EnableKVCache(uint32_t batch_size,uint32_t max_seq_len)
 {
   try
   {
-    _kv_cache_compressed=CAIF_DeviceTensor::Zeros(
-        {batch_size,max_seq_len,_config.kv_lora_rank},*_stream);
-    _kv_cache_k_pe=CAIF_DeviceTensor::Zeros(
-        {batch_size,max_seq_len,_config.qk_rope_head_dim},*_stream);
-    _kv_cache_len=0;
-    _kv_cache_max_len=max_seq_len;
-    _kv_cache_batch=batch_size;
-    _kv_cache_enabled=true;
+    const std::vector<uint32_t> kvc_shape={batch_size,max_seq_len,Config().kv_lora_rank};
+    const std::vector<uint32_t> kpe_shape={batch_size,max_seq_len,Config().qk_rope_head_dim};
+    SetKVCacheCompressed(CAIF_DeviceTensor::Zeros(kvc_shape,Stream(),StorageDtype()));
+    SetKVCacheKPE(CAIF_DeviceTensor::Zeros(kpe_shape,Stream(),StorageDtype()));
+    SetKVCacheLen(0);
+    SetKVCacheMaxLen(max_seq_len);
+    SetKVCacheBatch(batch_size);
+    SetKVCacheEnabled(true);
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceMLAttention::DisableKVCache()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::DisableKVCache()
 {
-  _kv_cache_compressed=CAIF_DeviceTensor();
-  _kv_cache_k_pe=CAIF_DeviceTensor();
-  _kv_cache_len=0;
-  _kv_cache_max_len=0;
-  _kv_cache_batch=0;
-  _kv_cache_enabled=false;
+  SetKVCacheCompressed(CAIF_DeviceTensor());
+  SetKVCacheKPE(CAIF_DeviceTensor());
+  SetKVCacheLen(0);
+  SetKVCacheMaxLen(0);
+  SetKVCacheBatch(0);
+  SetKVCacheEnabled(false);
 }
 
-void CAIF_DeviceMLAttention::ResetKVCache()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::ResetKVCache()
 {
-  if(_kv_cache_enabled==true)
+  if(IsKVCacheEnabled()==true)
   {
-    _kv_cache_compressed.Fill(0.0f);
-    _kv_cache_k_pe.Fill(0.0f);
-    _kv_cache_len=0;
+    MutableKVCacheCompressed().FillZero();
+    MutableKVCacheKPE().FillZero();
+    SetKVCacheLen(0);
   }
 }
 
@@ -1210,17 +1343,20 @@ void CAIF_DeviceMLAttention::ResetKVCache()
 // Cached forward (autoregressive inference)
 //------------------------------------------------------------------------------
 
-CAIF_DeviceTensor CAIF_DeviceMLAttention::ForwardCached(const CAIF_DeviceTensor &input)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceMLAttention<ComputeT,StorageT>::ForwardCached(const CAIF_DeviceTensor &input,
+                                                        CAIF_RunContext &ctx)
 {
   try
   {
-    if(_kv_cache_enabled==false)
+    if(IsKVCacheEnabled()==false)
     {
       THROW_CAIFE("MLA ForwardCached: KV cache not enabled");
     }
 
+    const MLAConfig_t &cfg=Config();
     const auto &shape=input.Shape();
-    if(shape.size()!=3||shape[2]!=_config.dim)
+    if(shape.size()!=3||shape[2]!=cfg.dim)
     {
       THROW_CAIFE("MLA ForwardCached: input must be [batch, seq_len, dim]");
     }
@@ -1228,269 +1364,446 @@ CAIF_DeviceTensor CAIF_DeviceMLAttention::ForwardCached(const CAIF_DeviceTensor 
     const uint32_t batch=shape[0];
     const uint32_t new_len=shape[1];
     const uint32_t bs=batch*new_len;
-    const uint32_t bh=batch*_config.num_heads;
-    const uint32_t nope=_config.qk_nope_head_dim;
-    const uint32_t rope=_config.qk_rope_head_dim;
-    const uint32_t v_dim=_config.v_head_dim;
-    const uint32_t total_len=_kv_cache_len+new_len;
-    const float scale=1.0f/std::sqrt(static_cast<float>(_qk_head_dim));
+    const uint32_t bh=batch*cfg.num_heads;
+    const uint32_t nope=cfg.qk_nope_head_dim;
+    const uint32_t rope=cfg.qk_rope_head_dim;
+    const uint32_t v_dim=cfg.v_head_dim;
+    const uint32_t cache_len=KVCacheLength();
+    const uint32_t cache_max_len=KVCacheMaxLen();
+    const uint32_t total_len=cache_len+new_len;
+    const float scale=1.0f/std::sqrt(static_cast<float>(QKHeadDim()));
 
     CAIF_DeviceTensor flat_input=input.Clone();
-    flat_input.Reshape({bs,_config.dim});
+    flat_input.Reshape({bs,cfg.dim});
 
     //------------------------------------------------------------------
-    // Q path (same as full forward)
+    // Q path — branches on UsesQLoRA(): LoRA chain when q_lora_rank>0,
+    // single direct matmul (DeepSeek-V2-Lite path) when ==0.
     //------------------------------------------------------------------
-    CAIF_DeviceTensor q_compressed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-    CAIF_DeviceOps::MatMul(flat_input,_w_q_compress,q_compressed);
+    CAIF_DeviceTensor q_full;
+    if(UsesQLoRA()==true)
+    {
+      CAIF_DeviceTensor q_compressed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(flat_input,WQCompress(),q_compressed,ctx,ComputeDtype());
 
-    CAIF_DeviceTensor q_normed=CAIF_DeviceTensor::Uninitialized({bs,_config.q_lora_rank},*_stream);
-    CAIF_DeviceTensor q_rms=CAIF_DeviceTensor::Uninitialized({bs},*_stream);
-    launch_rmsnorm_forward(q_compressed.DevicePtr(),
-                           _q_norm_gamma.DevicePtr(),
-                           q_normed.DevicePtr(),
-                           q_rms.DevicePtr(),
-                           _config.rms_norm_eps,
-                           static_cast<int>(bs),
-                           static_cast<int>(_config.q_lora_rank),
-                           _stream->Handle());
+      CAIF_DeviceTensor q_normed=CAIF_DeviceTensor::Uninitialized({bs,cfg.q_lora_rank},Stream(),StorageDtype());
+      CAIF_DeviceTensor q_rms=CAIF_DeviceTensor::Uninitialized({bs},Stream());
+      launch_rmsnorm_forward<StorageT>(q_compressed.template DevicePtr<StorageT>(),
+                                        QNormGamma().template DevicePtr<float>(),
+                                        q_normed.template DevicePtr<StorageT>(),
+                                        q_rms.template DevicePtr<float>(),
+                                        cfg.rms_norm_eps,
+                                        static_cast<int>(bs),
+                                        static_cast<int>(cfg.q_lora_rank),
+                                        Stream().Handle());
 
-    CAIF_DeviceTensor q_full=CAIF_DeviceTensor::Uninitialized({bs,_q_proj_dim},*_stream);
-    CAIF_DeviceOps::MatMul(q_normed,_w_q_decompress,q_full);
+      q_full=CAIF_DeviceTensor::Uninitialized({bs,QProjDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(q_normed,WQDecompress(),q_full,ctx,ComputeDtype());
+    }
+    else
+    {
+      q_full=CAIF_DeviceTensor::Uninitialized({bs,QProjDim()},Stream(),StorageDtype());
+      CAIF_Ops::MatMul(flat_input,WQ(),q_full,ctx,ComputeDtype());
+    }
 
-    q_full.Reshape({batch,new_len,_config.num_heads,_qk_head_dim});
-    CAIF_DeviceTensor q_transposed=CAIF_DeviceTensor::Uninitialized({bh,new_len,_qk_head_dim},*_stream);
-    launch_transpose_0213(q_full.DevicePtr(),
-                          q_transposed.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(new_len),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(_qk_head_dim),
-                          _stream->Handle());
+    q_full.Reshape({batch,new_len,cfg.num_heads,QKHeadDim()});
+    CAIF_DeviceTensor q_transposed=CAIF_DeviceTensor::Uninitialized({bh,new_len,QKHeadDim()},Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(q_full.template DevicePtr<StorageT>(),
+                                     q_transposed.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(new_len),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(QKHeadDim()),
+                                     Stream().Handle());
 
-    const int q_rows=static_cast<int>(bh*new_len);
-    CAIF_DeviceTensor q_nope=CAIF_DeviceTensor::Uninitialized({bh,new_len,nope},*_stream);
-    CAIF_DeviceTensor q_rope_t=CAIF_DeviceTensor::Uninitialized({bh,new_len,rope},*_stream);
-    launch_slice_last_dim(q_transposed.DevicePtr(),q_nope.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(q_transposed.DevicePtr(),q_rope_t.DevicePtr(),
-                          q_rows,static_cast<int>(_qk_head_dim),
-                          static_cast<int>(nope),static_cast<int>(rope),
-                          _stream->Handle());
+    CAIF_DeviceTensor q_nope=CAIF_DeviceTensor::Uninitialized({bh,new_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor q_rope_t=CAIF_DeviceTensor::Uninitialized({bh,new_len,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(q_transposed,q_nope,0);
+    CAIF_Ops::SliceLastDim(q_transposed,q_rope_t,static_cast<uint32_t>(nope));
 
-    launch_rope_forward_offset(q_rope_t.DevicePtr(),
-                               static_cast<int>(bh),
-                               static_cast<int>(new_len),
-                               static_cast<int>(rope),
-                               _config.rope_base,
-                               static_cast<int>(_kv_cache_len),
-                               _stream->Handle());
+    launch_rope_forward_offset<StorageT>(q_rope_t.template DevicePtr<StorageT>(),
+                                          static_cast<int>(bh),
+                                          static_cast<int>(new_len),
+                                          static_cast<int>(rope),
+                                          cfg.rope_base,
+                                          static_cast<int>(cache_len),
+                                          cfg.rope_style,
+                                          Stream().Handle());
 
-    CAIF_DeviceTensor q=CAIF_DeviceTensor::Uninitialized({bh,new_len,_qk_head_dim},*_stream);
-    launch_concat_last_dim(q_nope.DevicePtr(),q_rope_t.DevicePtr(),q.DevicePtr(),
-                           q_rows,static_cast<int>(nope),static_cast<int>(rope),
-                           _stream->Handle());
+    CAIF_DeviceTensor q=CAIF_DeviceTensor::Uninitialized({bh,new_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(q_nope,q_rope_t,q);
 
     //------------------------------------------------------------------
     // KV path: compress new tokens, append to cache, decompress full cache
     //------------------------------------------------------------------
-    CAIF_DeviceTensor kv_out=CAIF_DeviceTensor::Uninitialized({bs,_kv_compress_dim},*_stream);
-    CAIF_DeviceOps::MatMul(flat_input,_w_kv_compress,kv_out);
+    CAIF_DeviceTensor kv_out=CAIF_DeviceTensor::Uninitialized({bs,KVCompressDim()},Stream(),StorageDtype());
+    CAIF_Ops::MatMul(flat_input,WKVCompress(),kv_out,ctx,ComputeDtype());
 
-    CAIF_DeviceTensor new_kv_compressed=CAIF_DeviceTensor::Uninitialized({bs,_config.kv_lora_rank},*_stream);
-    CAIF_DeviceTensor new_k_pe=CAIF_DeviceTensor::Uninitialized({bs,rope},*_stream);
-    launch_slice_last_dim(kv_out.DevicePtr(),new_kv_compressed.DevicePtr(),
-                          static_cast<int>(bs),static_cast<int>(_kv_compress_dim),
-                          0,static_cast<int>(_config.kv_lora_rank),
-                          _stream->Handle());
-    launch_slice_last_dim(kv_out.DevicePtr(),new_k_pe.DevicePtr(),
-                          static_cast<int>(bs),static_cast<int>(_kv_compress_dim),
-                          static_cast<int>(_config.kv_lora_rank),static_cast<int>(rope),
-                          _stream->Handle());
+    CAIF_DeviceTensor new_kv_compressed=CAIF_DeviceTensor::Uninitialized({bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+    CAIF_DeviceTensor new_k_pe=CAIF_DeviceTensor::Uninitialized({bs,rope},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(kv_out,new_kv_compressed,0);
+    CAIF_Ops::SliceLastDim(kv_out,new_k_pe,cfg.kv_lora_rank);
 
-    // Append to KV cache
-    new_kv_compressed.Reshape({batch,new_len,_config.kv_lora_rank});
-    launch_kv_cache_append(new_kv_compressed.DevicePtr(),
-                           _kv_cache_compressed.DevicePtr(),
-                           static_cast<int>(batch),
-                           static_cast<int>(new_len),
-                           static_cast<int>(_kv_cache_len),
-                           static_cast<int>(_kv_cache_max_len),
-                           1,
-                           static_cast<int>(_config.kv_lora_rank),
-                           _stream->Handle());
+    new_kv_compressed.Reshape({batch,new_len,cfg.kv_lora_rank});
+    launch_kv_cache_append<StorageT>(new_kv_compressed.template DevicePtr<StorageT>(),
+                                      MutableKVCacheCompressed().template DevicePtr<StorageT>(),
+                                      static_cast<int>(batch),
+                                      static_cast<int>(new_len),
+                                      static_cast<int>(cache_len),
+                                      static_cast<int>(cache_max_len),
+                                      1,
+                                      static_cast<int>(cfg.kv_lora_rank),
+                                      Stream().Handle());
 
     new_k_pe.Reshape({batch,new_len,rope});
-    launch_kv_cache_append(new_k_pe.DevicePtr(),
-                           _kv_cache_k_pe.DevicePtr(),
-                           static_cast<int>(batch),
-                           static_cast<int>(new_len),
-                           static_cast<int>(_kv_cache_len),
-                           static_cast<int>(_kv_cache_max_len),
-                           1,
-                           static_cast<int>(rope),
-                           _stream->Handle());
+    launch_kv_cache_append<StorageT>(new_k_pe.template DevicePtr<StorageT>(),
+                                      MutableKVCacheKPE().template DevicePtr<StorageT>(),
+                                      static_cast<int>(batch),
+                                      static_cast<int>(new_len),
+                                      static_cast<int>(cache_len),
+                                      static_cast<int>(cache_max_len),
+                                      1,
+                                      static_cast<int>(rope),
+                                      Stream().Handle());
 
     // Decompress full cached KV: [batch, total_len, kv_lora_rank]
     const uint32_t total_bs=batch*total_len;
     CAIF_DeviceTensor cached_kv=CAIF_DeviceTensor::Uninitialized(
-        {batch,total_len,_config.kv_lora_rank},*_stream);
+        {batch,total_len,cfg.kv_lora_rank},Stream(),StorageDtype());
 
-    // Copy the valid portion of the cache
-    CAIF_DeviceTensor cache_view=_kv_cache_compressed.Clone();
-    cache_view.Reshape({batch*_kv_cache_max_len,_config.kv_lora_rank});
+    cached_kv.Reshape({total_bs,cfg.kv_lora_rank});
+    CAIF_DeviceTensor kv_normed=CAIF_DeviceTensor::Uninitialized({total_bs,cfg.kv_lora_rank},Stream(),StorageDtype());
+    CAIF_DeviceTensor kv_rms=CAIF_DeviceTensor::Uninitialized({total_bs},Stream());
 
-    // RMSNorm on full cached compressed KV
-    cached_kv.Reshape({total_bs,_config.kv_lora_rank});
-    CAIF_DeviceTensor kv_normed=CAIF_DeviceTensor::Uninitialized({total_bs,_config.kv_lora_rank},*_stream);
-    CAIF_DeviceTensor kv_rms=CAIF_DeviceTensor::Uninitialized({total_bs},*_stream);
-
-    // Extract valid cache range for RMSNorm
-    // We need to extract [batch, 0:total_len, kv_lora_rank] from cache [batch, max_len, kv_lora_rank]
-    // Use slice per batch or reshape approach
-    // For simplicity, copy valid portion row by row
+    // Copy the [batch, 0:total_len, kv_lora_rank] valid prefix out of the
+    // [batch, max_len, kv_lora_rank] cache, batch by batch — typed StorageT
+    // pointer arithmetic + sizeof(StorageT) for the byte count.
+    const StorageT *cached_compressed_ptr=KVCacheCompressed().template DevicePtr<StorageT>();
+    StorageT *cached_kv_ptr=cached_kv.template DevicePtr<StorageT>();
     for(uint32_t b=0;b<batch;++b)
     {
-      const float *src=_kv_cache_compressed.DevicePtr()+
-                       b*_kv_cache_max_len*_config.kv_lora_rank;
-      float *dst=cached_kv.DevicePtr()+b*total_len*_config.kv_lora_rank;
-      const size_t copy_bytes=total_len*_config.kv_lora_rank*sizeof(float);
+      const StorageT *src=cached_compressed_ptr+b*cache_max_len*cfg.kv_lora_rank;
+      StorageT *dst=cached_kv_ptr+b*total_len*cfg.kv_lora_rank;
+      const size_t copy_bytes=total_len*cfg.kv_lora_rank*sizeof(StorageT);
 #ifdef USE_CAIF_CUDA
-      cudaMemcpyAsync(dst,src,copy_bytes,cudaMemcpyDeviceToDevice,_stream->Handle());
+      cudaMemcpyAsync(dst,src,copy_bytes,cudaMemcpyDeviceToDevice,Stream().Handle());
 #endif
     }
 
-    launch_rmsnorm_forward(cached_kv.DevicePtr(),
-                           _kv_norm_gamma.DevicePtr(),
-                           kv_normed.DevicePtr(),
-                           kv_rms.DevicePtr(),
-                           _config.rms_norm_eps,
-                           static_cast<int>(total_bs),
-                           static_cast<int>(_config.kv_lora_rank),
-                           _stream->Handle());
+    launch_rmsnorm_forward<StorageT>(cached_kv.template DevicePtr<StorageT>(),
+                                      KVNormGamma().template DevicePtr<float>(),
+                                      kv_normed.template DevicePtr<StorageT>(),
+                                      kv_rms.template DevicePtr<float>(),
+                                      cfg.rms_norm_eps,
+                                      static_cast<int>(total_bs),
+                                      static_cast<int>(cfg.kv_lora_rank),
+                                      Stream().Handle());
 
-    // KV decompress full sequence
-    CAIF_DeviceTensor kv_full=CAIF_DeviceTensor::Uninitialized({total_bs,_kv_decomp_dim},*_stream);
-    CAIF_DeviceOps::MatMul(kv_normed,_w_kv_decompress,kv_full);
+    CAIF_DeviceTensor kv_full=CAIF_DeviceTensor::Uninitialized({total_bs,KVDecompDim()},Stream(),StorageDtype());
+    CAIF_Ops::MatMul(kv_normed,WKVDecompress(),kv_full,ctx,ComputeDtype());
 
     const uint32_t kv_per_head=nope+v_dim;
-    kv_full.Reshape({batch,total_len,_config.num_heads,kv_per_head});
+    kv_full.Reshape({batch,total_len,cfg.num_heads,kv_per_head});
     CAIF_DeviceTensor kv_transposed=CAIF_DeviceTensor::Uninitialized(
-        {bh,total_len,kv_per_head},*_stream);
-    launch_transpose_0213(kv_full.DevicePtr(),
-                          kv_transposed.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(total_len),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(kv_per_head),
-                          _stream->Handle());
+        {bh,total_len,kv_per_head},Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(kv_full.template DevicePtr<StorageT>(),
+                                     kv_transposed.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(total_len),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(kv_per_head),
+                                     Stream().Handle());
 
-    const int full_kv_rows=static_cast<int>(bh*total_len);
-    CAIF_DeviceTensor k_nope=CAIF_DeviceTensor::Uninitialized({bh,total_len,nope},*_stream);
-    CAIF_DeviceTensor v_heads=CAIF_DeviceTensor::Uninitialized({bh,total_len,v_dim},*_stream);
-    launch_slice_last_dim(kv_transposed.DevicePtr(),k_nope.DevicePtr(),
-                          full_kv_rows,static_cast<int>(kv_per_head),
-                          0,static_cast<int>(nope),
-                          _stream->Handle());
-    launch_slice_last_dim(kv_transposed.DevicePtr(),v_heads.DevicePtr(),
-                          full_kv_rows,static_cast<int>(kv_per_head),
-                          static_cast<int>(nope),static_cast<int>(v_dim),
-                          _stream->Handle());
+    CAIF_DeviceTensor k_nope=CAIF_DeviceTensor::Uninitialized({bh,total_len,nope},Stream(),StorageDtype());
+    CAIF_DeviceTensor v_heads=CAIF_DeviceTensor::Uninitialized({bh,total_len,v_dim},Stream(),StorageDtype());
+    CAIF_Ops::SliceLastDim(kv_transposed,k_nope,0);
+    CAIF_Ops::SliceLastDim(kv_transposed,v_heads,nope);
 
-    // Extract and broadcast cached k_pe for full sequence
-    CAIF_DeviceTensor cached_k_pe=CAIF_DeviceTensor::Uninitialized({batch,total_len,rope},*_stream);
+    // Extract and broadcast cached k_pe for full sequence (typed ptr arith).
+    CAIF_DeviceTensor cached_k_pe=CAIF_DeviceTensor::Uninitialized({batch,total_len,rope},
+                                                                    Stream(),
+                                                                    StorageDtype());
+    const StorageT *cache_kpe_ptr=KVCacheKPE().template DevicePtr<StorageT>();
+    StorageT *cached_kpe_ptr=cached_k_pe.template DevicePtr<StorageT>();
     for(uint32_t b=0;b<batch;++b)
     {
-      const float *src=_kv_cache_k_pe.DevicePtr()+b*_kv_cache_max_len*rope;
-      float *dst=cached_k_pe.DevicePtr()+b*total_len*rope;
-      const size_t copy_bytes=total_len*rope*sizeof(float);
+      const StorageT *src=cache_kpe_ptr+b*cache_max_len*rope;
+      StorageT *dst=cached_kpe_ptr+b*total_len*rope;
+      const size_t copy_bytes=total_len*rope*sizeof(StorageT);
 #ifdef USE_CAIF_CUDA
-      cudaMemcpyAsync(dst,src,copy_bytes,cudaMemcpyDeviceToDevice,_stream->Handle());
+      cudaMemcpyAsync(dst,src,copy_bytes,cudaMemcpyDeviceToDevice,Stream().Handle());
 #endif
     }
 
-    CAIF_DeviceTensor k_pe_expanded=CAIF_DeviceTensor::Uninitialized({bh,total_len,rope},*_stream);
-    launch_gqa_repeat_kv(cached_k_pe.DevicePtr(),
-                         k_pe_expanded.DevicePtr(),
-                         static_cast<int>(batch),
-                         1,
-                         static_cast<int>(_config.num_heads),
-                         static_cast<int>(total_len),
-                         static_cast<int>(rope),
-                         _stream->Handle());
+    CAIF_DeviceTensor k_pe_expanded=CAIF_DeviceTensor::Uninitialized({bh,total_len,rope},Stream(),StorageDtype());
+    launch_gqa_repeat_kv<StorageT>(cached_k_pe.template DevicePtr<StorageT>(),
+                                    k_pe_expanded.template DevicePtr<StorageT>(),
+                                    static_cast<int>(batch),
+                                    1,
+                                    static_cast<int>(cfg.num_heads),
+                                    static_cast<int>(total_len),
+                                    static_cast<int>(rope),
+                                    Stream().Handle());
 
-    // Apply RoPE to k_pe (full sequence positions)
-    launch_rope_forward(k_pe_expanded.DevicePtr(),
-                        static_cast<int>(bh),
-                        static_cast<int>(total_len),
-                        static_cast<int>(rope),
-                        _config.rope_base,
-                        _stream->Handle());
+    launch_rope_forward<StorageT>(k_pe_expanded.template DevicePtr<StorageT>(),
+                                   static_cast<int>(bh),
+                                   static_cast<int>(total_len),
+                                   static_cast<int>(rope),
+                                   cfg.rope_base,
+                                   cfg.rope_style,
+                                   Stream().Handle());
 
-    // Assemble K: [k_nope | k_pe] -> [bh, total_len, qk_head_dim]
-    CAIF_DeviceTensor k=CAIF_DeviceTensor::Uninitialized({bh,total_len,_qk_head_dim},*_stream);
-    launch_concat_last_dim(k_nope.DevicePtr(),k_pe_expanded.DevicePtr(),k.DevicePtr(),
-                           full_kv_rows,static_cast<int>(nope),static_cast<int>(rope),
-                           _stream->Handle());
+    CAIF_DeviceTensor k=CAIF_DeviceTensor::Uninitialized({bh,total_len,QKHeadDim()},Stream(),StorageDtype());
+    CAIF_Ops::ConcatLastDim(k_nope,k_pe_expanded,k);
 
     //------------------------------------------------------------------
     // Attention: Q [bh, new_len, qk_head_dim] x K [bh, total_len, qk_head_dim]
     //------------------------------------------------------------------
-    // Use batched matmul for non-square attention (query_len != key_len)
-    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,new_len,total_len},*_stream);
-    CAIF_DeviceOps::BatchedMatMulTransposeB(q,k,scores,
-                                           static_cast<int>(new_len),
-                                           static_cast<int>(_qk_head_dim),
-                                           static_cast<int>(total_len),
-                                           static_cast<int>(bh));
-    CAIF_DeviceOps::Scale(scores,scale);
+    CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized({bh,new_len,total_len},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMulTransposeB(q,
+                                       k,
+                                       scores,
+                                       static_cast<int>(new_len),
+                                       static_cast<int>(QKHeadDim()),
+                                       static_cast<int>(total_len),
+                                       static_cast<int>(bh),
+                                       ctx);
+    CAIF_Ops::Scale(scores,scale);
 
-    if(_config.causal==true)
+    if(cfg.causal==true)
     {
-      launch_causal_mask_fill_offset(scores.DevicePtr(),
-                                     static_cast<int>(bh),
-                                     static_cast<int>(new_len),
-                                     static_cast<int>(total_len),
-                                     static_cast<int>(_kv_cache_len),
-                                     _stream->Handle());
+      launch_causal_mask_fill_offset<StorageT>(scores.template DevicePtr<StorageT>(),
+                                                static_cast<int>(bh),
+                                                static_cast<int>(new_len),
+                                                static_cast<int>(total_len),
+                                                static_cast<int>(cache_len),
+                                                Stream().Handle());
     }
 
-    CAIF_DeviceTensor attn_weights=CAIF_DeviceTensor::Uninitialized({bh,new_len,total_len},*_stream);
-    launch_attention_softmax(scores.DevicePtr(),
-                             attn_weights.DevicePtr(),
-                             static_cast<int>(bh*new_len),
-                             static_cast<int>(total_len),
-                             _stream->Handle());
+    CAIF_DeviceTensor attn_weights=CAIF_DeviceTensor::Uninitialized({bh,new_len,total_len},Stream(),scores.Dtype());
+    launch_attention_softmax<StorageT>(scores.template DevicePtr<StorageT>(),
+                                       attn_weights.template DevicePtr<StorageT>(),
+                                       static_cast<int>(bh*new_len),
+                                       static_cast<int>(total_len),
+                                       Stream().Handle());
 
-    CAIF_DeviceTensor attn_output=CAIF_DeviceTensor::Uninitialized({bh,new_len,v_dim},*_stream);
-    CAIF_DeviceOps::BatchedMatMul(attn_weights,v_heads,attn_output,
-                                 static_cast<int>(new_len),
-                                 static_cast<int>(total_len),
-                                 static_cast<int>(v_dim),
-                                 static_cast<int>(bh));
+    CAIF_DeviceTensor attn_output=CAIF_DeviceTensor::Uninitialized({bh,new_len,v_dim},Stream(),StorageDtype());
+    CAIF_Ops::BatchedMatMul(attn_weights,
+                             v_heads,
+                             attn_output,
+                             static_cast<int>(new_len),
+                             static_cast<int>(total_len),
+                             static_cast<int>(v_dim),
+                             static_cast<int>(bh),
+                             ctx);
 
     //------------------------------------------------------------------
     // Output projection
     //------------------------------------------------------------------
-    CAIF_DeviceTensor attn_merged=CAIF_DeviceTensor::Uninitialized(
-        {batch,new_len,_config.num_heads,v_dim},*_stream);
-    launch_transpose_0213(attn_output.DevicePtr(),
-                          attn_merged.DevicePtr(),
-                          static_cast<int>(batch),
-                          static_cast<int>(_config.num_heads),
-                          static_cast<int>(new_len),
-                          static_cast<int>(v_dim),
-                          _stream->Handle());
-    attn_merged.Reshape({bs,_o_input_dim});
+    const std::vector<uint32_t> merged_shape={batch,new_len,cfg.num_heads,v_dim};
+    CAIF_DeviceTensor attn_merged=CAIF_DeviceTensor::Uninitialized(merged_shape,Stream(),StorageDtype());
+    launch_transpose_0213<StorageT>(attn_output.template DevicePtr<StorageT>(),
+                                     attn_merged.template DevicePtr<StorageT>(),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(cfg.num_heads),
+                                     static_cast<int>(new_len),
+                                     static_cast<int>(v_dim),
+                                     Stream().Handle());
+    attn_merged.Reshape({bs,OInputDim()});
 
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({bs,_config.dim},*_stream);
-    CAIF_DeviceOps::MatMul(attn_merged,_w_o,output);
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({bs,cfg.dim},Stream(),StorageDtype());
+    CAIF_Ops::MatMul(attn_merged,WO(),output,ctx,ComputeDtype());
 
-    _kv_cache_len=total_len;
+    SetKVCacheLen(total_len);
 
-    output.Reshape({batch,new_len,_config.dim});
+    output.Reshape({batch,new_len,cfg.dim});
     return output;
   }
   CAIF_CATCH_BLOCK()
 }
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWQCompress(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQCompress: not valid when using sub-projections");
+    }
+    if(UsesQLoRA()==false)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQCompress: not valid when q_lora_rank==0; use LoadWQ");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=Config().dim ||
+       shape[1]!=Config().q_lora_rank)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQCompress: shape mismatch, expected [dim, q_lora_rank]");
+    }
+    SetWQCompress(std::move(w));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadQNormGamma(CAIF_DeviceTensor &&gamma)
+{
+  try
+  {
+    if(UsesQLoRA()==false)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadQNormGamma: not valid when q_lora_rank==0");
+    }
+    const std::vector<uint32_t> &shape=gamma.Shape();
+    if(shape.size()!=1 || shape[0]!=Config().q_lora_rank)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadQNormGamma: shape mismatch, expected [q_lora_rank]");
+    }
+    SetQNormGamma(std::move(gamma));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWQDecompress(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQDecompress: not valid when using sub-projections");
+    }
+    if(UsesQLoRA()==false)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQDecompress: not valid when q_lora_rank==0; use LoadWQ");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=Config().q_lora_rank ||
+       shape[1]!=QProjDim())
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQDecompress: shape mismatch, expected [q_lora_rank, q_proj_dim]");
+    }
+    SetWQDecompress(std::move(w));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWQ(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQ: not valid when using sub-projections");
+    }
+    if(UsesQLoRA()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQ: not valid when q_lora_rank>0; use LoadWQCompress/LoadWQDecompress");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=Config().dim ||
+       shape[1]!=QProjDim())
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWQ: shape mismatch, expected [dim, q_proj_dim]");
+    }
+    SetWQ(std::move(w));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWKVCompress(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWKVCompress: not valid when using sub-projections");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=Config().dim ||
+       shape[1]!=KVCompressDim())
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWKVCompress: shape mismatch, expected [dim, kv_compress_dim]");
+    }
+    SetWKVCompress(std::move(w));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadKVNormGamma(CAIF_DeviceTensor &&gamma)
+{
+  try
+  {
+    const std::vector<uint32_t> &shape=gamma.Shape();
+    if(shape.size()!=1 || shape[0]!=Config().kv_lora_rank)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadKVNormGamma: shape mismatch, expected [kv_lora_rank]");
+    }
+    SetKVNormGamma(std::move(gamma));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWKVDecompress(CAIF_DeviceTensor &&w)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWKVDecompress: not valid when using sub-projections");
+    }
+    const std::vector<uint32_t> &shape=w.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=Config().kv_lora_rank ||
+       shape[1]!=KVDecompDim())
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWKVDecompress: shape mismatch, expected [kv_lora_rank, kv_decomp_dim]");
+    }
+    SetWKVDecompress(std::move(w));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMLAttention<ComputeT,StorageT>::LoadWO(CAIF_DeviceTensor &&w_o)
+{
+  try
+  {
+    if(UsesProjections()==true)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWO: not valid when using sub-projections");
+    }
+    const std::vector<uint32_t> &shape=w_o.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=OInputDim() ||
+       shape[1]!=Config().dim)
+    {
+      THROW_CAIFE("DeviceMLAttention::LoadWO: shape mismatch, expected [o_input_dim, dim]");
+    }
+    SetWO(std::move(w_o));
+  }
+  CAIF_CATCH_BLOCK()
+}
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceMLAttention<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceMLAttention<float,__half>;
+template class CAIF_DeviceMLAttention<float,__nv_bfloat16>;
+template class CAIF_DeviceMLAttention<__half,float>;
+template class CAIF_DeviceMLAttention<__half,__half>;
+template class CAIF_DeviceMLAttention<__half,__nv_bfloat16>;
+template class CAIF_DeviceMLAttention<__nv_bfloat16,float>;
+template class CAIF_DeviceMLAttention<__nv_bfloat16,__half>;
+template class CAIF_DeviceMLAttention<__nv_bfloat16,__nv_bfloat16>;
+#endif
+
+}//end instance namespace

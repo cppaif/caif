@@ -14,13 +14,19 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident LayerNorm layer
+// Device-resident LayerNorm layer (templated on <ComputeT, StorageT>).
+//
+// Uniform two-parameter signature with both defaulting to `float`. Every
+// (ComputeT, StorageT) cell from the cuBLAS-Lt-supported grid is a legal
+// instantiation. The runtime factory CAIF_DeviceLayerNormFactory::Create
+// (in caif_device_layernorm_factory.h) is the bridge for callers that
+// have the dtypes only as runtime values.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_LAYERNORM_H
-#define CAIF_DEVICE_LAYERNORM_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,25 +34,13 @@
 namespace instance
 {
 
-/**
- * @brief Standard Layer Normalization (Ba, Kiros, Hinton 2016)
- *
- *   y = (x - mean(x)) / sqrt(var(x) + epsilon) * gamma + beta
- *
- * Normalizes along the last dimension. For 3D inputs [batch, seq_len, dim],
- * leading dimensions are flattened to rows (batch * seq_len), normalizing
- * each row of length dim.
- *
- * Parameters: gamma [dim] (initialized to 1.0), beta [dim] (initialized to 0.0)
- *
- * Provided for compatibility with BERT-style and ViT-style models.
- */
-class CAIF_DeviceLayerNorm:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceLayerNorm:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     CAIF_DeviceLayerNorm(uint32_t dim,
-                        CAIF_CudaStream &stream,
-                        float epsilon=g_caif_epsilon);
+                         CAIF_CudaStream &stream,
+                         float epsilon=g_caif_epsilon);
     ~CAIF_DeviceLayerNorm()override=default;
 
     // Move
@@ -54,8 +48,12 @@ class CAIF_DeviceLayerNorm:public CAIF_DeviceLayer
     CAIF_DeviceLayerNorm &operator=(CAIF_DeviceLayerNorm &&other);
 
     // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::LayerNorm_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -66,29 +64,60 @@ class CAIF_DeviceLayerNorm:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
+    // Accessors (StorageDtype()/ComputeDtype() inherited from
+    // CAIF_DeviceLayerTyped — no per-layer copy needed).
     uint32_t Dim()const{return _dim;}
     float Epsilon()const{return _epsilon;}
 
+    /**
+     * @brief Replace gamma (scale) with a tensor of shape [dim].
+     */
+    void LoadGamma(CAIF_DeviceTensor &&gamma);
+
+    /**
+     * @brief Replace beta (shift) with a tensor of shape [dim].
+     */
+    void LoadBeta(CAIF_DeviceTensor &&beta);
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
     uint32_t _dim;
     float _epsilon;
-    CAIF_DeviceTensor _gamma;       // [dim], initialized to 1.0
-    CAIF_DeviceTensor _beta;        // [dim], initialized to 0.0
-    CAIF_DeviceTensor _gamma_grad;  // [dim]
-    CAIF_DeviceTensor _beta_grad;   // [dim]
+    CAIF_DeviceTensor _gamma;       // [dim] fp32 (kernel signature)
+    CAIF_DeviceTensor _beta;        // [dim] fp32 (kernel signature)
+    CAIF_DeviceTensor _gamma_grad;  // [dim] fp32
+    CAIF_DeviceTensor _beta_grad;   // [dim] fp32
 
-    // Pre-allocated buffers, reused when row count matches
-    int _cached_rows;              // Row count for current buffer sizes (0=not allocated)
+    int _cached_rows;
 
     // Cached for backward
-    CAIF_DeviceTensor _last_input;  // [rows, dim]
-    CAIF_DeviceTensor _mean_cache;  // [rows]
-    CAIF_DeviceTensor _rstd_cache;  // [rows]
+    CAIF_DeviceTensor _last_input;  // [rows, dim] at StorageDtype()
+    CAIF_DeviceTensor _mean_cache;  // [rows] fp32
+    CAIF_DeviceTensor _rstd_cache;  // [rows] fp32
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceLayerNorm<float,float>;
+extern template class CAIF_DeviceLayerNorm<float,__half>;
+extern template class CAIF_DeviceLayerNorm<float,__nv_bfloat16>;
+extern template class CAIF_DeviceLayerNorm<__half,float>;
+extern template class CAIF_DeviceLayerNorm<__half,__half>;
+extern template class CAIF_DeviceLayerNorm<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceLayerNorm<__nv_bfloat16,float>;
+extern template class CAIF_DeviceLayerNorm<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceLayerNorm<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceLayerNorm<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_LAYERNORM_H
+}//end instance namespace
