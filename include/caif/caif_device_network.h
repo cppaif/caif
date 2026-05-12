@@ -19,9 +19,8 @@
 #ifndef CAIF_DEVICE_NETWORK_H
 #define CAIF_DEVICE_NETWORK_H
 
-#include "caif_base.h"
+#include "caif_device_container.h"
 #include "caif_device_tensor.h"
-#include "caif_device_layer.h"
 #include "caif_device_dense_layer.h"
 #include "caif_model_format.h"
 #include "caif_cuda_stream.h"
@@ -33,53 +32,50 @@
 namespace instance
 {
 
+class CAIF_Optimizer;
+
+
 /**
- * @brief Device-resident neural network
+ * @brief Top-level device-resident neural network.
  *
- * A simplified neural network implementation that uses CAIF_DeviceTensor
- * exclusively. All data remains on the GPU during training.
+ * A CAIF_DeviceContainer that also owns:
+ *   - the training-loop facing Forward(input,training) / Backward(grad) entry
+ *     points, which construct the per-call CAIF_RunContext and stash any
+ *     pending sideband state onto it (prefix lengths, encoder context,
+ *     position bias),
+ *   - the active optimizer (Adam / SGD / Momentum / RMSprop / AdaGrad)
+ *     selected by Initialize{Adam,Sgd,Momentum,Rmsprop,AdaGrad}(),
+ *   - gradient norm clipping,
+ *   - SafeTensors + legacy binary model I/O.
  *
- * Key features:
- * - All layers and data on device
- * - No host memory allocation during training
- * - Simple sequential architecture
- * - Built-in Adam optimizer
- *
- * Part of the device-resident tensor architecture (see DEVICE_TENSOR_MIGRATION.md)
+ * Sublayer ownership, trainability, parameter/gradient iteration, aux-loss
+ * summation, and LayerCount()/Layer(i) accessors all come from
+ * CAIF_DeviceContainer.
  */
-class CAIF_DeviceNetwork:public CAIF_Base
+class CAIF_DeviceNetwork:public CAIF_DeviceContainer
 {
   public:
     /**
-     * @brief Construct a device network
+     * @brief Construct a device network.
      *
-     * @param stream CUDA stream for all operations
+     * @param stream CUDA stream for all operations.
      */
     explicit CAIF_DeviceNetwork(CAIF_CudaStream &stream);
 
-    /**
-     * @brief Destructor
-     */
-    ~CAIF_DeviceNetwork()=default;
+    // Out-of-line so unique_ptr<CAIF_Optimizer> sees the full type.
+    ~CAIF_DeviceNetwork()override;
 
-    // Non-copyable
     CAIF_DeviceNetwork(const CAIF_DeviceNetwork &)=delete;
     CAIF_DeviceNetwork &operator=(const CAIF_DeviceNetwork &)=delete;
 
-    // Movable
     CAIF_DeviceNetwork(CAIF_DeviceNetwork &&other);
     CAIF_DeviceNetwork &operator=(CAIF_DeviceNetwork &&other);
 
     /**
-     * @brief Add a dense layer to the network
+     * @brief Add a dense layer to the network.
      *
      * Layers are added sequentially. The first layer's input_size must match
-     * the data input size. Subsequent layers auto-connect.
-     *
-     * @param input_size Number of input features (or 0 to auto-infer from previous layer)
-     * @param output_size Number of output units
-     * @param activation Activation function
-     * @param use_bias Whether to use bias
+     * the data input size; subsequent layers auto-connect when input_size=0.
      */
     void AddDenseLayer(uint32_t input_size,
                        uint32_t output_size,
@@ -87,221 +83,262 @@ class CAIF_DeviceNetwork:public CAIF_Base
                        bool use_bias=true);
 
     /**
-     * @brief Add a polymorphic layer to the network
+     * @brief Add a polymorphic layer (ownership transferred).
      *
-     * Allows adding any CAIF_DeviceLayer subclass (transformer, attention, etc.)
-     *
-     * @param layer Layer to add (ownership transferred)
+     * Adam state is invalidated; InputSize/OutputSize are NOT updated (only
+     * AddDenseLayer tracks the declarative dense-chain IO sizes).
      */
     void AddLayer(std::unique_ptr<CAIF_DeviceLayer> layer);
 
     /**
-     * @brief Forward pass through all layers
+     * @brief Mark a sublayer as trainable / non-trainable.
      *
-     * @param input Input tensor [batch x input_features]
-     * @param training Whether in training mode
-     * @return Output tensor [batch x output_features]
-     */
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training=false);
-
-    /**
-     * @brief Backward pass through all layers
-     *
-     * Computes gradients for all parameters. Must call Forward with
-     * training=true before calling Backward.
-     *
-     * @param grad_output Gradient from loss function [batch x output_features]
-     */
-    void Backward(const CAIF_DeviceTensor &grad_output);
-
-    /**
-     * @brief Zero all gradients in all layers
-     */
-    void ZeroGradients();
-
-    /**
-     * @brief Initialize Adam optimizer state
-     *
-     * Must be called before using AdamStep.
-     *
-     * @param lr Learning rate (default 0.001)
-     * @param beta1 First moment decay (default 0.9)
-     * @param beta2 Second moment decay (default 0.999)
-     * @param epsilon Numerical stability constant (default 1e-8)
-     */
-    void InitializeAdam(float lr=0.001f,
-                        float beta1=0.9f,
-                        float beta2=0.999f,
-                        float epsilon=1e-8f,
-                        float weight_decay=0.0f);
-
-    /**
-     * @brief Perform one Adam optimizer update step
-     *
-     * Updates all parameters using their gradients and Adam state.
-     * Must call InitializeAdam before first use.
-     */
-    void AdamStep();
-
-    /**
-     * @brief Set Adam learning rate (for LR scheduling)
-     */
-    void SetLearningRate(float lr){_adam_lr=lr;}
-
-    /**
-     * @brief Clip gradient norm across all trainable parameters
-     *
-     * Computes the global L2 norm of all trainable gradients and
-     * scales them so the total norm does not exceed max_norm.
-     * Equivalent to torch.nn.utils.clip_grad_norm_.
-     *
-     * @param max_norm Maximum allowed gradient norm
-     * @return The total gradient norm before clipping
-     */
-    float ClipGradientNorm(float max_norm);
-
-    /**
-     * @brief Get the number of layers
-     */
-    size_t LayerCount()const{return _layers.size();}
-
-    /**
-     * @brief Get a layer by index (polymorphic)
-     */
-    CAIF_DeviceLayer &Layer(size_t index){return *_layers[index];}
-    const CAIF_DeviceLayer &Layer(size_t index)const{return *_layers[index];}
-
-    /**
-     * @brief Get a dense layer by index (typed access)
-     *
-     * Throws if the layer at the given index is not a dense layer.
-     */
-    CAIF_DeviceDenseLayer &DenseLayer(size_t index);
-    const CAIF_DeviceDenseLayer &DenseLayer(size_t index)const;
-
-    /**
-     * @brief Mark a layer as trainable or non-trainable
-     *
-     * Non-trainable layers are skipped by the Adam optimizer (no m/v tensors
-     * allocated) and their gradients are not zeroed by ZeroGradients().
-     * All layers default to trainable.
-     *
-     * @param index Layer index
-     * @param trainable Whether the layer should be trained
+     * Delegates to CAIF_DeviceContainer and then invalidates Adam state so
+     * the optimiser is rebuilt on the next InitializeAdam call.
      */
     void SetLayerTrainable(size_t index,bool trainable);
 
     /**
-     * @brief Check if a layer is trainable
+     * @brief Training-loop facing forward pass.
+     *
+     * Constructs a per-call CAIF_RunContext, sets stream/training/pass,
+     * stashes any pending sideband state, then invokes the base-class
+     * CAIF_DeviceLayer::Forward path (which pushes Network_e and chains
+     * sublayers via CAIF_DeviceContainer::ForwardImpl).
      */
-    bool IsLayerTrainable(size_t index)const;
+    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training=false);
 
     /**
-     * @brief Get total parameter count across all layers
+     * @brief Training-loop facing backward pass.
+     *
+     * Constructs the per-call CAIF_RunContext in Backward_e mode via
+     * CAIF_RunContextPassScope, stashes pending sideband, then invokes
+     * the inherited CAIF_DeviceLayer::Backward.
      */
-    size_t TotalParameterCount()const;
+    void Backward(const CAIF_DeviceTensor &grad_output);
+
+    // CAIF_DeviceLayer hooks — only the tag remains overridden; Forward/
+    // Backward IMPLs are inherited from CAIF_DeviceContainer (default
+    // sequential chain).
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::Network_e;
+    }
+    std::string Description()const override;
 
     /**
-     * @brief Get the expected input size for the network
+     * @brief Stash pending sideband state copied into the per-call run context.
      *
-     * Returns the input_size of the first layer, or 0 if no layers.
+     * Prefix-LM lengths, cross-attention encoder context, and T5 relative
+     * position bias used to be distributed across per-layer virtual setters.
+     * They now live on CAIF_RunContext, which Network constructs inside its
+     * own Forward/Backward. Callers that need to drive these sidebands (the
+     * trainer, encoder-decoder orchestration) set them here; the stashed
+     * state is copied onto the ctx at the start of every Forward and
+     * Backward. Call Clear<Name>() to remove a previously stashed sideband.
+     *
+     * Targets are held by non-owning reference — the caller keeps the
+     * tensors alive across the Forward/Backward pair.
      */
-    uint32_t InputSize()const;
+    void SetPrefixLengths(const CAIF_DeviceTensor &t){_pending_prefix_lengths=&t;}
+    void ClearPrefixLengths(){_pending_prefix_lengths=nullptr;}
+    void SetEncoderContext(const CAIF_DeviceTensor &t){_pending_encoder_context=&t;}
+    void ClearEncoderContext(){_pending_encoder_context=nullptr;}
+    void SetGradEncoderContext(CAIF_DeviceTensor &t){_pending_grad_encoder_context=&t;}
+    void ClearGradEncoderContext(){_pending_grad_encoder_context=nullptr;}
+    void SetPositionBias(const CAIF_DeviceTensor &t){_pending_position_bias=&t;}
+    void ClearPositionBias(){_pending_position_bias=nullptr;}
+    void SetGradPositionBias(CAIF_DeviceTensor &t){_pending_grad_position_bias=&t;}
+    void ClearGradPositionBias(){_pending_grad_position_bias=nullptr;}
 
     /**
-     * @brief Get the output size of the network
+     * @brief Initialize Adam optimizer state.
      *
-     * Returns the output_size of the last layer, or 0 if no layers.
+     * Convenience shim — wraps the CAIF_AdamOptimizer behind the
+     * polymorphic _optimizer member so OptimizerStep / SetLearningRate
+     * work uniformly across optimizer choices.
      */
-    uint32_t OutputSize()const;
+    void InitializeAdam(float lr=g_caif_default_learning_rate,
+                        float beta1=g_caif_default_beta1,
+                        float beta2=g_caif_default_beta2,
+                        float epsilon=g_caif_adam_epsilon,
+                        float weight_decay=0.0f);
 
     /**
-     * @brief Save network parameters to SafeTensors format
+     * @brief Initialize Adam with first/second-moment state offloaded to
+     * pinned host RAM. Same kernel as InitializeAdam, just keeps m / v on
+     * host between optimizer steps. See caif/CPU_OFFLOAD_DESIGN.md.
+     */
+    void InitializeOffloadedAdam(float lr=g_caif_default_learning_rate,
+                                 float beta1=g_caif_default_beta1,
+                                 float beta2=g_caif_default_beta2,
+                                 float epsilon=g_caif_adam_epsilon,
+                                 float weight_decay=0.0f);
+
+    /**
+     * @brief Initialize plain-SGD optimizer state (no momentum).
+     */
+    void InitializeSgd(float lr,
+                       float weight_decay=0.0f);
+
+    /**
+     * @brief Initialize SGD-with-momentum optimizer state.
+     */
+    void InitializeMomentum(float lr,
+                            float momentum=g_caif_sgd_default_momentum,
+                            float weight_decay=0.0f);
+
+    /**
+     * @brief Initialize RMSprop optimizer state.
+     */
+    void InitializeRmsprop(float lr,
+                           float alpha=g_caif_rmsprop_default_alpha,
+                           float epsilon=g_caif_rmsprop_default_epsilon,
+                           float weight_decay=0.0f);
+
+    /**
+     * @brief Initialize AdaGrad optimizer state.
+     */
+    void InitializeAdaGrad(float lr,
+                           float epsilon=g_caif_adagrad_default_epsilon,
+                           float weight_decay=0.0f);
+
+    /**
+     * @brief One optimizer step across every trainable parameter
+     * tensor. Dispatches through the active CAIF_Optimizer subclass.
+     */
+    void OptimizerStep();
+
+    /**
+     * @brief Backwards-compatible alias for OptimizerStep().
+     * @deprecated Use OptimizerStep().
+     */
+    void AdamStep(){OptimizerStep();}
+
+    /**
+     * @brief Set the active optimizer's learning rate (for LR
+     * scheduling). Throws if no Initialize* has been called.
+     */
+    void SetLearningRate(float lr);
+
+    /**
+     * @brief Clip gradient norm across all trainable parameters.
      *
-     * Saves all layer parameters using HuggingFace-compatible tensor names.
-     * Works with any layer types (polymorphic). Model architecture is stored
-     * in SafeTensors metadata.
+     * Computes the global L2 norm of all trainable gradients and scales
+     * them so the total norm does not exceed max_norm. Returns the total
+     * gradient norm before clipping.
+     */
+    float ClipGradientNorm(float max_norm);
+
+    /**
+     * @brief Sum of squares of all trainable gradients (no sqrt, no scale).
      *
-     * @param path Output file path (.safetensors)
+     * Split out of ClipGradientNorm so callers that own multiple networks
+     * (e.g. an encoder-decoder trainer) can accumulate this across
+     * networks, take one sqrt to get a joint L2 norm, and apply one joint
+     * scale via ScaleGradients. Per-network clip with a combined reduction
+     * is the standard "global-norm clip" semantics; calling
+     * ClipGradientNorm on each network separately gives a different scale
+     * on each side and the combined post-clip norm can exceed max_norm
+     * by up to sqrt(N).
+     */
+    float GradientNormSquared();
+
+    /**
+     * @brief Multiply every trainable gradient tensor by coef in place.
+     *
+     * Pairs with GradientNormSquared for multi-network joint gradient
+     * clipping. No-op when coef == 1.0f. Skips frozen layers, matching
+     * the same filter ClipGradientNorm uses.
+     */
+    void ScaleGradients(float coef);
+
+    /**
+     * @brief Get a dense layer by index (typed access). Throws if the layer
+     * at the given index is not a dense layer.
+     */
+    CAIF_DeviceDenseLayer<float,float> &DenseLayer(size_t index);
+    const CAIF_DeviceDenseLayer<float,float> &DenseLayer(size_t index)const;
+
+    /**
+     * @brief Declarative dense-chain input/output sizes.
+     *
+     * Tracked only by AddDenseLayer; polymorphic AddLayer calls do not
+     * update these. Returns 0 when the dense chain is empty.
+     */
+    uint32_t InputSize()const{return _input_size;}
+    uint32_t OutputSize()const{return _output_size;}
+
+    /**
+     * @brief Save network parameters to SafeTensors format.
      */
     void SaveSafeTensors(const std::string &path)const;
 
     /**
-     * @brief Load network parameters from SafeTensors file
-     *
-     * Loads weights into existing network architecture. The network must
-     * already have layers added that match the saved model. Parameters
-     * are matched by name using ParameterNames().
-     *
-     * @param path Input file path (.safetensors)
+     * @brief Load network parameters from SafeTensors file. The network must
+     * already have layers added that match the saved model.
      */
     void LoadSafeTensors(const std::string &path);
 
     /**
-     * @brief Save network using specified format
-     *
-     * @param path Output file path
-     * @param format Model format implementation
+     * @brief Save network using specified format.
      */
     void Save(const std::string &path,const CAIF_ModelFormat &format)const;
 
     /**
-     * @brief Load network parameters using specified format
-     *
-     * @param path Input file path
-     * @param format Model format implementation
+     * @brief Load network parameters using specified format.
      */
     void Load(const std::string &path,const CAIF_ModelFormat &format);
 
     /**
-     * @brief Save the network to legacy binary format (dense layers only)
-     *
-     * @deprecated Use SaveSafeTensors instead
-     *
-     * Saves layer architecture, weights, biases, and optionally Adam state.
-     * The file format is CAIF device network binary format (.aifdn).
-     * Only supports networks with dense layers.
-     *
-     * @param filepath Path to save the model
-     * @param save_optimizer_state Whether to save Adam optimizer state
+     * @brief Save the network to legacy binary format (dense layers only).
+     * @deprecated Use SaveSafeTensors instead.
      */
     void SaveModel(const std::string &filepath,bool save_optimizer_state=true)const;
 
     /**
-     * @brief Load network from legacy binary format (dense layers only)
-     *
-     * @deprecated Use LoadSafeTensors instead
-     *
-     * Restores layer architecture, weights, biases, and optionally Adam state.
-     * The network must not have any layers added before loading.
-     * Only supports networks with dense layers.
-     *
-     * @param filepath Path to the model file
-     * @param load_optimizer_state Whether to load Adam optimizer state if present
+     * @brief Load network from legacy binary format (dense layers only).
+     * @deprecated Use LoadSafeTensors instead. The network must not have any
+     * layers added before loading.
      */
     void LoadModel(const std::string &filepath,bool load_optimizer_state=true);
 
   protected:
 
   private:
-    CAIF_CudaStream *_stream;
-    std::vector<std::unique_ptr<CAIF_DeviceLayer>> _layers;
-    std::vector<bool> _trainable;
+    // Copy any stashed sideband (prefix lengths, encoder ctx, position bias)
+    // onto the per-call run context. Called at the top of Forward and
+    // Backward so both passes see the same sideband configuration.
+    void StashSidebandIntoContext(CAIF_RunContext &ctx)const;
+
+    // Declarative dense-chain IO sizes, tracked by AddDenseLayer.
     uint32_t _input_size;
     uint32_t _output_size;
 
-    // Adam optimizer state
-    bool _adam_initialized;
-    float _adam_lr;
-    float _adam_beta1;
-    float _adam_beta2;
-    float _adam_epsilon;
-    float _adam_weight_decay;
-    int _adam_t;  // Timestep
+    // Internal accessors + setters for _optimizer — methods access the
+    // optimizer through these instead of touching `_optimizer` directly
+    // (per coding guidelines: accessor-only access, even from within
+    // the class's own methods).  Setters are defined out-of-line in
+    // the .cpp so the unique_ptr destructor sees the full
+    // CAIF_Optimizer type.
+    bool HasOptimizer()const{return _optimizer!=nullptr;}
+    CAIF_Optimizer &Optimizer(){return *_optimizer;}
+    void ClearOptimizer();
+    void SetOptimizer(std::unique_ptr<CAIF_Optimizer> optimizer);
 
-    // Adam moment estimates (one pair per parameter tensor)
-    std::vector<CAIF_DeviceTensor> _adam_m;  // First moments
-    std::vector<CAIF_DeviceTensor> _adam_v;  // Second moments
+    // Active optimizer.  Set by Initialize{Adam,Sgd,Momentum,Rmsprop,
+    // AdaGrad}; null until then.  Owns its own state (m/v for Adam,
+    // velocity for Momentum, etc.) plus the AMP fp32-master + grad-fp32
+    // scaffolding that every optimizer needs when params are non-fp32.
+    std::unique_ptr<CAIF_Optimizer> _optimizer;
+
+    // Pending sideband state — copied onto the per-call run context at the
+    // top of Forward/Backward. nullptr means no sideband.
+    const CAIF_DeviceTensor *_pending_prefix_lengths=nullptr;
+    const CAIF_DeviceTensor *_pending_encoder_context=nullptr;
+    CAIF_DeviceTensor *_pending_grad_encoder_context=nullptr;
+    const CAIF_DeviceTensor *_pending_position_bias=nullptr;
+    CAIF_DeviceTensor *_pending_grad_position_bias=nullptr;
 };
 
 }//end instance namespace

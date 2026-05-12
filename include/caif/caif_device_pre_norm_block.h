@@ -14,14 +14,35 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Generic pre-norm residual block layer
+// CAIF_DevicePreNormBlock<ComputeT, StorageT> — generic pre-norm residual
+// block. Composes an arbitrary number of (norm, layer) pairs with residual
+// connections. Each stage applies:
+//
+//   x = x + layer(norm(x))
+//
+// Every stage requires BOTH norm and layer — no nullptr. Sublayers are
+// stored flat in the un-templated CAIF_DeviceContainer base's _sublayers
+// vector as interleaved pairs [norm0, layer0, norm1, layer1, ...].
+//
+// The block templates on <ComputeT, StorageT> for the residual buffer
+// allocation; the polymorphic sublayers may carry their own <C', S'> cells.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_PRE_NORM_BLOCK_H
-#define CAIF_DEVICE_PRE_NORM_BLOCK_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_container.h"
+#include "caif_device_layer_typed.h"
+#include "caif_block_offload_scheduler.h"
+#include "caif_run_context.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_constants.h"
+#include "caif_storage_dtype.h"
+#include "caif_storage_dtype_float.h"
+#ifdef USE_CAIF_CUDA
+#include "caif_storage_dtype_half.h"
+#include "caif_storage_dtype_bfloat16.h"
+#endif
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -30,28 +51,11 @@
 namespace instance
 {
 
-/**
- * @brief Generic pre-norm residual block.
- *
- * Composes an arbitrary number of (norm, layer) pairs with residual
- * connections. Each stage applies:
- *
- *   x = x + layer(norm(x))
- *
- * This single class replaces the need for architecture-specific block
- * classes (CAIF_DeviceTransformerBlock, CAIF_DeviceMoEBlock, etc.).
- *
- * The caller plugs in whatever combination of attention, FFN, MoE,
- * or any other CAIF_DeviceLayer they want:
- *
- * Standard transformer:  (RMSNorm, MHA)  + (RMSNorm, FFN)
- * MoE transformer:       (RMSNorm, MHA)  + (RMSNorm, MoE)
- * MLA + MoE (GLM-4.7):   (RMSNorm, MLA)  + (RMSNorm, MoE)
- * 3-stage block:          (Norm, CrossAttn) + (Norm, SelfAttn) + (Norm, FFN)
- */
-class CAIF_DevicePreNormBlock:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DevicePreNormBlock:public CAIF_DeviceContainer
 {
   public:
+    typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
 
     struct SubLayer_t
     {
@@ -64,49 +68,111 @@ class CAIF_DevicePreNormBlock:public CAIF_DeviceLayer
     typedef std::vector<SubLayer_t> SubLayerVec_t;
 
     CAIF_DevicePreNormBlock(SubLayerVec_t sub_layers,CAIF_CudaStream &stream);
-    ~CAIF_DevicePreNormBlock() override=default;
+    ~CAIF_DevicePreNormBlock()override=default;
 
-    // Move semantics
     CAIF_DevicePreNormBlock(CAIF_DevicePreNormBlock &&other);
     CAIF_DevicePreNormBlock &operator=(CAIF_DevicePreNormBlock &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training) override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output) override;
-    void ZeroGradients() override;
-    size_t ParameterTensorCount()const override;
-    CAIF_DeviceTensor &ParameterTensor(size_t index) override;
-    const CAIF_DeviceTensor &ParameterTensor(size_t index)const override;
-    CAIF_DeviceTensor &GradientTensor(size_t index) override;
-    const CAIF_DeviceTensor &GradientTensor(size_t index)const override;
-    size_t TotalParameterCount()const override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,
+                                  CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                   CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::PreNormBlock_e;
+    }
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
+    size_t FrozenTensorCount()const override;
+    CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
+    std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    size_t SubLayerCount()const{return _sub_layers.size();}
+    size_t SubLayerCount()const{return _sublayers.size()/g_caif_prenorm_stage_stride;}
 
-    void SetNormsTrainable(bool trainable){_norms_trainable=trainable;}
+    void SetNormsTrainable(bool trainable);
     bool NormsTrainable()const{return _norms_trainable;}
+
+    // Activation (gradient) checkpointing.
+    //
+    // When `_checkpointed` is true and `ctx.Training()` is true on entry
+    // to ForwardImpl, the block:
+    //   - clones the block input into `_saved_input`,
+    //   - flips `ctx.Training()` to false for the forward sweep — every
+    //     saving sublayer (MHA, MLA, FFN, MoE, norms) ALREADY gates its
+    //     internal `_cached_*` writes on `ctx.Training()`, so caching is
+    //     skipped for free,
+    //   - restores `ctx.Training()` to true on the way out.
+    //
+    // BackwardImpl, before running the real backward sweep, re-runs the
+    // forward loop on `_saved_input` with `ctx.Training()` true so each
+    // sublayer's caches are repopulated, then runs Backward as usual and
+    // releases `_saved_input`.
+    //
+    // Memory win: only one block's activations live at a time during
+    // backward instead of all N blocks' simultaneously during forward.
+    // Compute cost: one extra forward pass per block per training step.
+    // Composes with DP / TP / PP / ZeRO without modification — purely
+    // per-device.
+    void SetCheckpointed(const bool b)override{_checkpointed=b;}
+    bool Checkpointed()const override{return _checkpointed;}
+
+    // Saved-input accessors used by the checkpoint forward / backward
+    // pair. The block clones the forward input on entry to the
+    // checkpoint branch and consumes it on entry to backward; outside
+    // those two calls the saved tensor stays empty.
+    const CAIF_DeviceTensor &SavedInput()const{return _saved_input;}
+    void SetSavedInput(CAIF_DeviceTensor t){_saved_input=std::move(t);}
+    bool HasSavedInput()const{return _saved_input.IsAllocated();}
+    void ClearSavedInput(){_saved_input=CAIF_DeviceTensor();}
+
+    // CPU offload — block-level scheduler that drives Prefetch / Evict on
+    // offload-aware sublayers (CAIF_DeviceFrozenLinearBase). The block
+    // creates the scheduler on demand. ForwardLoop / BackwardLoop call
+    // OnEnter/Exit hooks per stage. Callers register offloadable sublayers
+    // (e.g. frozen-experts inside MoE) via `OffloadSchedulerMut().RegisterAtStage`.
+    CAIF_BlockOffloadScheduler &OffloadSchedulerMut();
+    bool HasOffloadScheduler()const{return _offload_scheduler!=nullptr;}
+
+    static constexpr CAIF_DataType::CAIF_DataType_e ComputeDtype()
+    {
+      return CAIF_StorageDtype_t<ComputeT>::Value;
+    }
+    static constexpr CAIF_DataType::CAIF_DataType_e StorageDtype()
+    {
+      return CAIF_StorageDtype_t<StorageT>::Value;
+    }
 
   protected:
 
   private:
+    // Forward / backward bodies factored out of ForwardImpl /
+    // BackwardImpl so the checkpoint-recompute path can re-run the
+    // forward loop without re-entering the checkpoint-mode branch.
+    CAIF_DeviceTensor ForwardLoop(const CAIF_DeviceTensor &input,
+                                  CAIF_RunContext &ctx);
+    CAIF_DeviceTensor BackwardLoop(const CAIF_DeviceTensor &grad_output,
+                                   CAIF_RunContext &ctx);
 
-    struct SubLayerMapping_t
-    {
-      size_t stage_idx;
-      bool is_norm;
-      size_t local_idx;
-    };
-
-    SubLayerMapping_t MapIndex(size_t index)const;
-    CAIF_DeviceLayer &LayerByMapping(const SubLayerMapping_t &mapping);
-    const CAIF_DeviceLayer &LayerByMapping(const SubLayerMapping_t &mapping)const;
-
-    SubLayerVec_t _sub_layers;
+    std::vector<std::string> _norm_prefixes;
+    std::vector<std::string> _layer_prefixes;
     bool _norms_trainable;
+    bool _checkpointed;
+    CAIF_DeviceTensor _saved_input;
+    std::unique_ptr<CAIF_BlockOffloadScheduler> _offload_scheduler;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DevicePreNormBlock<float,float>;
+extern template class CAIF_DevicePreNormBlock<float,__half>;
+extern template class CAIF_DevicePreNormBlock<float,__nv_bfloat16>;
+extern template class CAIF_DevicePreNormBlock<__half,float>;
+extern template class CAIF_DevicePreNormBlock<__half,__half>;
+extern template class CAIF_DevicePreNormBlock<__half,__nv_bfloat16>;
+extern template class CAIF_DevicePreNormBlock<__nv_bfloat16,float>;
+extern template class CAIF_DevicePreNormBlock<__nv_bfloat16,__half>;
+extern template class CAIF_DevicePreNormBlock<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DevicePreNormBlock<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_PRE_NORM_BLOCK_H
+}//end instance namespace

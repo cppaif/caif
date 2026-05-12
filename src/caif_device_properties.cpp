@@ -16,10 +16,11 @@
 #include "caif_exception.h"
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
-using namespace instance;
+namespace instance
+{
 
 // Static members
 CAIF_DeviceProperties::DevicePropertiesVec_t
@@ -139,3 +140,5 @@ CAIF_DeviceProperties &CAIF_DeviceProperties::Current()
 #endif
   return ForDevice(device_id);
 }
+
+}//end instance namespace

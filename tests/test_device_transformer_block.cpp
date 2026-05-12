@@ -13,8 +13,16 @@
 // limitations under the License.
 
 #include "caif_device_transformer_block.h"
-#include "caif_device_gated_activations.h"
-#include "caif_device_pointwise_activations.h"
+#include "caif_test_harness.h"
+#include "caif_device_swiglu_activation.h"
+#include "caif_device_geglu_activation.h"
+#include "caif_device_reglu_activation.h"
+#include "caif_device_glu_activation.h"
+#include "caif_device_bilinear_activation.h"
+#include "caif_device_gelu_activation.h"
+#include "caif_device_network.h"
+#include "caif_run_context.h"
+#include "caif_settings.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_constants.h"
@@ -25,21 +33,26 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
+struct GradMode_t
+{
+  bool precise;
+  float tol;
+  float fd_h;
+  const char *label;
+};
+
+// Gradient tolerance is applied relative to |analytical| for values > 1,
+// absolute otherwise: diff_tol = grad_tol * max(1, |analytical|).
+// fd_h: TF32's reduced mantissa precision causes catastrophic cancellation
+// in (sum_plus - sum_minus) when h is small relative to accumulated TF32
+// noise across the full block (RMSNorm+MHA+residual+RMSNorm+FFN). Use a
+// larger step for TF32 to keep signal above the noise floor.
+static const GradMode_t kGradModePrecise={true, 8e-2f, 1e-3f,"Precise"};
+static const GradMode_t kGradModeTF32=   {false,1.5e-1f,1e-2f,"TF32"};
 
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -58,7 +71,7 @@ static void TestForwardShape()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -68,13 +81,18 @@ static void TestForwardShape()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -96,11 +114,7 @@ static void TestForwardShape()
 
     ReportResult("TransformerBlock::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -117,7 +131,7 @@ static void TestForwardResidual()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -127,7 +141,10 @@ static void TestForwardResidual()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -137,7 +154,9 @@ static void TestForwardResidual()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // The residual connections mean the output should contain
@@ -169,11 +188,7 @@ static void TestForwardResidual()
 
     ReportResult("TransformerBlock::ForwardResidual",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::ForwardResidual",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardResidual")
 }
 
 //------------------------------------------------------------------------------
@@ -190,6 +205,8 @@ static void TestForwardCausal()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     // Create deterministic input
     std::vector<float> host_input(batch*seq_len*dim);
@@ -199,7 +216,7 @@ static void TestForwardCausal()
     }
 
     // Non-causal block
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config_nc;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config_nc;
     config_nc.dim=dim;
     config_nc.num_heads=num_heads;
     config_nc.num_kv_heads=num_heads;
@@ -209,10 +226,10 @@ static void TestForwardCausal()
     config_nc.use_rope=false;
     config_nc.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block_nc(config_nc,stream);
+    CAIF_DeviceTransformerBlock<float,float> block_nc(config_nc,stream);
 
     // Causal block with same weights
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config_c;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config_c;
     config_c.dim=dim;
     config_c.num_heads=num_heads;
     config_c.num_kv_heads=num_heads;
@@ -222,7 +239,7 @@ static void TestForwardCausal()
     config_c.use_rope=false;
     config_c.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block_c(config_c,stream);
+    CAIF_DeviceTransformerBlock<float,float> block_c(config_c,stream);
 
     // Copy weights from non-causal to causal
     for(size_t p=0;p<block_nc.ParameterTensorCount();++p)
@@ -237,8 +254,10 @@ static void TestForwardCausal()
     CAIF_DeviceTensor input_c=CAIF_DeviceTensor::FromHostData(
                                host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor out_nc=block_nc.Forward(input_nc,false);
-    CAIF_DeviceTensor out_c=block_c.Forward(input_c,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor out_nc=block_nc.Forward(input_nc,ctx);
+    CAIF_DeviceTensor out_c=block_c.Forward(input_c,ctx);
 
     CAIF_HostTensor host_nc=out_nc.ToHost();
     CAIF_HostTensor host_c=out_c.ToHost();
@@ -261,30 +280,32 @@ static void TestForwardCausal()
 
     ReportResult("TransformerBlock::ForwardCausal",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::ForwardCausal",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardCausal")
 }
 
 //------------------------------------------------------------------------------
 // Test 4: Backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestBackwardGrad()
+static void TestBackwardGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("TransformerBlock::BackwardGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=2;
     const uint32_t dim=4;
     const uint32_t num_heads=2;
     const uint32_t ffn_dim=8;
-    const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float h=mode.fd_h;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -302,7 +323,7 @@ static void TestBackwardGrad()
     }
 
     // Get analytical gradient
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
     // Save all weights
     const size_t num_params=block.ParameterTensorCount();
@@ -314,12 +335,15 @@ static void TestBackwardGrad()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    block.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=block.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=block.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -332,7 +356,7 @@ static void TestBackwardGrad()
       input_minus[i]-=h;
 
       // Forward with +h
-      CAIF_DeviceTransformerBlock block_p(config,stream);
+      CAIF_DeviceTransformerBlock<float,float> block_p(config,stream);
       for(size_t p=0;p<num_params;++p)
       {
         block_p.ParameterTensor(p).CopyFromHost(saved_params[p].Data(),
@@ -340,7 +364,8 @@ static void TestBackwardGrad()
       }
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_plus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=block_p.Forward(inp_p,false);
+      ctx.SetTraining(false);
+      CAIF_DeviceTensor out_p=block_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -349,7 +374,7 @@ static void TestBackwardGrad()
       }
 
       // Forward with -h
-      CAIF_DeviceTransformerBlock block_m(config,stream);
+      CAIF_DeviceTransformerBlock<float,float> block_m(config,stream);
       for(size_t p=0;p<num_params;++p)
       {
         block_m.ParameterTensor(p).CopyFromHost(saved_params[p].Data(),
@@ -357,7 +382,7 @@ static void TestBackwardGrad()
       }
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_minus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=block_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=block_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -368,7 +393,7 @@ static void TestBackwardGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -377,13 +402,10 @@ static void TestBackwardGrad()
       }
     }
 
-    ReportResult("TransformerBlock::BackwardGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::BackwardGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
@@ -398,7 +420,7 @@ static void TestParameterTensorCount()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -412,7 +434,7 @@ static void TestParameterTensorCount()
 
     // SwiGLU (gated, default): norm1(1) + attn(4) + norm2(1) + ffn(3) = 9
     {
-      CAIF_DeviceTransformerBlock block(config,stream);
+      CAIF_DeviceTransformerBlock<float,float> block(config,stream);
       if(block.ParameterTensorCount()!=9)
       {
         std::cout<<"  SwiGLU ParameterTensorCount expected 9, got "
@@ -423,8 +445,8 @@ static void TestParameterTensorCount()
 
     // GELU (pointwise): norm1(1) + attn(4) + norm2(1) + ffn(2) = 8
     {
-      auto activation=std::make_unique<CAIF_DeviceGELUActivation>();
-      CAIF_DeviceTransformerBlock block(config,std::move(activation),stream);
+      auto activation=std::make_unique<CAIF_DeviceGELUActivation<float,float>>();
+      CAIF_DeviceTransformerBlock<float,float> block(config,std::move(activation),stream);
       if(block.ParameterTensorCount()!=8)
       {
         std::cout<<"  GELU ParameterTensorCount expected 8, got "
@@ -435,11 +457,7 @@ static void TestParameterTensorCount()
 
     ReportResult("TransformerBlock::ParameterTensorCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -455,7 +473,7 @@ static void TestTotalParameterCount()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -465,7 +483,7 @@ static void TestTotalParameterCount()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
     // norm1: gamma[dim] = 8
     // attn: W_q[dim, num_heads*head_dim] = 8*8 = 64
@@ -497,11 +515,7 @@ static void TestTotalParameterCount()
 
     ReportResult("TransformerBlock::TotalParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::TotalParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::TotalParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -518,7 +532,7 @@ static void TestZeroGradients()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -528,18 +542,24 @@ static void TestZeroGradients()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    block.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    block.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    block.Backward(grad_out,ctx);
 
     // Zero gradients
     block.ZeroGradients();
@@ -566,11 +586,7 @@ static void TestZeroGradients()
 
     ReportResult("TransformerBlock::ZeroGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::ZeroGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::ZeroGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -585,7 +601,7 @@ static void TestDescription()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -595,7 +611,7 @@ static void TestDescription()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
     const std::string desc=block.Description();
 
     bool passed=true;
@@ -642,11 +658,7 @@ static void TestDescription()
 
     ReportResult("TransformerBlock::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::Description")
 }
 
 //------------------------------------------------------------------------------
@@ -660,7 +672,7 @@ static void TestFFNDimAutoCompute()
     const uint32_t num_heads=2;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -670,7 +682,7 @@ static void TestFFNDimAutoCompute()
     config.use_rope=false;
     config.rope_base=g_caif_rope_default_base;
 
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
     // Expected: round_to(4 * 8 * 2/3, 256) = round_to(21.33, 256) = 256
     uint32_t raw=g_caif_ffn_multiplier_numerator*
@@ -690,11 +702,7 @@ static void TestFFNDimAutoCompute()
 
     ReportResult("TransformerBlock::FFNDimAutoCompute",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::FFNDimAutoCompute",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::FFNDimAutoCompute")
 }
 
 //------------------------------------------------------------------------------
@@ -709,7 +717,7 @@ static void TestDefaultActivation()
     const uint32_t ffn_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock::TransformerBlockConfig_t config;
+    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
     config.dim=dim;
     config.num_heads=num_heads;
     config.num_kv_heads=num_heads;
@@ -720,7 +728,7 @@ static void TestDefaultActivation()
     config.rope_base=g_caif_rope_default_base;
 
     // Use convenience constructor (no activation arg -> SwiGLU)
-    CAIF_DeviceTransformerBlock block(config,stream);
+    CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
     // SwiGLU is gated -> 3 FFN tensors -> total 9 param tensors
     bool passed=true;
@@ -733,24 +741,21 @@ static void TestDefaultActivation()
 
     ReportResult("TransformerBlock::DefaultActivation",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("TransformerBlock::DefaultActivation",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("TransformerBlock::DefaultActivation")
 }
 
 #endif  // USE_CAIF_CUDA
 
 int main()
 {
-  std::cout<<"=== CAIF_DeviceTransformerBlock Tests ===\n\n";
+  std::cout<<"=== CAIF_DeviceTransformerBlock<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestForwardShape();
   TestForwardResidual();
   TestForwardCausal();
-  TestBackwardGrad();
+  TestBackwardGrad(kGradModePrecise);
+  TestBackwardGrad(kGradModeTF32);
   TestParameterTensorCount();
   TestTotalParameterCount();
   TestZeroGradients();
@@ -761,13 +766,5 @@ int main()
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

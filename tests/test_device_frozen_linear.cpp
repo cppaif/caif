@@ -17,12 +17,17 @@
 // Test: CAIF_DeviceFrozenLinear (Dtype-agnostic frozen linear layer)
 //------------------------------------------------------------------------------
 #include "caif_device_frozen_linear.h"
+#include "caif_device_frozen_linear_factory.h"
+#include "caif_device_frozen_linear_base.h"
+#include "caif_test_harness.h"
 #include "caif_device_dense_layer.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_cuda_kernels.h"
 #include "caif_constants.h"
 #include "caif_exception.h"
+#include "caif_ops.h"
+#include "caif_run_context.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
@@ -32,21 +37,9 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    ISE_Out::Out()<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    ISE_Out::Out()<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -58,10 +51,9 @@ static const uint32_t g_test_batch=2;
 //------------------------------------------------------------------------------
 // Helper: create a FrozenLinear with FP32 random weights loaded
 //------------------------------------------------------------------------------
-static CAIF_DeviceFrozenLinear MakeFP32Frozen(CAIF_CudaStream &stream,uint32_t seed=42)
+static CAIF_DeviceFrozenLinear<float,float> MakeFP32Frozen(CAIF_CudaStream &stream,uint32_t seed=42)
 {
-  CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                               CAIF_DataType::CAIF_DataType_e::Float32,stream);
+  CAIF_DeviceFrozenLinear<float,float> layer(g_test_input_dim,g_test_output_dim,stream);
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-0.5f,0.5f);
   const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
@@ -98,12 +90,16 @@ static void TestFP32ForwardShape()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -115,11 +111,7 @@ static void TestFP32ForwardShape()
     }
     ReportResult("FrozenLinear::FP32ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::FP32ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::FP32ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -130,12 +122,16 @@ static void TestFP32ForwardFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -150,11 +146,7 @@ static void TestFP32ForwardFinite()
     }
     ReportResult("FrozenLinear::FP32ForwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::FP32ForwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::FP32ForwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -165,17 +157,22 @@ static void TestFP32BackwardShapeFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    layer.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    layer.Forward(input,ctx);
 
     std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                               {g_test_batch,g_test_output_dim},stream);
-    CAIF_DeviceTensor grad_input=layer.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=layer.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -195,11 +192,7 @@ static void TestFP32BackwardShapeFinite()
     }
     ReportResult("FrozenLinear::FP32BackwardShapeFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::FP32BackwardShapeFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::FP32BackwardShapeFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -210,8 +203,9 @@ static void TestFP16ForwardShapeFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                                 CAIF_DataType::CAIF_DataType_e::Float16,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,__half> layer(g_test_input_dim,g_test_output_dim,stream);
 
     // Create FP32 weights, convert to FP16, load
     auto w=MakeRandomInput(g_test_input_dim,g_test_output_dim,77);
@@ -223,7 +217,9 @@ static void TestFP16ForwardShapeFinite()
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -243,11 +239,7 @@ static void TestFP16ForwardShapeFinite()
     }
     ReportResult("FrozenLinear::FP16ForwardShapeFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::FP16ForwardShapeFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::FP16ForwardShapeFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -258,8 +250,9 @@ static void TestBF16ForwardShapeFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                                 CAIF_DataType::CAIF_DataType_e::BFloat16,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,__nv_bfloat16> layer(g_test_input_dim,g_test_output_dim,stream);
 
     auto w=MakeRandomInput(g_test_input_dim,g_test_output_dim,88);
     CAIF_DeviceTensor fp32_w=CAIF_DeviceTensor::FromHostData(w.data(),
@@ -270,7 +263,9 @@ static void TestBF16ForwardShapeFinite()
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -290,11 +285,7 @@ static void TestBF16ForwardShapeFinite()
     }
     ReportResult("FrozenLinear::BF16ForwardShapeFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::BF16ForwardShapeFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::BF16ForwardShapeFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -305,8 +296,9 @@ static void TestINT8ForwardShapeFinite()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                                 CAIF_DataType::CAIF_DataType_e::Int8,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,int8_t> layer(g_test_input_dim,g_test_output_dim,stream);
 
     // Create small FP32 weights (within INT8 range), convert to INT8
     const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
@@ -325,7 +317,9 @@ static void TestINT8ForwardShapeFinite()
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -345,11 +339,7 @@ static void TestINT8ForwardShapeFinite()
     }
     ReportResult("FrozenLinear::INT8ForwardShapeFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::INT8ForwardShapeFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT8ForwardShapeFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -361,8 +351,8 @@ static void TestINT4ForwardShapeFinite()
   {
     const uint32_t group_size=g_caif_quant_default_group_size;
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                                 CAIF_DataType::CAIF_DataType_e::Int4,stream,group_size);
+    CAIF_DeviceFrozenLinear<float,caif_int4_packed_t> layer(g_test_input_dim,g_test_output_dim,
+                                                              stream,group_size);
 
     // Create FP32 weights, quantize to INT4 on device, then load
     const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
@@ -385,10 +375,12 @@ static void TestINT4ForwardShapeFinite()
     CAIF_DeviceTensor scales=CAIF_DeviceTensor::Zeros({num_groups},stream,
                                                      CAIF_DataType::CAIF_DataType_e::Float16);
 
-    // Quantize on device
-    launch_quantize_to_int4(static_cast<const float*>(fp32_w.DevicePtr()),
-                             packed.DevicePtr(),
-                             scales.DevicePtr(),
+    // Quantize on device. scales is fp16 storage; route through DeviceDataRaw
+    // so the fp16/bf16 DevicePtr() tripwire (caif_device_tensor.h) doesn't
+    // fire on a legitimate type-erased call.
+    launch_quantize_to_int4(fp32_w.DevicePtr<float>(),
+                             packed.DeviceDataRaw(),
+                             scales.DeviceDataRaw(),
                              static_cast<int>(count),
                              static_cast<int>(group_size),
                              stream.Handle());
@@ -404,10 +396,14 @@ static void TestINT4ForwardShapeFinite()
     layer.LoadScalesFromHost(host_scales.data(),scales_bytes);
 
     // Forward pass
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -427,11 +423,7 @@ static void TestINT4ForwardShapeFinite()
     }
     ReportResult("FrozenLinear::INT4ForwardShapeFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::INT4ForwardShapeFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT4ForwardShapeFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -442,7 +434,7 @@ static void TestParameterTensorCount()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     bool passed=layer.ParameterTensorCount()==0;
     if(passed==false)
@@ -451,11 +443,7 @@ static void TestParameterTensorCount()
     }
     ReportResult("FrozenLinear::ParameterTensorCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::ParameterTensorCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::ParameterTensorCount")
 }
 
 //------------------------------------------------------------------------------
@@ -466,7 +454,7 @@ static void TestTotalParameterCount()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     bool passed=layer.TotalParameterCount()==0;
     if(passed==false)
@@ -475,11 +463,7 @@ static void TestTotalParameterCount()
     }
     ReportResult("FrozenLinear::TotalParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::TotalParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::TotalParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -490,7 +474,7 @@ static void TestDescription()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
     const std::string desc=layer.Description();
 
     bool passed=true;
@@ -516,11 +500,7 @@ static void TestDescription()
     }
     ReportResult("FrozenLinear::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::Description")
 }
 
 //------------------------------------------------------------------------------
@@ -531,8 +511,7 @@ static void TestLoadFromTensor()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer(g_test_input_dim,g_test_output_dim,
-                                 CAIF_DataType::CAIF_DataType_e::Float32,stream);
+    CAIF_DeviceFrozenLinear<float,float> layer(g_test_input_dim,g_test_output_dim,stream);
 
     std::vector<float> w(static_cast<size_t>(g_test_input_dim)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor weight=CAIF_DeviceTensor::FromHostData(w.data(),
@@ -540,20 +519,20 @@ static void TestLoadFromTensor()
     layer.LoadFromTensor(std::move(weight));
 
     // Forward should work after load
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=h_out.TotalElements()==static_cast<size_t>(g_test_batch)*g_test_output_dim;
     ReportResult("FrozenLinear::LoadFromTensor",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::LoadFromTensor",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::LoadFromTensor")
 }
 
 //------------------------------------------------------------------------------
@@ -567,12 +546,16 @@ static void Test3DInputForwardShape()
     const uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     auto host_input=MakeRandomInput(batch*seq_len,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {batch,seq_len,g_test_input_dim},stream);
-    CAIF_DeviceTensor output=layer.Forward(input,false);
+    CAIF_DeviceTensor output=layer.Forward(input,ctx);
     CAIF_HostTensor h_out=output.ToHost();
 
     bool passed=true;
@@ -593,11 +576,7 @@ static void Test3DInputForwardShape()
     }
     ReportResult("FrozenLinear::3DInputForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::3DInputForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::3DInputForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -608,17 +587,22 @@ static void TestBackwardNonZero()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceFrozenLinear layer=MakeFP32Frozen(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DeviceFrozenLinear<float,float> layer=MakeFP32Frozen(stream);
 
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    layer.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    layer.Forward(input,ctx);
 
     std::vector<float> grad_data(static_cast<size_t>(g_test_batch)*g_test_output_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
                                                               {g_test_batch,g_test_output_dim},stream);
-    CAIF_DeviceTensor grad_input=layer.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=layer.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -643,11 +627,7 @@ static void TestBackwardNonZero()
     }
     ReportResult("FrozenLinear::BackwardNonZero",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::BackwardNonZero",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::BackwardNonZero")
 }
 
 //------------------------------------------------------------------------------
@@ -660,24 +640,38 @@ static void TestMatchesDenseLayer()
     CAIF_CudaStream stream;
 
     // Create dense layer (no bias, no activation)
-    CAIF_DeviceDenseLayer dense(g_test_input_dim,g_test_output_dim,
+    CAIF_DeviceDenseLayer<float,float> dense(g_test_input_dim,g_test_output_dim,
                                CAIF_DeviceActivation_e::None,stream,false);
 
-    // Copy dense weights to frozen layer
+    // Copy dense weights to frozen layer.
+    // Dense stores weights as [input_dim, output_dim]; FrozenLinear
+    // expects [output_dim, input_dim] (the HuggingFace safetensors
+    // layout). Transpose host-side.
     CAIF_HostTensor dense_weights=dense.Weights().ToHost();
+    std::vector<float> transposed(static_cast<size_t>(g_test_input_dim)*g_test_output_dim);
+    for(uint32_t i=0;i<g_test_input_dim;++i)
+    {
+      for(uint32_t o=0;o<g_test_output_dim;++o)
+      {
+        transposed[o*g_test_input_dim+i]=dense_weights.Data()[i*g_test_output_dim+o];
+      }
+    }
 
-    CAIF_DeviceFrozenLinear frozen(g_test_input_dim,g_test_output_dim,
-                                  CAIF_DataType::CAIF_DataType_e::Float32,stream);
-    CAIF_DeviceTensor frozen_w=CAIF_DeviceTensor::FromHostData(dense_weights.Data(),
-                                                              {g_test_input_dim,g_test_output_dim},stream);
+    CAIF_DeviceFrozenLinear<float,float> frozen(g_test_input_dim,g_test_output_dim,stream);
+    CAIF_DeviceTensor frozen_w=CAIF_DeviceTensor::FromHostData(transposed.data(),
+                                                              {g_test_output_dim,g_test_input_dim},stream);
     frozen.LoadFromTensor(std::move(frozen_w));
 
     // Same input
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     auto host_input=MakeRandomInput(g_test_batch,g_test_input_dim,999);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
                                                           {g_test_batch,g_test_input_dim},stream);
-    CAIF_DeviceTensor dense_out=dense.Forward(input,false);
-    CAIF_DeviceTensor frozen_out=frozen.Forward(input,false);
+    CAIF_DeviceTensor dense_out=dense.Forward(input,ctx);
+    CAIF_DeviceTensor frozen_out=frozen.Forward(input,ctx);
 
     CAIF_HostTensor h_dense=dense_out.ToHost();
     CAIF_HostTensor h_frozen=frozen_out.ToHost();
@@ -696,11 +690,407 @@ static void TestMatchesDenseLayer()
     }
     ReportResult("FrozenLinear::MatchesDenseLayer",passed);
   }
-  catch(const std::exception &e)
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::MatchesDenseLayer")
+}
+
+//------------------------------------------------------------------------------
+// Test: quantized storage dtypes vs FP32 reference (accuracy, not just shape).
+// For each storage+compute combo, quantize FP32 weights and compare the
+// FrozenLinear forward output against an FP32-storage FP32-compute reference.
+//------------------------------------------------------------------------------
+
+static bool CompareAgainstFP32(const CAIF_HostTensor &ref,
+                               const CAIF_HostTensor &got,
+                               const float tol,
+                               const char *label)
+{
+  if(ref.TotalElements()!=got.TotalElements())
   {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FrozenLinear::MatchesDenseLayer",false);
+    ISE_Out::Out()<<"  "<<label<<" size mismatch\n";
+    return false;
   }
+  float max_abs=0.0f;
+  for(size_t i=0;i<ref.TotalElements();++i)
+  {
+    const float a=std::fabs(ref.Data()[i]);
+    if(a>max_abs)
+    {
+      max_abs=a;
+    }
+  }
+  const float denom=std::max(max_abs,1e-6f);
+  for(size_t i=0;i<ref.TotalElements();++i)
+  {
+    if(std::isfinite(got.Data()[i])==false)
+    {
+      ISE_Out::Out()<<"  "<<label<<" non-finite at "<<i<<"\n";
+      return false;
+    }
+    const float rel=std::fabs(ref.Data()[i]-got.Data()[i])/denom;
+    if(rel>tol)
+    {
+      ISE_Out::Out()<<"  "<<label
+                    <<" mismatch i="<<i
+                    <<" ref="<<ref.Data()[i]
+                    <<" got="<<got.Data()[i]
+                    <<" rel="<<rel
+                    <<"\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+static CAIF_HostTensor RunFP32Reference(const std::vector<float> &weights,
+                                        const std::vector<float> &input_host,
+                                        CAIF_CudaStream &stream)
+{
+  CAIF_DeviceFrozenLinear<float,float> ref(g_test_input_dim,g_test_output_dim,stream);
+  CAIF_DeviceTensor w=CAIF_DeviceTensor::FromHostData(weights.data(),
+                                                     {g_test_input_dim,g_test_output_dim},
+                                                     stream);
+  ref.LoadFromTensor(std::move(w));
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_host.data(),
+                                                         {g_test_batch,g_test_input_dim},
+                                                         stream);
+  CAIF_DeviceTensor out=ref.Forward(input,ctx);
+  return out.ToHost();
+}
+
+static bool RunInt8Case(const std::vector<float> &weights,
+                        const std::vector<float> &host_input,
+                        const CAIF_HostTensor &ref,
+                        const CAIF_Ops::QuantScheme_e scheme,
+                        const CAIF_DataType::CAIF_DataType_e compute,
+                        const char *label,
+                        const float tol,
+                        CAIF_CudaStream &stream)
+{
+  std::unique_ptr<CAIF_DeviceLayer> layer=
+    CAIF_DeviceFrozenLinearFactory::Create(g_test_input_dim,
+                                            g_test_output_dim,
+                                            CAIF_DataType::CAIF_DataType_e::Int8,
+                                            stream,
+                                            g_caif_quant_default_group_size,
+                                            true,
+                                            compute,
+                                            scheme);
+  CAIF_DeviceFrozenLinearBase *layer_fl=
+    dynamic_cast<CAIF_DeviceFrozenLinearBase*>(layer.get());
+  CAIF_DeviceTensor w_fp32=CAIF_DeviceTensor::FromHostData(weights.data(),
+                                                          {g_test_input_dim,g_test_output_dim},
+                                                          stream);
+  CAIF_DeviceTensor w_int8=CAIF_DeviceTensor::Zeros({g_test_input_dim,g_test_output_dim},
+                                                   stream,
+                                                   CAIF_DataType::CAIF_DataType_e::Int8);
+  uint32_t scale_count=1u;
+  if(scheme==CAIF_Ops::QuantScheme_e::PerChannel_e)
+  {
+    scale_count=g_test_output_dim;
+  }
+  CAIF_DeviceTensor scales=CAIF_DeviceTensor::Zeros({scale_count},
+                                                   stream,
+                                                   CAIF_DataType::CAIF_DataType_e::Float32);
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
+  CAIF_Ops::QuantizeInt8(w_fp32,w_int8,scales,scheme,ctx);
+  stream.Synchronize();
+
+  layer_fl->LoadFromTensor(std::move(w_int8));
+  std::vector<float> host_scales(scale_count);
+  scales.CopyToHost(host_scales.data());
+  layer_fl->LoadScalesFromHost(host_scales.data(),host_scales.size()*sizeof(float));
+
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                         {g_test_batch,g_test_input_dim},
+                                                         stream);
+  CAIF_DeviceTensor out=layer->Forward(input,ctx);
+  CAIF_HostTensor got=out.ToHost();
+  return CompareAgainstFP32(ref,got,tol,label);
+}
+
+static bool RunInt4Case(const std::vector<float> &weights,
+                        const std::vector<float> &host_input,
+                        const CAIF_HostTensor &ref,
+                        const CAIF_DataType::CAIF_DataType_e compute,
+                        const char *label,
+                        const float tol,
+                        CAIF_CudaStream &stream)
+{
+  const uint32_t group_size=g_caif_quant_default_group_size;
+  const size_t count=weights.size();
+  std::unique_ptr<CAIF_DeviceLayer> layer=
+    CAIF_DeviceFrozenLinearFactory::Create(g_test_input_dim,
+                                            g_test_output_dim,
+                                            CAIF_DataType::CAIF_DataType_e::Int4,
+                                            stream,
+                                            group_size,
+                                            true,
+                                            compute);
+  CAIF_DeviceFrozenLinearBase *layer_fl=
+    dynamic_cast<CAIF_DeviceFrozenLinearBase*>(layer.get());
+  CAIF_DeviceTensor w_fp32=CAIF_DeviceTensor::FromHostData(weights.data(),
+                                                          {g_test_input_dim,g_test_output_dim},
+                                                          stream);
+  const size_t packed_bytes=(count+1)/2;
+  const uint32_t num_groups=
+    static_cast<uint32_t>((count+group_size-1)/group_size);
+  CAIF_DeviceTensor packed=CAIF_DeviceTensor::Zeros({static_cast<uint32_t>(packed_bytes)},
+                                                   stream,
+                                                   CAIF_DataType::CAIF_DataType_e::UInt8);
+  CAIF_DeviceTensor scales=CAIF_DeviceTensor::Zeros({num_groups},
+                                                   stream,
+                                                   CAIF_DataType::CAIF_DataType_e::Float16);
+  // scales is fp16 storage; route through DeviceDataRaw to bypass the
+  // fp16/bf16 DevicePtr() tripwire (caif_device_tensor.h).
+  launch_quantize_to_int4(w_fp32.DevicePtr<float>(),
+                          packed.DeviceDataRaw(),
+                          scales.DeviceDataRaw(),
+                          static_cast<int>(count),
+                          static_cast<int>(group_size),
+                          stream.Handle());
+  stream.Synchronize();
+
+  layer_fl->LoadFromTensor(std::move(packed));
+  std::vector<uint8_t> host_scales(num_groups*sizeof(uint16_t));
+  scales.CopyToHostRaw(host_scales.data());
+  layer_fl->LoadScalesFromHost(host_scales.data(),host_scales.size());
+
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                         {g_test_batch,g_test_input_dim},
+                                                         stream);
+  CAIF_DeviceTensor out=layer->Forward(input,ctx);
+  CAIF_HostTensor got=out.ToHost();
+  return CompareAgainstFP32(ref,got,tol,label);
+}
+
+static void TestINT8PerTensorAccuracy()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
+    std::vector<float> weights(count);
+    std::mt19937 gen(71);
+    std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+    for(size_t i=0;i<count;++i)
+    {
+      weights[i]=dist(gen);
+    }
+    std::vector<float> host_input=MakeRandomInput(g_test_batch,g_test_input_dim,201);
+    CAIF_HostTensor ref=RunFP32Reference(weights,host_input,stream);
+
+    bool all_ok=true;
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerTensor_e,
+                   CAIF_DataType::CAIF_DataType_e::Float32,
+                   "INT8pt_fp32c",2e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerTensor_e,
+                   CAIF_DataType::CAIF_DataType_e::Float16,
+                   "INT8pt_fp16c",3e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerTensor_e,
+                   CAIF_DataType::CAIF_DataType_e::BFloat16,
+                   "INT8pt_bf16c",4e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    ReportResult("FrozenLinear::INT8PerTensorAccuracy",all_ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT8PerTensorAccuracy")
+}
+
+static void TestINT8PerChannelAccuracy()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
+    std::vector<float> weights(count);
+    std::mt19937 gen(72);
+    std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+    for(size_t i=0;i<count;++i)
+    {
+      weights[i]=dist(gen);
+    }
+    std::vector<float> host_input=MakeRandomInput(g_test_batch,g_test_input_dim,202);
+    CAIF_HostTensor ref=RunFP32Reference(weights,host_input,stream);
+
+    bool all_ok=true;
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerChannel_e,
+                   CAIF_DataType::CAIF_DataType_e::Float32,
+                   "INT8pc_fp32c",2e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerChannel_e,
+                   CAIF_DataType::CAIF_DataType_e::Float16,
+                   "INT8pc_fp16c",3e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt8Case(weights,host_input,ref,
+                   CAIF_Ops::QuantScheme_e::PerChannel_e,
+                   CAIF_DataType::CAIF_DataType_e::BFloat16,
+                   "INT8pc_bf16c",4e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    ReportResult("FrozenLinear::INT8PerChannelAccuracy",all_ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT8PerChannelAccuracy")
+}
+
+static void TestINT4PerGroupAccuracy()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
+    std::vector<float> weights(count);
+    std::mt19937 gen(73);
+    std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+    for(size_t i=0;i<count;++i)
+    {
+      weights[i]=dist(gen);
+    }
+    std::vector<float> host_input=MakeRandomInput(g_test_batch,g_test_input_dim,203);
+    CAIF_HostTensor ref=RunFP32Reference(weights,host_input,stream);
+
+    bool all_ok=true;
+    if(RunInt4Case(weights,host_input,ref,
+                   CAIF_DataType::CAIF_DataType_e::Float32,
+                   "INT4pg_fp32c",1.5e-1f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt4Case(weights,host_input,ref,
+                   CAIF_DataType::CAIF_DataType_e::Float16,
+                   "INT4pg_fp16c",1.5e-1f,stream)==false)
+    {
+      all_ok=false;
+    }
+    if(RunInt4Case(weights,host_input,ref,
+                   CAIF_DataType::CAIF_DataType_e::BFloat16,
+                   "INT4pg_bf16c",1.5e-1f,stream)==false)
+    {
+      all_ok=false;
+    }
+    ReportResult("FrozenLinear::INT4PerGroupAccuracy",all_ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT4PerGroupAccuracy")
+}
+
+//------------------------------------------------------------------------------
+// Phase 8.5.B: explicit INT4 numerical-parity test against a
+// dequantize-then-fp32-matmul reference.
+//
+// Existing TestINT4PerGroupAccuracy compares INT4-on-device output against
+// `RunFP32Reference` which uses the *original* full-precision weights —
+// that mixes the int4 quantization round-trip noise into the tolerance,
+// so a real matmul kernel bug at int4 storage would be hidden under the
+// quant-noise band.
+//
+// This test isolates the matmul: quantize fp32 weights to int4 packed,
+// then dequantize them back to fp32 (so the reference sees the same
+// rounded values that landed in storage), and matmul those dequantized
+// weights as the reference. The device int4 forward path should match
+// to a tight tolerance because both sides operate on identical numerical
+// inputs — the only difference is the device path matmuls in int4 with
+// per-group scales, the reference matmuls in fp32 on the dequantized
+// weights.
+//------------------------------------------------------------------------------
+static void TestINT4DequantizeMatmulParity()
+{
+  try
+  {
+    const uint32_t group_size=g_caif_quant_default_group_size;
+    CAIF_CudaStream stream;
+
+    const size_t count=static_cast<size_t>(g_test_input_dim)*g_test_output_dim;
+    std::vector<float> weights(count);
+    std::mt19937 gen(91);
+    std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+    for(size_t i=0;i<count;++i)
+    {
+      weights[i]=dist(gen);
+    }
+    std::vector<float> host_input=MakeRandomInput(g_test_batch,g_test_input_dim,303);
+
+    CAIF_DeviceTensor fp32_w=CAIF_DeviceTensor::FromHostData(weights.data(),
+                                                              {g_test_input_dim,g_test_output_dim},
+                                                              stream);
+    const size_t packed_bytes=(count+1)/2;
+    const uint32_t num_groups=static_cast<uint32_t>((count+group_size-1)/group_size);
+    CAIF_DeviceTensor packed=CAIF_DeviceTensor::Zeros({static_cast<uint32_t>(packed_bytes)},
+                                                       stream,
+                                                       CAIF_DataType::CAIF_DataType_e::UInt8);
+    CAIF_DeviceTensor scales_fp16=CAIF_DeviceTensor::Zeros({num_groups},
+                                                           stream,
+                                                           CAIF_DataType::CAIF_DataType_e::Float16);
+    launch_quantize_to_int4(fp32_w.DevicePtr<float>(),
+                             packed.DeviceDataRaw(),
+                             scales_fp16.DeviceDataRaw(),
+                             static_cast<int>(count),
+                             static_cast<int>(group_size),
+                             stream.Handle());
+    stream.Synchronize();
+
+    // Dequantize the int4 packed weights back to fp32 — this gives us
+    // the same rounded numerical state that the device int4 path will
+    // see, isolating the matmul from the quant noise. The packing
+    // preserved the original [in_dim, out_dim] flat order, so the
+    // dequant output is the same layout (no transpose).
+    CAIF_DeviceTensor dequant_fp32=CAIF_DeviceTensor::Uninitialized(
+                                     {g_test_input_dim,g_test_output_dim},
+                                     stream,
+                                     CAIF_DataType::CAIF_DataType_e::Float32);
+    launch_dequantize_int4(packed.DeviceDataRaw(),
+                            scales_fp16.DeviceDataRaw(),
+                            dequant_fp32.DevicePtr<float>(),
+                            static_cast<int>(count),
+                            static_cast<int>(group_size),
+                            stream.Handle());
+    stream.Synchronize();
+
+    // Reference matmul: fp32 layer wrapping the dequantized weights in
+    // their native [in,out] layout (LoadFromTensor's expected shape).
+    CAIF_HostTensor h_dequant=dequant_fp32.ToHost();
+    std::vector<float> dequant_weights(h_dequant.Data(),
+                                        h_dequant.Data()+count);
+    CAIF_HostTensor ref=RunFP32Reference(dequant_weights,host_input,stream);
+
+    // Device path: int4 FrozenLinear with fp32 compute (the cleanest
+    // cell to isolate matmul correctness).
+    bool all_ok=true;
+    if(RunInt4Case(weights,host_input,ref,
+                   CAIF_DataType::CAIF_DataType_e::Float32,
+                   "INT4pg_fp32c_dequant_ref",2e-2f,stream)==false)
+    {
+      all_ok=false;
+    }
+    ReportResult("FrozenLinear::INT4DequantizeMatmulParity",all_ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("FrozenLinear::INT4DequantizeMatmulParity")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -719,6 +1109,10 @@ int main()
     TestBF16ForwardShapeFinite();
     TestINT8ForwardShapeFinite();
     TestINT4ForwardShapeFinite();
+    TestINT8PerTensorAccuracy();
+    TestINT8PerChannelAccuracy();
+    TestINT4PerGroupAccuracy();
+    TestINT4DequantizeMatmulParity();
     TestParameterTensorCount();
     TestTotalParameterCount();
     TestDescription();
@@ -731,10 +1125,10 @@ int main()
 #endif
 
     ISE_Out::Out()<<"\n=== Summary ===\n";
-    ISE_Out::Out()<<"Passed: "<<g_tests_passed<<"\n";
-    ISE_Out::Out()<<"Failed: "<<g_tests_failed<<"\n";
+    ISE_Out::Out()<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+    ISE_Out::Out()<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-    if(g_tests_failed>0)
+    if(CAIF_TestHarness::FailedCount()>0)
     {
       return 1;
     }

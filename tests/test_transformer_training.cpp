@@ -24,36 +24,26 @@
 #include "caif_device_transformer_model.h"
 #include "caif_device_cross_entropy_loss.h"
 #include "caif_device_tensor.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_cuda_stream.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_kernels.h"
+#include "caif_run_context.h"
 
+#include "caif_test_harness.h"
 using namespace instance;
-
-static int g_tests_passed=0;
-static int g_tests_failed=0;
 
 static void ReportTest(const std::string &name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"  PASS: "<<name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"  FAIL: "<<name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(name.c_str(),passed);
 }
 
 //------------------------------------------------------------------------------
 // Helper: Create a small transformer config for testing
 //------------------------------------------------------------------------------
-static CAIF_DeviceTransformerModel::Config_t CreateTinyConfig()
+static CAIF_DeviceTransformerModel<float,float>::Config_t CreateTinyConfig()
 {
-  CAIF_DeviceTransformerModel::Config_t config;
+  CAIF_DeviceTransformerModel<float,float>::Config_t config;
   config.vocab_size=16;
   config.max_seq_len=8;
   config.dim=32;
@@ -82,7 +72,7 @@ struct AdamState
   float epsilon;
   int t;
 
-  void Initialize(CAIF_DeviceTransformerModel &model,
+  void Initialize(CAIF_DeviceTransformerModel<float,float> &model,
                   CAIF_CudaStream &stream,
                   float learning_rate=0.001f)
   {
@@ -106,7 +96,7 @@ struct AdamState
     }
   }
 
-  void Step(CAIF_DeviceTransformerModel &model,CAIF_CudaStream &stream)
+  void Step(CAIF_DeviceTransformerModel<float,float> &model,CAIF_CudaStream &stream)
   {
     ++t;
     const float bias_correction1=1.0f-std::pow(beta1,static_cast<float>(t));
@@ -119,10 +109,10 @@ struct AdamState
       const CAIF_DeviceTensor &grad=model.GradientTensor(i);
 
 #ifdef USE_CAIF_CUDA
-      launch_fused_adam(param.DevicePtr(),
-                        grad.DevicePtr(),
-                        m[i].DevicePtr(),
-                        v[i].DevicePtr(),
+      launch_fused_adam(param.DevicePtr<float>(),
+                        grad.DevicePtr<float>(),
+                        m[i].DevicePtr<float>(),
+                        v[i].DevicePtr<float>(),
                         lr,
                         beta1,
                         beta2,
@@ -143,8 +133,10 @@ struct AdamState
 static void TestForwardBackwardSmoke()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=CreateTinyConfig();
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   // Create input: batch=2, seq_len=4
   std::vector<float> input_data={
@@ -164,7 +156,9 @@ static void TestForwardBackwardSmoke()
   try
   {
     // Forward
-    CAIF_DeviceTensor logits=model.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor logits=model.Forward(input,ctx);
 
     // Debug: check logits
     CAIF_HostTensor host_logits=logits.ToHost();
@@ -174,12 +168,13 @@ static void TestForwardBackwardSmoke()
 
     // Compute loss and gradient
     CAIF_DeviceTensor grad_logits;
-    float loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+    float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
         logits,targets,grad_logits,stream);
     std::cout<<"    Loss: "<<loss<<"\n";
 
     // Backward
-    model.Backward(grad_logits);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    model.Backward(grad_logits,ctx);
 
     // Check loss is finite
     if(std::isfinite(loss)==false)
@@ -187,6 +182,11 @@ static void TestForwardBackwardSmoke()
       std::cout<<"    Loss is not finite: "<<loss<<"\n";
       passed=false;
     }
+  }
+  catch(const CAIF_Exception &e)
+  {
+    std::cout<<"    Exception: "<<e<<"\n";
+    passed=false;
   }
   catch(const std::exception &e)
   {
@@ -203,8 +203,10 @@ static void TestForwardBackwardSmoke()
 static void TestLossDecreases()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=CreateTinyConfig();
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   // Create fixed input/target
   std::vector<float> input_data={0,1,2,3};
@@ -218,9 +220,11 @@ static void TestLossDecreases()
   adam.Initialize(model,stream,0.01f);  // Higher LR for faster convergence
 
   // Get initial loss
-  CAIF_DeviceTensor logits=model.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor logits=model.Forward(input,ctx);
   CAIF_DeviceTensor grad_logits;
-  float initial_loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+  float initial_loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
       logits,targets,grad_logits,stream);
 
   // Train for 10 steps
@@ -230,10 +234,12 @@ static void TestLossDecreases()
   for(int step=0;step<num_steps;++step)
   {
     model.ZeroGradients();
-    logits=model.Forward(input,true);
-    final_loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    logits=model.Forward(input,ctx);
+    final_loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
         logits,targets,grad_logits,stream);
-    model.Backward(grad_logits);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    model.Backward(grad_logits,ctx);
     adam.Step(model,stream);
   }
 
@@ -254,8 +260,10 @@ static void TestLossDecreases()
 static void TestGradientNonZero()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=CreateTinyConfig();
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   std::vector<float> input_data={0,1,2,3};
   std::vector<float> target_data={1,2,3,4};
@@ -264,10 +272,13 @@ static void TestGradientNonZero()
   CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(target_data.data(),{1,4},stream);
 
   model.ZeroGradients();
-  CAIF_DeviceTensor logits=model.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor logits=model.Forward(input,ctx);
   CAIF_DeviceTensor grad_logits;
-  CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(logits,targets,grad_logits,stream);
-  model.Backward(grad_logits);
+  CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(logits,targets,grad_logits,stream);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  model.Backward(grad_logits,ctx);
 
   // Check that at least some gradients are non-zero
   bool found_nonzero=false;
@@ -298,8 +309,10 @@ static void TestGradientNonZero()
 static void TestParameterUpdate()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=CreateTinyConfig();
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   std::vector<float> input_data={0,1,2,3};
   std::vector<float> target_data={1,2,3,4};
@@ -317,10 +330,13 @@ static void TestParameterUpdate()
   adam.Initialize(model,stream,0.01f);
 
   model.ZeroGradients();
-  CAIF_DeviceTensor logits=model.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor logits=model.Forward(input,ctx);
   CAIF_DeviceTensor grad_logits;
-  CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(logits,targets,grad_logits,stream);
-  model.Backward(grad_logits);
+  CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(logits,targets,grad_logits,stream);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  model.Backward(grad_logits,ctx);
   adam.Step(model,stream);
 
   // Get updated parameter values
@@ -346,8 +362,10 @@ static void TestParameterUpdate()
 static void TestOverfitTinyDataset()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=CreateTinyConfig();
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   // Very simple pattern: next token is current token + 1
   // Sequences: [0,1,2,3], [4,5,6,7], [8,9,10,11], [12,13,14,15]
@@ -377,11 +395,14 @@ static void TestOverfitTinyDataset()
   for(int step=0;step<num_steps;++step)
   {
     model.ZeroGradients();
-    CAIF_DeviceTensor logits=model.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor logits=model.Forward(input,ctx);
     CAIF_DeviceTensor grad_logits;
-    final_loss=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+    final_loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
         logits,target,grad_logits,stream);
-    model.Backward(grad_logits);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    model.Backward(grad_logits,ctx);
     adam.Step(model,stream);
   }
 
@@ -403,12 +424,14 @@ static void TestOverfitTinyDataset()
 static void TestWeightTyingGradient()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   // Create config with weight tying
   auto config=CreateTinyConfig();
   config.tie_weights=true;
 
-  CAIF_DeviceTransformerModel model(config,stream);
+  CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
   std::vector<float> input_data={0,1,2,3};
   std::vector<float> target_data={1,2,3,4};
@@ -417,10 +440,13 @@ static void TestWeightTyingGradient()
   CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(target_data.data(),{1,4},stream);
 
   model.ZeroGradients();
-  CAIF_DeviceTensor logits=model.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor logits=model.Forward(input,ctx);
   CAIF_DeviceTensor grad_logits;
-  CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(logits,targets,grad_logits,stream);
-  model.Backward(grad_logits);
+  CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(logits,targets,grad_logits,stream);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  model.Backward(grad_logits,ctx);
 
   // With weight tying, the embedding gradient should include both
   // the embedding backward gradient and the head backward gradient.
@@ -458,10 +484,10 @@ int main()
   TestWeightTyingGradient();
 
   std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
+  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-  if(g_tests_failed==0)
+  if(CAIF_TestHarness::FailedCount()==0)
   {
     std::cout<<"All tests passed!\n";
     return 0;

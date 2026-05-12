@@ -14,17 +14,33 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident Transformer Block (pre-norm) layer
+// CAIF_DeviceTransformerBlock<ComputeT, StorageT> — pre-norm transformer
+// block. Composes RMSNorm, Multi-Head Attention, and FFN sub-layers with
+// residual connections:
+//
+//   h   = x + attention(norm1(x))    // residual 1
+//   out = h + ffn(norm2(h))          // residual 2
+//
+// All four sub-layers share the block's <ComputeT, StorageT> cell. The
+// residual buffers also allocate at the block's StorageT.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_TRANSFORMER_BLOCK_H
-#define CAIF_DEVICE_TRANSFORMER_BLOCK_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_container.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_device_rmsnorm.h"
 #include "caif_device_multi_head_attention.h"
 #include "caif_device_ffn.h"
 #include "caif_device_activation.h"
 #include "caif_constants.h"
+#include "caif_storage_dtype.h"
+#include "caif_storage_dtype_float.h"
+#ifdef USE_CAIF_CUDA
+#include "caif_storage_dtype_half.h"
+#include "caif_storage_dtype_bfloat16.h"
+#endif
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,27 +49,12 @@
 namespace instance
 {
 
-/**
- * @brief Pre-norm Transformer Block
- *
- * Composes RMSNorm, Multi-Head Attention, and FFN sub-layers
- * with residual connections:
- *
- *   h   = x + attention(norm1(x))    // residual 1
- *   out = h + ffn(norm2(h))          // residual 2
- *
- * No new CUDA kernels -- uses existing sub-layers and CAIF_DeviceOps::Add
- * for residual connections. Sub-layers cache their own inputs for backward.
- *
- * Parameters are delegated to sub-layers via MapIndex:
- *   norm1: 1 tensor (gamma)
- *   attention: 4 tensors (W_q, W_k, W_v, W_o)
- *   norm2: 1 tensor (gamma)
- *   ffn: 2 or 3 tensors (depending on gated/pointwise)
- */
-class CAIF_DeviceTransformerBlock:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceTransformerBlock:public CAIF_DeviceContainer
 {
   public:
+    typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
+
     struct TransformerBlockConfig_t
     {
       uint32_t dim;
@@ -64,59 +65,140 @@ class CAIF_DeviceTransformerBlock:public CAIF_DeviceLayer
       bool causal;
       bool use_rope;
       float rope_base;
+      int rope_style=0;
     };
 
     CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,
-                               std::unique_ptr<CAIF_DeviceActivation> activation,
-                               CAIF_CudaStream &stream);
+                                std::unique_ptr<CAIF_DeviceActivation> activation,
+                                CAIF_CudaStream &stream);
 
-    // Convenience constructor: defaults to SwiGLU activation
-    CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,CAIF_CudaStream &stream);
+    // Convenience constructor: defaults to SwiGLU activation at the same cell.
+    CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,
+                                CAIF_CudaStream &stream);
 
     ~CAIF_DeviceTransformerBlock()override=default;
 
-    // Move
     CAIF_DeviceTransformerBlock(CAIF_DeviceTransformerBlock &&other);
     CAIF_DeviceTransformerBlock &operator=(CAIF_DeviceTransformerBlock &&other);
 
-    // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
-    void ZeroGradients()override;
-    size_t ParameterTensorCount()const override;
-    CAIF_DeviceTensor &ParameterTensor(size_t index)override;
-    const CAIF_DeviceTensor &ParameterTensor(size_t index)const override;
-    CAIF_DeviceTensor &GradientTensor(size_t index)override;
-    const CAIF_DeviceTensor &GradientTensor(size_t index)const override;
-    size_t TotalParameterCount()const override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,
+                                  CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                   CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::TransformerBlock_e;
+    }
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
+    size_t FrozenTensorCount()const override;
+    CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
+    std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    // Accessors
     const TransformerBlockConfig_t &Config()const{return _config;}
     uint32_t EffectiveFFNDim()const{return _effective_ffn_dim;}
+
+    static constexpr CAIF_DataType::CAIF_DataType_e ComputeDtype()
+    {
+      return CAIF_StorageDtype_t<ComputeT>::Value;
+    }
+    static constexpr CAIF_DataType::CAIF_DataType_e StorageDtype()
+    {
+      return CAIF_StorageDtype_t<StorageT>::Value;
+    }
+
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> &Norm1()
+    {
+      if(_norm1==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: norm1 is null");
+      }
+      return *_norm1;
+    }
+    const CAIF_DeviceRMSNorm<ComputeT,StorageT> &Norm1()const
+    {
+      if(_norm1==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: norm1 is null");
+      }
+      return *_norm1;
+    }
+    CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> &Attention()
+    {
+      if(_attention==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: attention is null");
+      }
+      return *_attention;
+    }
+    const CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> &Attention()const
+    {
+      if(_attention==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: attention is null");
+      }
+      return *_attention;
+    }
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> &Norm2()
+    {
+      if(_norm2==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: norm2 is null");
+      }
+      return *_norm2;
+    }
+    const CAIF_DeviceRMSNorm<ComputeT,StorageT> &Norm2()const
+    {
+      if(_norm2==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: norm2 is null");
+      }
+      return *_norm2;
+    }
+    CAIF_DeviceFFN<ComputeT,StorageT> &FFN()
+    {
+      if(_ffn==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: ffn is null");
+      }
+      return *_ffn;
+    }
+    const CAIF_DeviceFFN<ComputeT,StorageT> &FFN()const
+    {
+      if(_ffn==nullptr)
+      {
+        THROW_CAIFE("TransformerBlock: ffn is null");
+      }
+      return *_ffn;
+    }
 
   protected:
 
   private:
-    struct SubLayerMapping_t
-    {
-      uint32_t sub_layer_idx;
-      size_t local_idx;
-    };
-
     static uint32_t ComputeDefaultFFNDim(uint32_t dim);
-    SubLayerMapping_t MapIndex(size_t index)const;
 
     TransformerBlockConfig_t _config;
     uint32_t _effective_ffn_dim;
 
-    std::unique_ptr<CAIF_DeviceRMSNorm> _norm1;
-    std::unique_ptr<CAIF_DeviceMultiHeadAttention> _attention;
-    std::unique_ptr<CAIF_DeviceRMSNorm> _norm2;
-    std::unique_ptr<CAIF_DeviceFFN> _ffn;
+    // Non-owning typed pointers into _sublayers (owned by container base).
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> *_norm1;
+    CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> *_attention;
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> *_norm2;
+    CAIF_DeviceFFN<ComputeT,StorageT> *_ffn;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceTransformerBlock<float,float>;
+extern template class CAIF_DeviceTransformerBlock<float,__half>;
+extern template class CAIF_DeviceTransformerBlock<float,__nv_bfloat16>;
+extern template class CAIF_DeviceTransformerBlock<__half,float>;
+extern template class CAIF_DeviceTransformerBlock<__half,__half>;
+extern template class CAIF_DeviceTransformerBlock<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceTransformerBlock<__nv_bfloat16,float>;
+extern template class CAIF_DeviceTransformerBlock<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceTransformerBlock<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DeviceTransformerBlock<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_TRANSFORMER_BLOCK_H
+}//end instance namespace

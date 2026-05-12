@@ -14,21 +14,38 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Cross-entropy loss from logits implementation
+// Cross-entropy loss from logits implementation (templated).
+//
+// Per-site dispositions per the type-dispatch full plan (Phase 2):
+//   - `targets` are float-encoded target indices (CE kernel signature
+//     contract; kernel casts them to int internally) —
+//     `DevicePtr<float>()`.
+//   - `losses` / `per_losses` / `reduction` / `result` are fp32
+//     accumulators (per-token loss, mean, grad scalar) —
+//     `DevicePtr<float>()`.
+//   - All logits-tensor reads use `tensor.template DevicePtr<StorageT>()`.
 //------------------------------------------------------------------------------
 #include "caif_device_cross_entropy_loss.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_kernels.h"
+#include "caif_storage_dtype.h"
+#include "caif_storage_dtype_float.h"
+#ifdef USE_CAIF_CUDA
+#include "caif_storage_dtype_half.h"
+#include "caif_storage_dtype_bfloat16.h"
+#endif
 #include "caif_exception.h"
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace instance
 {
 
-CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceCrossEntropyLoss<ComputeT,StorageT>::ComputePerPositionLoss(
     const CAIF_DeviceTensor &logits,
     const CAIF_DeviceTensor &targets,
     CAIF_CudaStream &stream,
@@ -36,16 +53,19 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
 {
   try
   {
-    const auto &logits_shape=logits.Shape();
-    const auto &targets_shape=targets.Shape();
-
-    // Logits should be 2D [N, vocab_size] or 3D [batch, seq_len, vocab_size]
-    if(logits_shape.size()<2)
+    if(logits.Dtype()!=CAIF_StorageDtype_t<StorageT>::Value)
     {
-      THROW_CAIFE("CrossEntropyLoss: logits must be at least 2D");
+      THROW_CAIFE("CAIF_DeviceCrossEntropyLoss: logits dtype != StorageT");
     }
 
-    // Flatten logits to [N, vocab_size]
+    const std::vector<uint32_t> &logits_shape=logits.Shape();
+    const std::vector<uint32_t> &targets_shape=targets.Shape();
+
+    if(logits_shape.size()<2)
+    {
+      THROW_CAIFE("CAIF_DeviceCrossEntropyLoss: logits must be at least 2D");
+    }
+
     uint32_t n=1;
     for(size_t i=0;i<logits_shape.size()-1;++i)
     {
@@ -53,7 +73,6 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
     }
     const uint32_t vocab_size=logits_shape.back();
 
-    // Verify targets shape
     uint32_t target_n=1;
     for(size_t i=0;i<targets_shape.size();++i)
     {
@@ -61,21 +80,20 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
     }
     if(target_n!=n)
     {
-      THROW_CAIFE("CrossEntropyLoss: targets size mismatch (expected "+
-                 std::to_string(n)+", got "+std::to_string(target_n)+")");
+      THROW_CAIFE("CAIF_DeviceCrossEntropyLoss: targets size mismatch (expected "+
+                  std::to_string(n)+", got "+std::to_string(target_n)+")");
     }
 
-    // Allocate output
     CAIF_DeviceTensor losses=CAIF_DeviceTensor::Uninitialized({n},stream);
 
 #ifdef USE_CAIF_CUDA
-    launch_cross_entropy_logits_forward(logits.DevicePtr(),
-                                        targets.DevicePtr(),
-                                        losses.DevicePtr(),
-                                        static_cast<int>(n),
-                                        static_cast<int>(vocab_size),
-                                        ignore_index,
-                                        stream.Handle());
+    launch_cross_entropy_logits_forward<StorageT>(logits.template DevicePtr<StorageT>(),
+                                                   targets.DevicePtr<float>(),
+                                                   losses.DevicePtr<float>(),
+                                                   static_cast<int>(n),
+                                                   static_cast<int>(vocab_size),
+                                                   ignore_index,
+                                                   stream.Handle());
 #endif
 
     return losses;
@@ -83,17 +101,18 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputePerPositionLoss(
   CAIF_CATCH_BLOCK()
 }
 
-float CAIF_DeviceCrossEntropyLoss::ComputeLoss(const CAIF_DeviceTensor &logits,
-                                              const CAIF_DeviceTensor &targets,
-                                              CAIF_CudaStream &stream,
-                                              int ignore_index)
+template<typename ComputeT,typename StorageT>
+float CAIF_DeviceCrossEntropyLoss<ComputeT,StorageT>::ComputeLoss(
+    const CAIF_DeviceTensor &logits,
+    const CAIF_DeviceTensor &targets,
+    CAIF_CudaStream &stream,
+    int ignore_index)
 {
   try
   {
-    // Get per-position losses
     CAIF_DeviceTensor losses=ComputePerPositionLoss(logits,targets,stream,ignore_index);
 
-    const auto &logits_shape=logits.Shape();
+    const std::vector<uint32_t> &logits_shape=logits.Shape();
     uint32_t n=1;
     for(size_t i=0;i<logits_shape.size()-1;++i)
     {
@@ -101,17 +120,15 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLoss(const CAIF_DeviceTensor &logits,
     }
 
 #ifdef USE_CAIF_CUDA
-    // Allocate output buffer for sum and count (2 floats)
     CAIF_DeviceTensor reduction=CAIF_DeviceTensor::Zeros({2},stream);
 
-    launch_cross_entropy_reduce_mean(losses.DevicePtr(),
-                                     targets.DevicePtr(),
-                                     reduction.DevicePtr(),
+    launch_cross_entropy_reduce_mean(losses.DevicePtr<float>(),
+                                     targets.DevicePtr<float>(),
+                                     reduction.DevicePtr<float>(),
                                      static_cast<int>(n),
                                      ignore_index,
                                      stream.Handle());
 
-    // Copy result to host
     CAIF_HostTensor host_result=reduction.ToHost();
     const float total_loss=host_result.At({0});
     const float count=host_result.At({1});
@@ -129,7 +146,9 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLoss(const CAIF_DeviceTensor &logits,
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceCrossEntropyLoss<ComputeT,StorageT>::ComputeGradient(
     const CAIF_DeviceTensor &logits,
     const CAIF_DeviceTensor &targets,
     CAIF_CudaStream &stream,
@@ -137,9 +156,12 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
 {
   try
   {
-    const auto &logits_shape=logits.Shape();
+    if(logits.Dtype()!=CAIF_StorageDtype_t<StorageT>::Value)
+    {
+      THROW_CAIFE("CAIF_DeviceCrossEntropyLoss: logits dtype != StorageT");
+    }
 
-    // Flatten to [N, vocab_size]
+    const std::vector<uint32_t> &logits_shape=logits.Shape();
     uint32_t n=1;
     for(size_t i=0;i<logits_shape.size()-1;++i)
     {
@@ -147,17 +169,14 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
     }
     const uint32_t vocab_size=logits_shape.back();
 
-    // Allocate gradient with same shape as logits
-    CAIF_DeviceTensor grad=CAIF_DeviceTensor::Uninitialized(logits_shape,stream);
+    CAIF_DeviceTensor grad=CAIF_DeviceTensor::Uninitialized(logits_shape,stream,logits.Dtype());
 
 #ifdef USE_CAIF_CUDA
-    // Count valid positions (non-ignored) for gradient scale.
-    // Use the same reduce kernel as ComputeLoss — output[1] is the count.
     CAIF_DeviceTensor per_losses=ComputePerPositionLoss(logits,targets,stream,ignore_index);
     CAIF_DeviceTensor reduction=CAIF_DeviceTensor::Zeros({2},stream);
-    launch_cross_entropy_reduce_mean(per_losses.DevicePtr(),
-                                     targets.DevicePtr(),
-                                     reduction.DevicePtr(),
+    launch_cross_entropy_reduce_mean(per_losses.DevicePtr<float>(),
+                                     targets.DevicePtr<float>(),
+                                     reduction.DevicePtr<float>(),
                                      static_cast<int>(n),
                                      ignore_index,
                                      stream.Handle());
@@ -170,14 +189,14 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
       scale=1.0f/valid_count;
     }
 
-    launch_cross_entropy_logits_backward(logits.DevicePtr(),
-                                         targets.DevicePtr(),
-                                         grad.DevicePtr(),
-                                         static_cast<int>(n),
-                                         static_cast<int>(vocab_size),
-                                         ignore_index,
-                                         scale,
-                                         stream.Handle());
+    launch_cross_entropy_logits_backward<StorageT>(logits.template DevicePtr<StorageT>(),
+                                                    targets.DevicePtr<float>(),
+                                                    grad.template DevicePtr<StorageT>(),
+                                                    static_cast<int>(n),
+                                                    static_cast<int>(vocab_size),
+                                                    ignore_index,
+                                                    scale,
+                                                    stream.Handle());
 #endif
 
     return grad;
@@ -185,7 +204,8 @@ CAIF_DeviceTensor CAIF_DeviceCrossEntropyLoss::ComputeGradient(
   CAIF_CATCH_BLOCK()
 }
 
-float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+template<typename ComputeT,typename StorageT>
+float CAIF_DeviceCrossEntropyLoss<ComputeT,StorageT>::ComputeLossAndGradient(
     const CAIF_DeviceTensor &logits,
     const CAIF_DeviceTensor &targets,
     CAIF_DeviceTensor &grad_logits,
@@ -194,9 +214,12 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
 {
   try
   {
-    const auto &logits_shape=logits.Shape();
+    if(logits.Dtype()!=CAIF_StorageDtype_t<StorageT>::Value)
+    {
+      THROW_CAIFE("CAIF_DeviceCrossEntropyLoss: logits dtype != StorageT");
+    }
 
-    // Flatten to [N, vocab_size]
+    const std::vector<uint32_t> &logits_shape=logits.Shape();
     uint32_t n=1;
     for(size_t i=0;i<logits_shape.size()-1;++i)
     {
@@ -205,22 +228,20 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
     const uint32_t vocab_size=logits_shape.back();
 
 #ifdef USE_CAIF_CUDA
-    // Fused path: count + loss/grad + reduce — no host sync between kernels
     CAIF_DeviceTensor per_losses=CAIF_DeviceTensor::Uninitialized({n},stream);
-    grad_logits=CAIF_DeviceTensor::Uninitialized(logits_shape,stream);
+    grad_logits=CAIF_DeviceTensor::Uninitialized(logits_shape,stream,logits.Dtype());
     CAIF_DeviceTensor result=CAIF_DeviceTensor::Zeros({2},stream);
 
-    launch_cross_entropy_fused(logits.DevicePtr(),
-                               targets.DevicePtr(),
-                               per_losses.DevicePtr(),
-                               grad_logits.DevicePtr(),
-                               result.DevicePtr(),
-                               static_cast<int>(n),
-                               static_cast<int>(vocab_size),
-                               ignore_index,
-                               stream.Handle());
+    launch_cross_entropy_fused<StorageT>(logits.template DevicePtr<StorageT>(),
+                                          targets.DevicePtr<float>(),
+                                          per_losses.DevicePtr<float>(),
+                                          grad_logits.template DevicePtr<StorageT>(),
+                                          result.DevicePtr<float>(),
+                                          static_cast<int>(n),
+                                          static_cast<int>(vocab_size),
+                                          ignore_index,
+                                          stream.Handle());
 
-    // Single host sync at the end — result[0]=count, result[1]=loss_sum
     CAIF_HostTensor host_result=result.ToHost();
     const float valid_count=host_result.At({0});
     const float loss_sum=host_result.At({1});
@@ -243,5 +264,18 @@ float CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
   }
   CAIF_CATCH_BLOCK()
 }
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceCrossEntropyLoss<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceCrossEntropyLoss<float,__half>;
+template class CAIF_DeviceCrossEntropyLoss<float,__nv_bfloat16>;
+template class CAIF_DeviceCrossEntropyLoss<__half,float>;
+template class CAIF_DeviceCrossEntropyLoss<__half,__half>;
+template class CAIF_DeviceCrossEntropyLoss<__half,__nv_bfloat16>;
+template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,float>;
+template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,__half>;
+template class CAIF_DeviceCrossEntropyLoss<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

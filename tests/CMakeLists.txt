@@ -34,16 +34,25 @@ endif()
 # include/caif/ as PRIVATE (internal shorthand).  Tests need the shorthand.
 set(CAIF_TEST_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include/caif)
 
+# Shared test support objects compiled once and linked into every test.
+# Contains CAIF_TestHarness (Report / Pass-Fail counters / FinalExitCode)
+# and CAIF_GradCheck (finite-difference gradient verifier).
+set(CAIF_TEST_SUPPORT_SOURCES
+  caif_test_harness.cpp
+  caif_gradcheck.cpp
+)
+add_library(caif_test_support STATIC ${CAIF_TEST_SUPPORT_SOURCES})
+target_link_libraries(caif_test_support PUBLIC ${CAIF_TEST_LIB})
+target_include_directories(caif_test_support PUBLIC ${CAIF_TEST_INCLUDE_DIR})
+
 foreach(test_src ${TEST_SOURCES})
   get_filename_component(test_name ${test_src} NAME_WE)
   add_executable(${test_name} ${test_src})
-  target_link_libraries(${test_name} PRIVATE ${CAIF_TEST_LIB})
-  target_include_directories(${test_name} PRIVATE ${CAIF_TEST_INCLUDE_DIR})
+  target_link_libraries(${test_name} PRIVATE caif_test_support)
 endforeach()
 
 # run_all_tests master runner
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/run_all_tests.cpp)
   add_executable(run_all_tests run_all_tests.cpp)
-  target_link_libraries(run_all_tests PRIVATE ${CAIF_TEST_LIB})
-  target_include_directories(run_all_tests PRIVATE ${CAIF_TEST_INCLUDE_DIR})
+  target_link_libraries(run_all_tests PRIVATE caif_test_support)
 endif()

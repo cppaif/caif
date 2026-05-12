@@ -35,3 +35,23 @@ target_include_directories(train_transformer PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR}
 add_executable(finetune_lora finetune_lora.cpp)
 target_link_libraries(finetune_lora PRIVATE ${CAIF_EXAMPLE_LIB})
 target_include_directories(finetune_lora PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR})
+
+# Multi-head attention with QK-norm + partial-rotary RoPE
+add_executable(mha_qknorm_partial_rope mha_qknorm_partial_rope.cpp)
+target_link_libraries(mha_qknorm_partial_rope PRIVATE ${CAIF_EXAMPLE_LIB})
+target_include_directories(mha_qknorm_partial_rope PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR})
+
+# MoE router norm_topk_prob toggle (OLMoE-style raw softmax vs HF normalised)
+add_executable(moe_router_norm_topk_prob moe_router_norm_topk_prob.cpp)
+target_link_libraries(moe_router_norm_topk_prob PRIVATE ${CAIF_EXAMPLE_LIB})
+target_include_directories(moe_router_norm_topk_prob PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR})
+
+# MoE-extension via CAIF_DeviceMoEFrozenExpert (frozen pretrained expert wrapper)
+add_executable(moe_frozen_expert_extension moe_frozen_expert_extension.cpp)
+target_link_libraries(moe_frozen_expert_extension PRIVATE ${CAIF_EXAMPLE_LIB})
+target_include_directories(moe_frozen_expert_extension PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR})
+
+# Inference with int8 + int4 quantized FrozenLinear (fp32 reference for error comparison)
+add_executable(inference_quantized inference_quantized.cpp)
+target_link_libraries(inference_quantized PRIVATE ${CAIF_EXAMPLE_LIB})
+target_include_directories(inference_quantized PRIVATE ${CAIF_EXAMPLE_INCLUDE_DIR})

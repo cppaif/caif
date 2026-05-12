@@ -14,9 +14,12 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Test: CAIF_DeviceMLAttention (Multi-head Latent Attention)
+// Test: CAIF_DeviceMLAttention<float,float> (Multi-head Latent Attention)
 //------------------------------------------------------------------------------
 #include "caif_device_ml_attention.h"
+#include "caif_test_harness.h"
+#include "caif_run_context.h"
+#include "caif_settings.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_exception.h"
@@ -28,26 +31,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    ISE_Out::Out()<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    ISE_Out::Out()<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -55,13 +46,13 @@ static bool FloatEqual(float a,float b,float tolerance=1e-3f)
 //------------------------------------------------------------------------------
 // Helper: create small MLA config for testing
 //------------------------------------------------------------------------------
-static CAIF_DeviceMLAttention::MLAConfig_t MakeTestConfig(bool causal=true)
+static CAIF_DeviceMLAttention<float,float>::MLAConfig_t MakeTestConfig(bool causal=true)
 {
   // Constraints:
   //   v_head_dim must equal qk_nope_head_dim + qk_rope_head_dim
   //   qk_head_dim must be 32, 64, 80, 96, or 128 (flash attention kernel)
   //   qk_rope_head_dim must be even (RoPE pairs)
-  CAIF_DeviceMLAttention::MLAConfig_t config;
+  CAIF_DeviceMLAttention<float,float>::MLAConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.q_lora_rank=16;
@@ -87,14 +78,18 @@ static void TestForwardShape()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=mla.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mla.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -116,11 +111,7 @@ static void TestForwardShape()
 
     ReportResult("MLA::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -135,8 +126,10 @@ static void TestForwardFinite()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -147,7 +140,9 @@ static void TestForwardFinite()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=mla.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mla.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -163,11 +158,7 @@ static void TestForwardFinite()
 
     ReportResult("MLA::ForwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ForwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ForwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -182,10 +173,12 @@ static void TestCausalDifference()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config_causal=MakeTestConfig(true);
     auto config_noncausal=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla_causal(config_causal,stream);
-    CAIF_DeviceMLAttention mla_noncausal(config_noncausal,stream);
+    CAIF_DeviceMLAttention<float,float> mla_causal(config_causal,stream);
+    CAIF_DeviceMLAttention<float,float> mla_noncausal(config_noncausal,stream);
 
     // Copy same weights to both
     for(size_t p=0;p<mla_causal.ParameterTensorCount();++p)
@@ -203,8 +196,10 @@ static void TestCausalDifference()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor out_causal=mla_causal.Forward(input,false);
-    CAIF_DeviceTensor out_noncausal=mla_noncausal.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor out_causal=mla_causal.Forward(input,ctx);
+    CAIF_DeviceTensor out_noncausal=mla_noncausal.Forward(input,ctx);
     CAIF_HostTensor h_causal=out_causal.ToHost();
     CAIF_HostTensor h_noncausal=out_noncausal.ToHost();
 
@@ -228,11 +223,7 @@ static void TestCausalDifference()
 
     ReportResult("MLA::CausalDifference",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::CausalDifference",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::CausalDifference")
 }
 
 //------------------------------------------------------------------------------
@@ -244,7 +235,7 @@ static void TestParameterCount()
   {
     CAIF_CudaStream stream;
     auto config=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     bool passed=true;
 
@@ -283,11 +274,7 @@ static void TestParameterCount()
 
     ReportResult("MLA::ParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -299,7 +286,7 @@ static void TestParameterNames()
   {
     CAIF_CudaStream stream;
     auto config=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     auto names=mla.ParameterNames("self_attn.");
     bool passed=true;
@@ -332,11 +319,7 @@ static void TestParameterNames()
 
     ReportResult("MLA::ParameterNames",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ParameterNames",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ParameterNames")
 }
 
 //------------------------------------------------------------------------------
@@ -351,19 +334,24 @@ static void TestZeroGradients()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    mla.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mla.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    mla.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    mla.Backward(grad_out,ctx);
 
     // Zero gradients
     mla.ZeroGradients();
@@ -390,11 +378,7 @@ static void TestZeroGradients()
 
     ReportResult("MLA::ZeroGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ZeroGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ZeroGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -409,8 +393,10 @@ static void TestBackwardFinite()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(false);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -420,12 +406,15 @@ static void TestBackwardFinite()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    mla.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mla.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=mla.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=mla.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -467,11 +456,7 @@ static void TestBackwardFinite()
 
     ReportResult("MLA::BackwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::BackwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::BackwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -487,6 +472,8 @@ static void TestBackwardInputGrad()
     const float h=1e-3f;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(false);
 
     // Create base input
@@ -497,7 +484,7 @@ static void TestBackwardInputGrad()
     }
 
     // Get analytical gradient
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     // Save weights for reuse
     std::vector<CAIF_HostTensor> saved_weights;
@@ -508,12 +495,15 @@ static void TestBackwardInputGrad()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    mla.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mla.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=mla.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=mla.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -525,6 +515,10 @@ static void TestBackwardInputGrad()
     int sign_agree=0;
     int sign_total=0;
 
+    const bool fd_prev_precise=CAIF_Settings::PreciseGradients();
+    CAIF_Settings::SetPreciseGradients(true);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     for(size_t i=0;i<check_count&&i<host_input.size();++i)
     {
       std::vector<float> input_plus(host_input);
@@ -533,7 +527,7 @@ static void TestBackwardInputGrad()
       input_minus[i]-=h;
 
       // Forward with +h
-      CAIF_DeviceMLAttention mla_p(config,stream);
+      CAIF_DeviceMLAttention<float,float> mla_p(config,stream);
       for(size_t p=0;p<saved_weights.size();++p)
       {
         mla_p.ParameterTensor(p).CopyFromHost(saved_weights[p].Data(),
@@ -542,7 +536,7 @@ static void TestBackwardInputGrad()
 
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_plus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=mla_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=mla_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -551,7 +545,7 @@ static void TestBackwardInputGrad()
       }
 
       // Forward with -h
-      CAIF_DeviceMLAttention mla_m(config,stream);
+      CAIF_DeviceMLAttention<float,float> mla_m(config,stream);
       for(size_t p=0;p<saved_weights.size();++p)
       {
         mla_m.ParameterTensor(p).CopyFromHost(saved_weights[p].Data(),
@@ -560,7 +554,7 @@ static void TestBackwardInputGrad()
 
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_minus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=mla_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=mla_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -582,6 +576,8 @@ static void TestBackwardInputGrad()
       }
     }
 
+    CAIF_Settings::SetPreciseGradients(fd_prev_precise);
+
     // Require at least 75% sign agreement
     if(sign_total>0)
     {
@@ -597,11 +593,7 @@ static void TestBackwardInputGrad()
 
     ReportResult("MLA::BackwardInputGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::BackwardInputGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::BackwardInputGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -618,6 +610,8 @@ static void TestBackwardWeightGradWo()
     const float grad_tol=5e-2f;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(false);
 
     std::vector<float> host_input(batch*seq_len*dim);
@@ -627,7 +621,7 @@ static void TestBackwardWeightGradWo()
     }
 
     // Get analytical gradient for W_o (index 6)
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
     std::vector<CAIF_HostTensor> saved_weights;
     for(size_t p=0;p<mla.ParameterTensorCount();++p)
     {
@@ -636,12 +630,15 @@ static void TestBackwardWeightGradWo()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    mla.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mla.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),{batch,seq_len,dim},stream);
-    mla.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    mla.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_wo=mla.GradientTensor(6).ToHost();
 
     bool passed=true;
@@ -653,6 +650,8 @@ static void TestBackwardWeightGradWo()
                                saved_weights[wo_idx].TotalElements());
     const size_t check_count=4;
 
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     for(size_t i=0;i<check_count&&passed==true;++i)
     {
       std::vector<float> wo_plus(wo_data);
@@ -661,7 +660,7 @@ static void TestBackwardWeightGradWo()
       wo_minus[i]-=h;
 
       // Forward with +h
-      CAIF_DeviceMLAttention mla_p(config,stream);
+      CAIF_DeviceMLAttention<float,float> mla_p(config,stream);
       for(size_t p=0;p<saved_weights.size();++p)
       {
         if(p==wo_idx)
@@ -677,7 +676,7 @@ static void TestBackwardWeightGradWo()
 
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=mla_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=mla_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -686,7 +685,7 @@ static void TestBackwardWeightGradWo()
       }
 
       // Forward with -h
-      CAIF_DeviceMLAttention mla_m(config,stream);
+      CAIF_DeviceMLAttention<float,float> mla_m(config,stream);
       for(size_t p=0;p<saved_weights.size();++p)
       {
         if(p==wo_idx)
@@ -702,7 +701,7 @@ static void TestBackwardWeightGradWo()
 
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=mla_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=mla_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -724,11 +723,7 @@ static void TestBackwardWeightGradWo()
 
     ReportResult("MLA::BackwardWeightGradWo",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::BackwardWeightGradWo",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::BackwardWeightGradWo")
 }
 
 //------------------------------------------------------------------------------
@@ -740,7 +735,7 @@ static void TestDescription()
   {
     CAIF_CudaStream stream;
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     const std::string desc=mla.Description();
 
@@ -764,11 +759,7 @@ static void TestDescription()
 
     ReportResult("MLA::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::Description")
 }
 
 //------------------------------------------------------------------------------
@@ -780,7 +771,7 @@ static void TestKVCacheManagement()
   {
     CAIF_CudaStream stream;
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     bool passed=true;
 
@@ -822,11 +813,7 @@ static void TestKVCacheManagement()
 
     ReportResult("MLA::KVCacheManagement",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::KVCacheManagement",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::KVCacheManagement")
 }
 
 //------------------------------------------------------------------------------
@@ -840,8 +827,10 @@ static void TestForwardCached()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
     mla.EnableKVCache(batch,32);
 
     // First token (prefill with 3 tokens)
@@ -854,7 +843,9 @@ static void TestForwardCached()
     CAIF_DeviceTensor prefill_input=CAIF_DeviceTensor::FromHostData(
                                      host_prefill.data(),
                                      {batch,prefill_len,dim},stream);
-    CAIF_DeviceTensor prefill_out=mla.ForwardCached(prefill_input);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor prefill_out=mla.ForwardCached(prefill_input,ctx);
     CAIF_HostTensor h_prefill=prefill_out.ToHost();
 
     bool passed=true;
@@ -883,7 +874,7 @@ static void TestForwardCached()
     }
     CAIF_DeviceTensor step_input=CAIF_DeviceTensor::FromHostData(
                                   host_step.data(),{batch,1,dim},stream);
-    CAIF_DeviceTensor step_out=mla.ForwardCached(step_input);
+    CAIF_DeviceTensor step_out=mla.ForwardCached(step_input,ctx);
     CAIF_HostTensor h_step=step_out.ToHost();
 
     // Check step output shape
@@ -915,11 +906,7 @@ static void TestForwardCached()
 
     ReportResult("MLA::ForwardCached",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::ForwardCached",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::ForwardCached")
 }
 
 //------------------------------------------------------------------------------
@@ -934,8 +921,10 @@ static void TestDeterministic()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -945,12 +934,14 @@ static void TestDeterministic()
 
     CAIF_DeviceTensor input1=CAIF_DeviceTensor::FromHostData(
                               host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output1=mla.Forward(input1,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output1=mla.Forward(input1,ctx);
     CAIF_HostTensor h1=output1.ToHost();
 
     CAIF_DeviceTensor input2=CAIF_DeviceTensor::FromHostData(
                               host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output2=mla.Forward(input2,false);
+    CAIF_DeviceTensor output2=mla.Forward(input2,ctx);
     CAIF_HostTensor h2=output2.ToHost();
 
     bool passed=true;
@@ -967,11 +958,7 @@ static void TestDeterministic()
 
     ReportResult("MLA::Deterministic",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::Deterministic",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::Deterministic")
 }
 
 //------------------------------------------------------------------------------
@@ -986,8 +973,10 @@ static void TestBatchIndependence()
     const uint32_t dim=32;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeTestConfig(true);
-    CAIF_DeviceMLAttention mla(config,stream);
+    CAIF_DeviceMLAttention<float,float> mla(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -997,7 +986,9 @@ static void TestBatchIndependence()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=mla.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mla.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Check that batch 0 and batch 1 outputs differ
@@ -1021,11 +1012,7 @@ static void TestBatchIndependence()
 
     ReportResult("MLA::BatchIndependence",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("MLA::BatchIndependence",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("MLA::BatchIndependence")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -1034,7 +1021,7 @@ int main()
 {
   try
   {
-    ISE_Out::Out()<<"=== CAIF_DeviceMLAttention Tests ===\n\n";
+    ISE_Out::Out()<<"=== CAIF_DeviceMLAttention<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
     TestForwardShape();
@@ -1056,10 +1043,10 @@ int main()
 #endif
 
     ISE_Out::Out()<<"\n=== Summary ===\n";
-    ISE_Out::Out()<<"Passed: "<<g_tests_passed<<"\n";
-    ISE_Out::Out()<<"Failed: "<<g_tests_failed<<"\n";
+    ISE_Out::Out()<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+    ISE_Out::Out()<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-    if(g_tests_failed>0)
+    if(CAIF_TestHarness::FailedCount()>0)
     {
       return 1;
     }

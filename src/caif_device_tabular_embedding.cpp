@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//------------------------------------------------------------------------------
-// CAIF - AI Framework
-// Device-resident tabular embedding implementation
-//------------------------------------------------------------------------------
 #include "caif_device_tabular_embedding.h"
-#include "caif_device_ops.h"
+#include "caif_device_tabular_embedding_factory.h"
+#include "caif_ops.h"
 #include "caif_cuda_kernels.h"
 #include "caif_exception.h"
 #include <cmath>
@@ -26,55 +23,64 @@
 namespace instance
 {
 
-CAIF_DeviceTabularEmbedding::CAIF_DeviceTabularEmbedding(const Config_t &config,
-                                                       CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
-                                                       _config(config),
-                                                       _cached_batch(0),
-                                                       _cached_seq_len(0)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::CAIF_DeviceTabularEmbedding(
+                                              const Config_t &config,
+                                              CAIF_CudaStream &stream):
+                                          CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                          _config(config),
+                                          _w_proj(),
+                                          _b_proj(),
+                                          _grad_w_proj(),
+                                          _grad_b_proj(),
+                                          _cached_input(),
+                                          _cached_batch(0),
+                                          _cached_seq_len(0)
 {
   try
   {
     if(config.num_features==0)
     {
-      THROW_CAIFE("DeviceTabularEmbedding: num_features must be > 0");
+      THROW_CAIFE("CAIF_DeviceTabularEmbedding: num_features must be > 0");
     }
     if(config.dim==0)
     {
-      THROW_CAIFE("DeviceTabularEmbedding: dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceTabularEmbedding: dim must be > 0");
     }
 
-    // Allocate parameters
-    _w_proj=CAIF_DeviceTensor::Zeros({config.num_features,config.dim},stream);
-    _b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    _w_proj=CAIF_DeviceTensor::Zeros({config.num_features,config.dim},stream,sdt);
+    _b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream,sdt);
+    _grad_w_proj=CAIF_DeviceTensor::Zeros({config.num_features,config.dim},stream,sdt);
+    _grad_b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream,sdt);
 
-    // Allocate gradients
-    _grad_w_proj=CAIF_DeviceTensor::Zeros({config.num_features,config.dim},stream);
-    _grad_b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream);
-
-    // Initialize weights with Xavier uniform
     InitializeWeights(0);
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTabularEmbedding::CAIF_DeviceTabularEmbedding(
-  CAIF_DeviceTabularEmbedding &&other):CAIF_DeviceLayer(std::move(other)),
-                                      _config(other._config),
-                                      _w_proj(std::move(other._w_proj)),
-                                      _b_proj(std::move(other._b_proj)),
-                                      _grad_w_proj(std::move(other._grad_w_proj)),
-                                      _grad_b_proj(std::move(other._grad_b_proj)),
-                                      _cached_input(std::move(other._cached_input)),
-                                      _cached_batch(other._cached_batch),
-                                      _cached_seq_len(other._cached_seq_len)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::CAIF_DeviceTabularEmbedding(
+                                              CAIF_DeviceTabularEmbedding &&other):
+                              CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                              _config(other._config),
+                              _w_proj(std::move(other._w_proj)),
+                              _b_proj(std::move(other._b_proj)),
+                              _grad_w_proj(std::move(other._grad_w_proj)),
+                              _grad_b_proj(std::move(other._grad_b_proj)),
+                              _cached_input(std::move(other._cached_input)),
+                              _cached_batch(other._cached_batch),
+                              _cached_seq_len(other._cached_seq_len)
 {
 }
 
-CAIF_DeviceTabularEmbedding &CAIF_DeviceTabularEmbedding::operator=(CAIF_DeviceTabularEmbedding &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT> &
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::operator=(CAIF_DeviceTabularEmbedding &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
+    CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
     _config=other._config;
     _w_proj=std::move(other._w_proj);
     _b_proj=std::move(other._b_proj);
@@ -87,22 +93,20 @@ CAIF_DeviceTabularEmbedding &CAIF_DeviceTabularEmbedding::operator=(CAIF_DeviceT
   return *this;
 }
 
-CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Forward(const CAIF_DeviceTensor &input,
-                                                     bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                              CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceTabularEmbedding: layer has been moved from");
-    }
+    AssertInputDtype(input);
 
-    const auto &shape=input.Shape();
+    const std::vector<uint32_t> &shape=input.Shape();
     uint32_t batch=0;
     uint32_t seq_len=1;
     uint32_t num_features=0;
 
-    // Handle 2D [batch, num_features] or 3D [batch, seq_len, num_features]
     if(shape.size()==2)
     {
       batch=shape[0];
@@ -117,56 +121,44 @@ CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Forward(const CAIF_DeviceTensor &
     }
     else
     {
-      THROW_CAIFE("DeviceTabularEmbedding: input must be 2D or 3D");
+      THROW_CAIFE("CAIF_DeviceTabularEmbedding: input must be 2D or 3D");
     }
 
     if(num_features!=_config.num_features)
     {
-      THROW_CAIFE("DeviceTabularEmbedding: input feature dim mismatch");
+      THROW_CAIFE("CAIF_DeviceTabularEmbedding: input feature dim mismatch");
     }
 
     const uint32_t total_rows=batch*seq_len;
     const uint32_t dim=_config.dim;
 
-    // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_input=input.Clone();
       _cached_batch=batch;
       _cached_seq_len=seq_len;
     }
 
-    // Flatten to [total_rows, num_features]
     CAIF_DeviceTensor flat_input=input.Clone();
     flat_input.Reshape({total_rows,num_features});
 
-    // Project: output = input @ W_proj
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({total_rows,dim},*_stream);
-    CAIF_DeviceOps::MatMul(flat_input,_w_proj,output);
-
-    // Add bias
-    launch_bias_add_2d(output.DevicePtr(),_b_proj.DevicePtr(),
-                       output.DevicePtr(),
-                       static_cast<int>(total_rows),
-                       static_cast<int>(dim),
-                       _stream->Handle());
-
-    // Reshape to [batch, seq_len, dim]
+    CAIF_DeviceTensor output=AllocateOutput({total_rows,dim},ctx);
+    CAIF_Ops::MatMul(flat_input,_w_proj,output,ctx);
+    CAIF_Ops::BiasAdd(output,_b_proj,output);
     output.Reshape({batch,seq_len,dim});
-
     return output;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                              CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceTabularEmbedding: layer has been moved from");
-    }
+    AssertInputDtype(grad_output);
 
     const uint32_t batch=_cached_batch;
     const uint32_t seq_len=_cached_seq_len;
@@ -174,30 +166,18 @@ CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Backward(const CAIF_DeviceTensor 
     const uint32_t dim=_config.dim;
     const uint32_t total_rows=batch*seq_len;
 
-    // Flatten grad_output to [total_rows, dim]
     CAIF_DeviceTensor flat_grad=grad_output.Clone();
     flat_grad.Reshape({total_rows,dim});
 
-    // grad_b_proj = sum(grad_output, axis=0)
-    launch_bias_grad_2d(flat_grad.DevicePtr(),_grad_b_proj.DevicePtr(),
-                        static_cast<int>(total_rows),
-                        static_cast<int>(dim),
-                        _stream->Handle());
+    CAIF_Ops::BiasGradient(flat_grad,_grad_b_proj);
 
-    // grad_w_proj = input^T @ grad_output
-    // input: [total_rows, num_features], grad_output: [total_rows, dim]
-    // grad_w_proj: [num_features, dim]
     CAIF_DeviceTensor flat_input=_cached_input.Clone();
     flat_input.Reshape({total_rows,num_features});
-    CAIF_DeviceOps::MatMulTransposeA(flat_input,flat_grad,_grad_w_proj);
+    CAIF_Ops::MatMulTransposeA(flat_input,flat_grad,_grad_w_proj,ctx);
 
-    // grad_input = grad_output @ W_proj^T
-    // grad_output: [total_rows, dim], W_proj: [num_features, dim]
-    // grad_input: [total_rows, num_features]
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({total_rows,num_features},*_stream);
-    CAIF_DeviceOps::MatMulTransposeB(flat_grad,_w_proj,grad_input);
+    CAIF_DeviceTensor grad_input=AllocateOutput({total_rows,num_features},ctx);
+    CAIF_Ops::MatMulTransposeB(flat_grad,_w_proj,grad_input,ctx);
 
-    // Reshape to original input shape
     if(seq_len==1)
     {
       grad_input.Reshape({batch,num_features});
@@ -206,41 +186,31 @@ CAIF_DeviceTensor CAIF_DeviceTabularEmbedding::Backward(const CAIF_DeviceTensor 
     {
       grad_input.Reshape({batch,seq_len,num_features});
     }
-
     return grad_input;
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceTabularEmbedding::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_w_proj.Fill(0.0f);
-    _grad_b_proj.Fill(0.0f);
+    _grad_w_proj.FillZero();
+    _grad_b_proj.FillZero();
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceTabularEmbedding::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  return 2;  // w_proj, b_proj
+  return 2;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::ParameterTensor(size_t index)
-{
-  if(index==0)
-  {
-    return _w_proj;
-  }
-  if(index==1)
-  {
-    return _b_proj;
-  }
-  THROW_CAIFE("DeviceTabularEmbedding: parameter index out of range");
-}
-
-const CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
   if(index==0)
   {
@@ -250,10 +220,27 @@ const CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::ParameterTensor(size_t ind
   {
     return _b_proj;
   }
-  THROW_CAIFE("DeviceTabularEmbedding: parameter index out of range");
+  THROW_CAIFE("CAIF_DeviceTabularEmbedding::ParameterTensor: index out of range");
 }
 
-CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)const
+{
+  if(index==0)
+  {
+    return _w_proj;
+  }
+  if(index==1)
+  {
+    return _b_proj;
+  }
+  THROW_CAIFE("CAIF_DeviceTabularEmbedding::ParameterTensor: index out of range");
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   if(index==0)
   {
@@ -263,10 +250,12 @@ CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::GradientTensor(size_t index)
   {
     return _grad_b_proj;
   }
-  THROW_CAIFE("DeviceTabularEmbedding: gradient index out of range");
+  THROW_CAIFE("CAIF_DeviceTabularEmbedding::GradientTensor: index out of range");
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   if(index==0)
   {
@@ -276,15 +265,17 @@ const CAIF_DeviceTensor &CAIF_DeviceTabularEmbedding::GradientTensor(size_t inde
   {
     return _grad_b_proj;
   }
-  THROW_CAIFE("DeviceTabularEmbedding: gradient index out of range");
+  THROW_CAIFE("CAIF_DeviceTabularEmbedding::GradientTensor: index out of range");
 }
 
-size_t CAIF_DeviceTabularEmbedding::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::TotalParameterCount()const
 {
   return _config.num_features*_config.dim+_config.dim;
 }
 
-std::string CAIF_DeviceTabularEmbedding::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -294,7 +285,9 @@ std::string CAIF_DeviceTabularEmbedding::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceTabularEmbedding::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
@@ -306,14 +299,14 @@ std::vector<std::string> CAIF_DeviceTabularEmbedding::ParameterNames(const std::
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceTabularEmbedding::InitializeWeights(uint32_t seed)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceTabularEmbedding<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
 {
   try
   {
     std::mt19937 rng(seed);
-
-    // Xavier uniform for W_proj
-    const float limit=std::sqrt(6.0f/static_cast<float>(_config.num_features+_config.dim));
+    const float limit=std::sqrt(g_caif_xavier_uniform_scale/
+                                 static_cast<float>(_config.num_features+_config.dim));
     std::uniform_real_distribution<float> dist(-limit,limit);
 
     std::vector<float> w_data(_config.num_features*_config.dim);
@@ -321,11 +314,22 @@ void CAIF_DeviceTabularEmbedding::InitializeWeights(uint32_t seed)
     {
       w_data[i]=dist(rng);
     }
-    _w_proj.CopyFromHost(w_data.data(),w_data.size());
-
-    // Bias initialized to zero (already done)
+    WProjMut().CopyFromHostFp32(w_data.data(),w_data.size());
   }
   CAIF_CATCH_BLOCK()
 }
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceTabularEmbedding<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceTabularEmbedding<float,__half>;
+template class CAIF_DeviceTabularEmbedding<float,__nv_bfloat16>;
+template class CAIF_DeviceTabularEmbedding<__half,float>;
+template class CAIF_DeviceTabularEmbedding<__half,__half>;
+template class CAIF_DeviceTabularEmbedding<__half,__nv_bfloat16>;
+template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,float>;
+template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,__half>;
+template class CAIF_DeviceTabularEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

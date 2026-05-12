@@ -13,7 +13,8 @@
 // limitations under the License.
 
 #include "caif_device_linear_head.h"
-#include "caif_device_ops.h"
+#include "caif_constants.h"
+#include "caif_ops.h"
 #include "caif_exception.h"
 #include <cmath>
 #include <vector>
@@ -21,126 +22,132 @@
 namespace instance
 {
 
-CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(const CAIF_DeviceLinearHead::Config_t &config,
-                                           CAIF_CudaStream &stream):
-                                           CAIF_DeviceLayer(stream),
-                                           _config(config),
-                                           _weight_tied(false),
-                                           _frozen(false),
-                                           _weight(),
-                                           _weight_grad(),
-                                           _tied_weight(nullptr),
-                                           _tied_weight_grad(nullptr),
-                                           _bias(),
-                                           _bias_grad(),
-                                           _cached_input(),
-                                           _cached_shape()
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLinearHead<ComputeT,StorageT>::CAIF_DeviceLinearHead(const Config_t &config,
+                                                                CAIF_CudaStream &stream):
+                                          CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                          _config(config),
+                                          _weight_tied(false),
+                                          _frozen(false),
+                                          _weight(),
+                                          _weight_grad(),
+                                          _tied_weight(nullptr),
+                                          _tied_weight_grad(nullptr),
+                                          _bias(),
+                                          _bias_grad(),
+                                          _cached_input(),
+                                          _cached_shape()
 {
   try
   {
     if(config.input_dim==0)
     {
-      THROW_CAIFE("DeviceLinearHead: input_dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceLinearHead: input_dim must be > 0");
     }
     if(config.output_dim==0)
     {
-      THROW_CAIFE("DeviceLinearHead: output_dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceLinearHead: output_dim must be > 0");
     }
 
-    // Xavier uniform init for weight
-    const float limit=std::sqrt(6.0f/static_cast<float>(config.input_dim+config.output_dim));
+    const float limit=std::sqrt(g_caif_xavier_uniform_scale/
+                                 static_cast<float>(config.input_dim+config.output_dim));
     const size_t weight_size=static_cast<size_t>(config.input_dim)*config.output_dim;
     std::vector<float> w_init(weight_size);
     for(size_t i=0;i<weight_size;++i)
     {
-      const float t=static_cast<float>(i)*0.6180339887f;
+      const float t=static_cast<float>(i)*g_caif_golden_ratio_frac;
       w_init[i]=(t-std::floor(t))*2.0f*limit-limit;
     }
 
-    _weight=CAIF_DeviceTensor::Uninitialized({config.input_dim,config.output_dim},stream);
-    _weight.CopyFromHost(w_init.data(),weight_size);
-    _weight_grad=CAIF_DeviceTensor::Zeros({config.input_dim,config.output_dim},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    SetWeight(CAIF_DeviceTensor::Uninitialized({config.input_dim,config.output_dim},stream,sdt));
+    WeightMut().CopyFromHostFp32(w_init.data(),weight_size);
+    _weight_grad=CAIF_DeviceTensor::Zeros({config.input_dim,config.output_dim},stream,sdt);
 
     if(config.use_bias==true)
     {
-      _bias=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
-      _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
+      _bias=CAIF_DeviceTensor::Zeros({config.output_dim},stream,sdt);
+      _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream,sdt);
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(const CAIF_DeviceLinearHead::Config_t &config,
-                                           CAIF_DeviceTensor &tied_weight,
-                                           CAIF_DeviceTensor &tied_weight_grad,
-                                           CAIF_CudaStream &stream):
-                                           CAIF_DeviceLayer(stream),
-                                           _config(config),
-                                           _weight_tied(true),
-                                           _frozen(false),
-                                           _weight(),
-                                           _weight_grad(),
-                                           _tied_weight(&tied_weight),
-                                           _tied_weight_grad(&tied_weight_grad),
-                                           _bias(),
-                                           _bias_grad(),
-                                           _cached_input(),
-                                           _cached_shape()
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLinearHead<ComputeT,StorageT>::CAIF_DeviceLinearHead(const Config_t &config,
+                                                                CAIF_DeviceTensor &tied_weight,
+                                                                CAIF_DeviceTensor &tied_weight_grad,
+                                                                CAIF_CudaStream &stream):
+                                          CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                          _config(config),
+                                          _weight_tied(true),
+                                          _frozen(false),
+                                          _weight(),
+                                          _weight_grad(),
+                                          _tied_weight(&tied_weight),
+                                          _tied_weight_grad(&tied_weight_grad),
+                                          _bias(),
+                                          _bias_grad(),
+                                          _cached_input(),
+                                          _cached_shape()
 {
   try
   {
     if(config.input_dim==0)
     {
-      THROW_CAIFE("DeviceLinearHead: input_dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceLinearHead: input_dim must be > 0");
     }
     if(config.output_dim==0)
     {
-      THROW_CAIFE("DeviceLinearHead: output_dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceLinearHead: output_dim must be > 0");
     }
 
-    // Verify tied weight shape: should be [output_dim, input_dim] (embedding table)
-    const auto &tied_shape=tied_weight.Shape();
+    const std::vector<uint32_t> &tied_shape=tied_weight.Shape();
     if(tied_shape.size()!=2)
     {
-      THROW_CAIFE("DeviceLinearHead: tied weight must be 2D");
+      THROW_CAIFE("CAIF_DeviceLinearHead: tied weight must be 2D");
     }
     if(tied_shape[0]!=config.output_dim||tied_shape[1]!=config.input_dim)
     {
-      THROW_CAIFE("DeviceLinearHead: tied weight shape must be [output_dim, input_dim]");
+      THROW_CAIFE("CAIF_DeviceLinearHead: tied weight shape must be [output_dim, input_dim]");
     }
 
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
     if(config.use_bias==true)
     {
-      _bias=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
-      _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream);
+      _bias=CAIF_DeviceTensor::Zeros({config.output_dim},stream,sdt);
+      _bias_grad=CAIF_DeviceTensor::Zeros({config.output_dim},stream,sdt);
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceLinearHead::CAIF_DeviceLinearHead(CAIF_DeviceLinearHead &&other)noexcept:
-                                           CAIF_DeviceLayer(std::move(other)),
-                                           _config(other._config),
-                                           _weight_tied(other._weight_tied),
-                                           _frozen(other._frozen),
-                                           _weight(std::move(other._weight)),
-                                           _weight_grad(std::move(other._weight_grad)),
-                                           _tied_weight(other._tied_weight),
-                                           _tied_weight_grad(other._tied_weight_grad),
-                                           _bias(std::move(other._bias)),
-                                           _bias_grad(std::move(other._bias_grad)),
-                                           _cached_input(std::move(other._cached_input)),
-                                           _cached_shape(std::move(other._cached_shape))
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLinearHead<ComputeT,StorageT>::CAIF_DeviceLinearHead(CAIF_DeviceLinearHead &&other):
+                              CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                              _config(other._config),
+                              _weight_tied(other._weight_tied),
+                              _frozen(other._frozen),
+                              _weight(std::move(other._weight)),
+                              _weight_grad(std::move(other._weight_grad)),
+                              _tied_weight(other._tied_weight),
+                              _tied_weight_grad(other._tied_weight_grad),
+                              _bias(std::move(other._bias)),
+                              _bias_grad(std::move(other._bias_grad)),
+                              _cached_input(std::move(other._cached_input)),
+                              _cached_shape(std::move(other._cached_shape))
 {
   other._tied_weight=nullptr;
   other._tied_weight_grad=nullptr;
 }
 
-CAIF_DeviceLinearHead &CAIF_DeviceLinearHead::operator=(CAIF_DeviceLinearHead &&other)noexcept
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLinearHead<ComputeT,StorageT> &
+CAIF_DeviceLinearHead<ComputeT,StorageT>::operator=(CAIF_DeviceLinearHead &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
+    CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
     _config=other._config;
     _weight_tied=other._weight_tied;
     _frozen=other._frozen;
@@ -158,26 +165,24 @@ CAIF_DeviceLinearHead &CAIF_DeviceLinearHead::operator=(CAIF_DeviceLinearHead &&
   return *this;
 }
 
-CAIF_DeviceTensor CAIF_DeviceLinearHead::Forward(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceLinearHead<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                       CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceLinearHead: layer has been moved from");
-    }
-
-    const auto &shape=input.Shape();
+    AssertInputDtype(input);
+    const std::vector<uint32_t> &shape=input.Shape();
     if(shape.empty()==true)
     {
-      THROW_CAIFE("DeviceLinearHead::Forward: input shape is empty");
+      THROW_CAIFE("CAIF_DeviceLinearHead::Forward: input shape is empty");
     }
     if(shape.back()!=_config.input_dim)
     {
-      THROW_CAIFE("DeviceLinearHead::Forward: last dim must match input_dim");
+      THROW_CAIFE("CAIF_DeviceLinearHead::Forward: last dim must match input_dim");
     }
 
-    // Flatten leading dims: [d0, d1, ..., input_dim] -> [N, input_dim]
     uint32_t n=1;
     for(size_t i=0;i<shape.size()-1;++i)
     {
@@ -187,28 +192,23 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Forward(const CAIF_DeviceTensor &input,
     CAIF_DeviceTensor flat_input=input.Clone();
     flat_input.Reshape({n,_config.input_dim});
 
-    // MatMul: [N, input_dim] @ [input_dim, output_dim] = [N, output_dim]
-    // Or for tied weights: [N, input_dim] @ [output_dim, input_dim]^T = [N, output_dim]
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({n,_config.output_dim},*_stream);
+    CAIF_DeviceTensor output=AllocateOutput({n,_config.output_dim},ctx);
 
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
     if(_weight_tied==true)
     {
-      // Tied: output = input @ tied_weight^T
-      CAIF_DeviceOps::MatMulTransposeB(flat_input,*_tied_weight,output);
+      CAIF_Ops::MatMulTransposeB(flat_input,*_tied_weight,output,ctx,cdt);
     }
     else
     {
-      // Untied: output = input @ weight
-      CAIF_DeviceOps::MatMul(flat_input,_weight,output);
+      CAIF_Ops::MatMul(flat_input,_weight,output,ctx,cdt);
     }
 
-    // Add bias if enabled
     if(_config.use_bias==true)
     {
-      CAIF_DeviceOps::BiasAdd(output,_bias,output);
+      CAIF_Ops::BiasAdd(output,_bias,output);
     }
 
-    // Reshape to output shape
     std::vector<uint32_t> out_shape;
     for(size_t i=0;i<shape.size()-1;++i)
     {
@@ -217,8 +217,7 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Forward(const CAIF_DeviceTensor &input,
     out_shape.push_back(_config.output_dim);
     output.Reshape(out_shape);
 
-    // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_input=input.Clone();
       _cached_shape=std::vector<uint32_t>(shape.begin(),shape.end());
@@ -229,21 +228,19 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Forward(const CAIF_DeviceTensor &input,
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceLinearHead::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceLinearHead<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                        CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceLinearHead: layer has been moved from");
-    }
     if(_cached_shape.empty()==true)
     {
-      THROW_CAIFE("DeviceLinearHead::Backward: must call Forward with training=true first");
+      THROW_CAIFE("CAIF_DeviceLinearHead::Backward: must call Forward with training=true first");
     }
 
-    // Flatten grad_output: [..., output_dim] -> [N, output_dim]
-    const auto &grad_shape=grad_output.Shape();
+    const std::vector<uint32_t> &grad_shape=grad_output.Shape();
     uint32_t n=1;
     for(size_t i=0;i<grad_shape.size()-1;++i)
     {
@@ -253,102 +250,99 @@ CAIF_DeviceTensor CAIF_DeviceLinearHead::Backward(const CAIF_DeviceTensor &grad_
     CAIF_DeviceTensor flat_grad=grad_output.Clone();
     flat_grad.Reshape({n,_config.output_dim});
 
-    // Flatten cached input
     CAIF_DeviceTensor flat_input=_cached_input.Clone();
     flat_input.Reshape({n,_config.input_dim});
 
-    // Weight gradient and input gradient
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({n,_config.input_dim},*_stream);
+    CAIF_DeviceTensor grad_input=AllocateOutput({n,_config.input_dim},ctx);
 
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
     if(_frozen==true)
     {
-      // Frozen: skip weight/bias gradient, only compute grad_input
       if(_weight_tied==true)
       {
-        CAIF_DeviceOps::MatMul(flat_grad,*_tied_weight,grad_input);
+        CAIF_Ops::MatMul(flat_grad,*_tied_weight,grad_input,ctx,cdt);
       }
       else
       {
-        CAIF_DeviceOps::MatMulTransposeB(flat_grad,_weight,grad_input);
+        CAIF_Ops::MatMulTransposeB(flat_grad,_weight,grad_input,ctx,cdt);
       }
     }
     else
     {
-      // Bias gradient: sum over batch dimension
       if(_config.use_bias==true)
       {
-        CAIF_DeviceOps::BiasGradient(flat_grad,_bias_grad);
+        CAIF_Ops::BiasGradient(flat_grad,_bias_grad);
       }
 
       if(_weight_tied==true)
       {
-        // Tied: forward was input @ tied_weight^T
+        const CAIF_DataType::CAIF_DataType_e wdt=_tied_weight_grad->Dtype();
         CAIF_DeviceTensor grad_w_delta=CAIF_DeviceTensor::Uninitialized(
-          {_config.output_dim,_config.input_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeA(flat_grad,flat_input,grad_w_delta);
-        CAIF_DeviceOps::Add(*_tied_weight_grad,grad_w_delta,*_tied_weight_grad);
+                                          {_config.output_dim,_config.input_dim},
+                                          ctx.Stream(),wdt);
+        CAIF_Ops::MatMulTransposeA(flat_grad,flat_input,grad_w_delta,ctx,cdt);
+        CAIF_Ops::Add(*_tied_weight_grad,grad_w_delta,*_tied_weight_grad);
 
-        // grad_input = grad_output @ tied_weight
-        CAIF_DeviceOps::MatMul(flat_grad,*_tied_weight,grad_input);
+        CAIF_Ops::MatMul(flat_grad,*_tied_weight,grad_input,ctx,cdt);
       }
       else
       {
-        // Untied: forward was input @ weight
+        const CAIF_DataType::CAIF_DataType_e wdt=_weight_grad.Dtype();
         CAIF_DeviceTensor grad_w_delta=CAIF_DeviceTensor::Uninitialized(
-          {_config.input_dim,_config.output_dim},*_stream);
-        CAIF_DeviceOps::MatMulTransposeA(flat_input,flat_grad,grad_w_delta);
-        CAIF_DeviceOps::Add(_weight_grad,grad_w_delta,_weight_grad);
+                                          {_config.input_dim,_config.output_dim},
+                                          ctx.Stream(),wdt);
+        CAIF_Ops::MatMulTransposeA(flat_input,flat_grad,grad_w_delta,ctx,cdt);
+        CAIF_Ops::Add(_weight_grad,grad_w_delta,_weight_grad);
 
-        // grad_input = grad_output @ weight^T
-        CAIF_DeviceOps::MatMulTransposeB(flat_grad,_weight,grad_input);
+        CAIF_Ops::MatMulTransposeB(flat_grad,_weight,grad_input,ctx,cdt);
       }
     }
 
-    // Reshape grad_input to original input shape
     grad_input.Reshape(_cached_shape);
-
     return grad_input;
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceLinearHead::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceLinearHead<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
     if(_weight_tied==false)
     {
-      _weight_grad.Fill(0.0f);
+      _weight_grad.FillZero();
     }
-    // Note: tied weight grad is zeroed by embedding layer, not here
-
     if(_config.use_bias==true)
     {
-      _bias_grad.Fill(0.0f);
+      _bias_grad.FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceLinearHead::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceLinearHead<ComputeT,StorageT>::ParameterTensorCount()const
 {
   try
   {
     size_t count=0;
     if(_weight_tied==false)
     {
-      count+=1;  // weight
+      count+=1;
     }
     if(_config.use_bias==true)
     {
-      count+=1;  // bias
+      count+=1;
     }
     return count;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceLinearHead<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
   try
   {
@@ -370,12 +364,14 @@ CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)
         return _bias;
       }
     }
-    THROW_CAIFE("DeviceLinearHead::ParameterTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceLinearHead::ParameterTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceLinearHead<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
   try
   {
@@ -397,12 +393,14 @@ const CAIF_DeviceTensor &CAIF_DeviceLinearHead::ParameterTensor(size_t index)con
         return _bias;
       }
     }
-    THROW_CAIFE("DeviceLinearHead::ParameterTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceLinearHead::ParameterTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceLinearHead<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   try
   {
@@ -424,12 +422,14 @@ CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)
         return _bias_grad;
       }
     }
-    THROW_CAIFE("DeviceLinearHead::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceLinearHead::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceLinearHead<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   try
   {
@@ -451,12 +451,13 @@ const CAIF_DeviceTensor &CAIF_DeviceLinearHead::GradientTensor(size_t index)cons
         return _bias_grad;
       }
     }
-    THROW_CAIFE("DeviceLinearHead::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceLinearHead::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceLinearHead::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceLinearHead<ComputeT,StorageT>::TotalParameterCount()const
 {
   try
   {
@@ -474,7 +475,8 @@ size_t CAIF_DeviceLinearHead::TotalParameterCount()const
   CAIF_CATCH_BLOCK()
 }
 
-std::string CAIF_DeviceLinearHead::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceLinearHead<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -491,7 +493,9 @@ std::string CAIF_DeviceLinearHead::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceLinearHead::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceLinearHead<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
@@ -508,5 +512,58 @@ std::vector<std::string> CAIF_DeviceLinearHead::ParameterNames(const std::string
   }
   CAIF_CATCH_BLOCK()
 }
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceLinearHead<ComputeT,StorageT>::LoadWeight(CAIF_DeviceTensor &&weight)
+{
+  try
+  {
+    if(_weight_tied==true)
+    {
+      THROW_CAIFE("CAIF_DeviceLinearHead::LoadWeight: cannot load weight into a weight-tied head");
+    }
+    const std::vector<uint32_t> &shape=weight.Shape();
+    if(shape.size()!=2 ||
+       shape[0]!=_config.input_dim ||
+       shape[1]!=_config.output_dim)
+    {
+      THROW_CAIFE("CAIF_DeviceLinearHead::LoadWeight: shape mismatch, expected [input_dim, output_dim]");
+    }
+    _weight=std::move(weight);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceLinearHead<ComputeT,StorageT>::LoadBias(CAIF_DeviceTensor &&bias)
+{
+  try
+  {
+    if(_config.use_bias==false)
+    {
+      THROW_CAIFE("CAIF_DeviceLinearHead::LoadBias: use_bias is false");
+    }
+    const std::vector<uint32_t> &shape=bias.Shape();
+    if(shape.size()!=1 || shape[0]!=_config.output_dim)
+    {
+      THROW_CAIFE("CAIF_DeviceLinearHead::LoadBias: shape mismatch, expected [output_dim]");
+    }
+    _bias=std::move(bias);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceLinearHead<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceLinearHead<float,__half>;
+template class CAIF_DeviceLinearHead<float,__nv_bfloat16>;
+template class CAIF_DeviceLinearHead<__half,float>;
+template class CAIF_DeviceLinearHead<__half,__half>;
+template class CAIF_DeviceLinearHead<__half,__nv_bfloat16>;
+template class CAIF_DeviceLinearHead<__nv_bfloat16,float>;
+template class CAIF_DeviceLinearHead<__nv_bfloat16,__half>;
+template class CAIF_DeviceLinearHead<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

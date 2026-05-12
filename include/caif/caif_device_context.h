@@ -20,13 +20,14 @@
 #define CAIF_DEVICE_CONTEXT_H
 
 #include "caif_base.h"
+#include "caif_constants.h"
 #include "caif_device_properties.h"
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
-#include "cuda/cublas_v2.h"
-#include "cuda/cublasLt.h"
-#include "cudnn/cudnn.h"
+#include <cuda_runtime_api.h>
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#include <cudnn.h>
 #endif
 
 namespace instance
@@ -83,7 +84,7 @@ class CAIF_DeviceContext:public CAIF_Base
     void *CublasHandle(){return nullptr;}
     void *CublasLtHandle(){return nullptr;}
     void *CublasLtWorkspace(){return nullptr;}
-    size_t CublasLtWorkspaceSize()const{return 0;}
+    size_t CublasLtWorkspaceSize()const{return _cublaslt_workspace_size;}
 #endif
 
     /**
@@ -158,6 +159,22 @@ class CAIF_DeviceContext:public CAIF_Base
      */
     void Cleanup();
 
+    static constexpr size_t _cublaslt_workspace_bytes_small=
+                                    g_caif_cublaslt_workspace_bytes_small;
+    static constexpr size_t _cublaslt_workspace_bytes_medium=
+                                    g_caif_cublaslt_workspace_bytes_medium;
+    static constexpr size_t _cublaslt_workspace_bytes_large=
+                                    g_caif_cublaslt_workspace_bytes_large;
+    static constexpr int _cublaslt_workspace_free_vram_divisor=
+                                    g_caif_cublaslt_workspace_free_vram_divisor;
+
+    size_t AutoSizeCublasLtWorkspace(const int cc_major,
+                                     const int cc_minor)const;
+    size_t ResolveCublasLtWorkspaceSize(const int cc_major,
+                                        const int cc_minor,
+                                        const size_t free_vram_bytes,
+                                        bool &out_is_override)const;
+
 #ifdef USE_CAIF_CUDA
     cublasHandle_t _cublas_handle;
     cublasLtHandle_t _cublaslt_handle;
@@ -165,6 +182,7 @@ class CAIF_DeviceContext:public CAIF_Base
     void *_cublaslt_workspace;
     cudaStream_t _last_cublas_stream;
 #endif
+    size_t _cublaslt_workspace_size;
     bool _initialized;
     int _device_id;
 };

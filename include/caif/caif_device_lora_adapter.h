@@ -14,35 +14,34 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// LoRA (Low-Rank Adaptation) adapter wrapping any CAIF_DeviceLayer
+// LoRA (Low-Rank Adaptation) adapter (templated on <ComputeT, StorageT>).
+//
+// LoRA A/B matrices are stored at StorageT and computed with ComputeT, so
+// the adapter composes cleanly inside a templated MHA at any
+// (compute, storage) pair the rest of the framework supports. Defaults
+// make `CAIF_DeviceLoRAAdapter<>` valid syntax for the legacy fp32 path.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_LORA_ADAPTER_H
-#define CAIF_DEVICE_LORA_ADAPTER_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
+#ifdef USE_CAIF_CUDA
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
 #include <vector>
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <type_traits>
 
 namespace instance
 {
 
-/**
- * @brief LoRA adapter that adds low-rank trainable parameters to any layer
- *
- * Wraps a base layer (typically CAIF_DeviceFrozenLinear) and adds
- * trainable LoRA A and B matrices. During forward:
- *   output = base_layer(input) + (input @ A^T @ B^T) * (alpha / rank)
- *
- * Only LoRA A and B are exposed as trainable parameters. The base layer's
- * parameters are NOT exposed to the optimizer.
- *
- * Initialization: A = Kaiming uniform, B = zeros.
- * This means LoRA initially produces zero output (identity behavior).
- */
-class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     struct LoRAConfig_t
@@ -54,19 +53,21 @@ class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayer
     };
 
     CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
-                          std::unique_ptr<CAIF_DeviceLayer> base_layer,
-                          CAIF_CudaStream &stream,
-                          uint32_t seed=0);
+                           std::unique_ptr<CAIF_DeviceLayer> base_layer,
+                           CAIF_CudaStream &stream,
+                           uint32_t seed=0);
 
     ~CAIF_DeviceLoRAAdapter()override=default;
 
-    // Movable
     CAIF_DeviceLoRAAdapter(CAIF_DeviceLoRAAdapter &&other);
     CAIF_DeviceLoRAAdapter &operator=(CAIF_DeviceLoRAAdapter &&other);
 
-    // --- CAIF_DeviceLayer interface ---
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::LoRAAdapter_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -76,29 +77,66 @@ class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayer
     size_t TotalParameterCount()const override;
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
+    size_t FrozenTensorCount()const override;
+    CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
+    std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    // --- LoRA-specific ---
     const LoRAConfig_t &Config()const{return _config;}
 
+    CAIF_DeviceLayer &BaseLayer()
+    {
+      if(_base_layer==nullptr)
+      {
+        THROW_CAIFE("LoRAAdapter: base_layer is null");
+      }
+      return *_base_layer;
+    }
+    const CAIF_DeviceLayer &BaseLayer()const
+    {
+      if(_base_layer==nullptr)
+      {
+        THROW_CAIFE("LoRAAdapter: base_layer is null");
+      }
+      return *_base_layer;
+    }
+
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &LoRAAMut(){return _lora_a;}
+
     LoRAConfig_t _config;
     std::unique_ptr<CAIF_DeviceLayer> _base_layer;
 
-    // LoRA parameters: A=[rank, input_dim], B=[output_dim, rank]
     CAIF_DeviceTensor _lora_a;
     CAIF_DeviceTensor _lora_b;
 
-    // Gradients
     CAIF_DeviceTensor _grad_lora_a;
     CAIF_DeviceTensor _grad_lora_b;
 
-    // Cached for backward
     CAIF_DeviceTensor _cached_input;
     CAIF_DeviceTensor _cached_lora_hidden;
 };
 
-}//end instance namespace
+extern template class CAIF_DeviceLoRAAdapter<float,float>;
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DeviceLoRAAdapter<float,__half>;
+extern template class CAIF_DeviceLoRAAdapter<float,__nv_bfloat16>;
+extern template class CAIF_DeviceLoRAAdapter<__half,float>;
+extern template class CAIF_DeviceLoRAAdapter<__half,__half>;
+extern template class CAIF_DeviceLoRAAdapter<__half,__nv_bfloat16>;
+extern template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,float>;
+extern template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,__half>;
+extern template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
-#endif  // CAIF_DEVICE_LORA_ADAPTER_H
+}//end instance namespace

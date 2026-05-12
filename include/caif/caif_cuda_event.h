@@ -19,7 +19,7 @@
 #include <cstdint>
 
 #ifdef USE_CAIF_CUDA
-#include "cuda/cuda_runtime_api.h"
+#include <cuda_runtime_api.h>
 #endif
 
 namespace instance

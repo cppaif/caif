@@ -13,8 +13,13 @@
 // limitations under the License.
 
 #include "caif_device_patch_embedding.h"
+#include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
+#include "caif_cpu_reference/caif_cpu_patch_extract.h"
+#include "caif_cpu_reference/caif_cpu_matmul.h"
+#include "caif_cpu_reference/caif_cpu_linear.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -22,108 +27,22 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
 
-//------------------------------------------------------------------------------
-// CPU reference: extract patches, project, bias add
-//------------------------------------------------------------------------------
-static void CpuExtractPatches(const float *input,
-                               float *output,
-                               int batch,
-                               int height,
-                               int width,
-                               int channels,
-                               int patch_size,
-                               int num_patches_h,
-                               int num_patches_w)
-{
-  const int patch_flat=patch_size*patch_size*channels;
-  const int num_patches=num_patches_h*num_patches_w;
-  for(int b=0;b<batch;++b)
-  {
-    for(int ph=0;ph<num_patches_h;++ph)
-    {
-      for(int pw=0;pw<num_patches_w;++pw)
-      {
-        const int patch_idx=ph*num_patches_w+pw;
-        const int out_row=b*num_patches+patch_idx;
-        for(int lh=0;lh<patch_size;++lh)
-        {
-          for(int lw=0;lw<patch_size;++lw)
-          {
-            const int gh=ph*patch_size+lh;
-            const int gw=pw*patch_size+lw;
-            for(int c=0;c<channels;++c)
-            {
-              const int flat_pos=(lh*patch_size+lw)*channels+c;
-              const int in_idx=((b*height+gh)*width+gw)*channels+c;
-              output[out_row*patch_flat+flat_pos]=input[in_idx];
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-static void CpuMatMul(const float *a,
-                       const float *b,
-                       float *c,
-                       int m,
-                       int k,
-                       int n)
-{
-  for(int i=0;i<m;++i)
-  {
-    for(int j=0;j<n;++j)
-    {
-      float sum=0.0f;
-      for(int p=0;p<k;++p)
-      {
-        sum+=a[i*k+p]*b[p*n+j];
-      }
-      c[i*n+j]=sum;
-    }
-  }
-}
-
-static void CpuBiasAdd(float *data,const float *bias,int rows,int cols)
-{
-  for(int r=0;r<rows;++r)
-  {
-    for(int c=0;c<cols;++c)
-    {
-      data[r*cols+c]+=bias[c];
-    }
-  }
-}
-
 // Test config used across most tests
-static CAIF_DevicePatchEmbedding::Config_t TestConfig(bool cls)
+static CAIF_DevicePatchEmbedding<float,float>::Config_t TestConfig(bool cls)
 {
-  CAIF_DevicePatchEmbedding::Config_t config;
+  CAIF_DevicePatchEmbedding<float,float>::Config_t config;
   config.image_height=8;
   config.image_width=8;
   config.channels=3;
@@ -141,8 +60,10 @@ static void TestForwardShape()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(false);
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(false);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
 
     // Input: [1,8,8,3]
     constexpr uint32_t batch=1;
@@ -153,7 +74,9 @@ static void TestForwardShape()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
 
-    CAIF_DeviceTensor output=emb.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     const auto &shape=output.Shape();
 
     // num_patches = (8/4)*(8/4) = 4
@@ -174,11 +97,7 @@ static void TestForwardShape()
 
     ReportResult("PatchEmbedding::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -189,8 +108,10 @@ static void TestForwardShapeCLS()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(true);
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(true);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -200,7 +121,9 @@ static void TestForwardShapeCLS()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
 
-    CAIF_DeviceTensor output=emb.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     const auto &shape=output.Shape();
 
     // num_patches+1 = 5
@@ -221,11 +144,7 @@ static void TestForwardShapeCLS()
 
     ReportResult("PatchEmbedding::ForwardShapeCLS",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::ForwardShapeCLS",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::ForwardShapeCLS")
 }
 
 //------------------------------------------------------------------------------
@@ -236,8 +155,10 @@ static void TestForwardValues()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(false);
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(false);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -259,7 +180,9 @@ static void TestForwardValues()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
 
-    CAIF_DeviceTensor output=emb.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Read W_proj and b_proj
@@ -268,13 +191,13 @@ static void TestForwardValues()
 
     // CPU reference
     std::vector<float> patches(batch*num_patches*patch_flat);
-    CpuExtractPatches(input_data.data(),patches.data(),
+    CAIF_CpuPatchExtract::Apply(input_data.data(),patches.data(),
                        batch,h,w,c,patch_size,num_patches_h,num_patches_w);
 
     std::vector<float> projected(num_patches*dim);
-    CpuMatMul(patches.data(),host_w.Data(),projected.data(),
+    CAIF_CpuMatMul::Apply(patches.data(),host_w.Data(),projected.data(),
                num_patches,patch_flat,dim);
-    CpuBiasAdd(projected.data(),host_b.Data(),num_patches,dim);
+    CAIF_CpuLinear::BiasAdd(projected.data(),host_b.Data(),num_patches,dim);
 
     bool passed=true;
     for(size_t i=0;i<num_patches*dim;++i)
@@ -290,11 +213,7 @@ static void TestForwardValues()
 
     ReportResult("PatchEmbedding::ForwardValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::ForwardValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::ForwardValues")
 }
 
 //------------------------------------------------------------------------------
@@ -305,8 +224,10 @@ static void TestForwardCLSValues()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(true);
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(true);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -327,7 +248,9 @@ static void TestForwardCLSValues()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
 
-    CAIF_DeviceTensor output=emb.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Read CLS token
@@ -352,12 +275,12 @@ static void TestForwardCLSValues()
     if(passed==true)
     {
       std::vector<float> patches(num_patches*patch_flat);
-      CpuExtractPatches(input_data.data(),patches.data(),
+      CAIF_CpuPatchExtract::Apply(input_data.data(),patches.data(),
                          batch,h,w,c,patch_size,num_patches_h,num_patches_w);
       std::vector<float> projected(num_patches*dim);
-      CpuMatMul(patches.data(),host_w.Data(),projected.data(),
+      CAIF_CpuMatMul::Apply(patches.data(),host_w.Data(),projected.data(),
                  num_patches,patch_flat,dim);
-      CpuBiasAdd(projected.data(),host_b.Data(),num_patches,dim);
+      CAIF_CpuLinear::BiasAdd(projected.data(),host_b.Data(),num_patches,dim);
 
       for(uint32_t p=0;p<num_patches&&passed==true;++p)
       {
@@ -378,11 +301,7 @@ static void TestForwardCLSValues()
 
     ReportResult("PatchEmbedding::ForwardCLSValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::ForwardCLSValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::ForwardCLSValues")
 }
 
 //------------------------------------------------------------------------------
@@ -393,7 +312,9 @@ static void TestBackwardInputGrad()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(false);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(false);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -413,7 +334,7 @@ static void TestBackwardInputGrad()
     }
 
     // Read weights for consistent perturbed runs
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
     CAIF_HostTensor host_w=emb.ParameterTensor(0).ToHost();
     CAIF_HostTensor host_b=emb.ParameterTensor(1).ToHost();
     const size_t w_size=emb.ParameterTensor(0).TotalElements();
@@ -422,14 +343,20 @@ static void TestBackwardInputGrad()
     // Analytical backward
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
-    CAIF_DeviceTensor output=emb.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*num_patches*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),
                                 {batch,num_patches,dim},stream);
-    CAIF_DeviceTensor grad_input=emb.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=emb.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
+
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     // Finite-difference check on a subset of input elements
     bool passed=true;
@@ -442,12 +369,12 @@ static void TestBackwardInputGrad()
       inp_minus[i]-=fd_h;
 
       // f(x+h)
-      CAIF_DevicePatchEmbedding emb_p(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_p(config,stream);
       emb_p.ParameterTensor(0).CopyFromHost(host_w.Data(),w_size);
       emb_p.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                inp_plus.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*num_patches*dim;++j)
@@ -456,12 +383,12 @@ static void TestBackwardInputGrad()
       }
 
       // f(x-h)
-      CAIF_DevicePatchEmbedding emb_m(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_m(config,stream);
       emb_m.ParameterTensor(0).CopyFromHost(host_w.Data(),w_size);
       emb_m.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                inp_minus.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*num_patches*dim;++j)
@@ -482,11 +409,7 @@ static void TestBackwardInputGrad()
 
     ReportResult("PatchEmbedding::BackwardInputGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::BackwardInputGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::BackwardInputGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -497,7 +420,9 @@ static void TestBackwardWeightGrad()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(false);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(false);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -514,7 +439,7 @@ static void TestBackwardWeightGrad()
       input_data[i]=static_cast<float>(i)*0.01f-0.5f;
     }
 
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
     CAIF_HostTensor host_w=emb.ParameterTensor(0).ToHost();
     CAIF_HostTensor host_b=emb.ParameterTensor(1).ToHost();
     const size_t w_size=host_w.TotalElements();
@@ -524,13 +449,19 @@ static void TestBackwardWeightGrad()
     // Analytical backward
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
-    CAIF_DeviceTensor output=emb.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     std::vector<float> grad_ones(batch*num_patches*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),
                                 {batch,num_patches,dim},stream);
-    emb.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    emb.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_w=emb.GradientTensor(0).ToHost();
+
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     // Finite-difference on subset of W_proj elements
     bool passed=true;
@@ -542,12 +473,12 @@ static void TestBackwardWeightGrad()
       w_plus[i]+=fd_h;
       w_minus[i]-=fd_h;
 
-      CAIF_DevicePatchEmbedding emb_p(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_p(config,stream);
       emb_p.ParameterTensor(0).CopyFromHost(w_plus.data(),w_size);
       emb_p.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_data.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*num_patches*dim;++j)
@@ -555,12 +486,12 @@ static void TestBackwardWeightGrad()
         sum_plus+=hout_p.Data()[j];
       }
 
-      CAIF_DevicePatchEmbedding emb_m(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_m(config,stream);
       emb_m.ParameterTensor(0).CopyFromHost(w_minus.data(),w_size);
       emb_m.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_data.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*num_patches*dim;++j)
@@ -581,11 +512,7 @@ static void TestBackwardWeightGrad()
 
     ReportResult("PatchEmbedding::BackwardWeightGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::BackwardWeightGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::BackwardWeightGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -596,7 +523,9 @@ static void TestBackwardCLSGrad()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePatchEmbedding::Config_t config=TestConfig(true);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config=TestConfig(true);
 
     constexpr uint32_t batch=1;
     constexpr uint32_t h=8;
@@ -614,7 +543,7 @@ static void TestBackwardCLSGrad()
       input_data[i]=static_cast<float>(i)*0.01f-0.5f;
     }
 
-    CAIF_DevicePatchEmbedding emb(config,stream);
+    CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
     CAIF_HostTensor host_w=emb.ParameterTensor(0).ToHost();
     CAIF_HostTensor host_b=emb.ParameterTensor(1).ToHost();
     CAIF_HostTensor host_cls=emb.ParameterTensor(2).ToHost();
@@ -625,13 +554,19 @@ static void TestBackwardCLSGrad()
     // Analytical backward
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,h,w,c},stream);
-    CAIF_DeviceTensor output=emb.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=emb.Forward(input,ctx);
     std::vector<float> grad_ones(batch*out_seq*dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_ones.data(),
                                 {batch,out_seq,dim},stream);
-    emb.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    emb.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_cls=emb.GradientTensor(2).ToHost();
+
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     bool passed=true;
     for(uint32_t d=0;d<dim&&passed==true;++d)
@@ -641,13 +576,13 @@ static void TestBackwardCLSGrad()
       cls_plus[d]+=fd_h;
       cls_minus[d]-=fd_h;
 
-      CAIF_DevicePatchEmbedding emb_p(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_p(config,stream);
       emb_p.ParameterTensor(0).CopyFromHost(host_w.Data(),w_size);
       emb_p.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       emb_p.ParameterTensor(2).CopyFromHost(cls_plus.data(),dim);
       CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
                                input_data.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,false);
+      CAIF_DeviceTensor out_p=emb_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*out_seq*dim;++j)
@@ -655,13 +590,13 @@ static void TestBackwardCLSGrad()
         sum_plus+=hout_p.Data()[j];
       }
 
-      CAIF_DevicePatchEmbedding emb_m(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb_m(config,stream);
       emb_m.ParameterTensor(0).CopyFromHost(host_w.Data(),w_size);
       emb_m.ParameterTensor(1).CopyFromHost(host_b.Data(),b_size);
       emb_m.ParameterTensor(2).CopyFromHost(cls_minus.data(),dim);
       CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
                                input_data.data(),{batch,h,w,c},stream);
-      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,false);
+      CAIF_DeviceTensor out_m=emb_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*out_seq*dim;++j)
@@ -682,11 +617,7 @@ static void TestBackwardCLSGrad()
 
     ReportResult("PatchEmbedding::BackwardCLSGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::BackwardCLSGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::BackwardCLSGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -699,8 +630,8 @@ static void TestParameterCount()
     CAIF_CudaStream stream;
 
     // Without CLS
-    CAIF_DevicePatchEmbedding::Config_t config_no=TestConfig(false);
-    CAIF_DevicePatchEmbedding emb_no(config_no,stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config_no=TestConfig(false);
+    CAIF_DevicePatchEmbedding<float,float> emb_no(config_no,stream);
     bool passed=true;
     if(emb_no.ParameterTensorCount()!=2)
     {
@@ -710,8 +641,8 @@ static void TestParameterCount()
     }
 
     // With CLS
-    CAIF_DevicePatchEmbedding::Config_t config_cls=TestConfig(true);
-    CAIF_DevicePatchEmbedding emb_cls(config_cls,stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config_cls=TestConfig(true);
+    CAIF_DevicePatchEmbedding<float,float> emb_cls(config_cls,stream);
     if(emb_cls.ParameterTensorCount()!=3)
     {
       std::cout<<"  CLS: ParameterTensorCount expected 3, got "
@@ -721,11 +652,7 @@ static void TestParameterCount()
 
     ReportResult("PatchEmbedding::ParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::ParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::ParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -737,7 +664,7 @@ static void TestPatchSizeValidation()
   {
     CAIF_CudaStream stream;
 
-    CAIF_DevicePatchEmbedding::Config_t config;
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config;
     config.image_height=7;  // Not divisible by 4
     config.image_width=8;
     config.channels=3;
@@ -748,7 +675,7 @@ static void TestPatchSizeValidation()
     bool threw=false;
     try
     {
-      CAIF_DevicePatchEmbedding emb(config,stream);
+      CAIF_DevicePatchEmbedding<float,float> emb(config,stream);
     }
     catch(...)
     {
@@ -763,11 +690,7 @@ static void TestPatchSizeValidation()
 
     ReportResult("PatchEmbedding::PatchSizeValidation",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::PatchSizeValidation",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::PatchSizeValidation")
 }
 
 //------------------------------------------------------------------------------
@@ -779,13 +702,13 @@ static void TestDescription()
   {
     CAIF_CudaStream stream;
 
-    CAIF_DevicePatchEmbedding::Config_t config_no=TestConfig(false);
-    CAIF_DevicePatchEmbedding emb_no(config_no,stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config_no=TestConfig(false);
+    CAIF_DevicePatchEmbedding<float,float> emb_no(config_no,stream);
     const std::string desc_no=emb_no.Description();
     const std::string expected_no="PatchEmbedding(patch=4,ch=3,dim=6)";
 
-    CAIF_DevicePatchEmbedding::Config_t config_cls=TestConfig(true);
-    CAIF_DevicePatchEmbedding emb_cls(config_cls,stream);
+    CAIF_DevicePatchEmbedding<float,float>::Config_t config_cls=TestConfig(true);
+    CAIF_DevicePatchEmbedding<float,float> emb_cls(config_cls,stream);
     const std::string desc_cls=emb_cls.Description();
     const std::string expected_cls="PatchEmbedding(patch=4,ch=3,dim=6,cls=true)";
 
@@ -801,18 +724,14 @@ static void TestDescription()
 
     ReportResult("PatchEmbedding::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PatchEmbedding::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PatchEmbedding::Description")
 }
 
 #endif  // USE_CAIF_CUDA
 
 int main()
 {
-  std::cout<<"=== CAIF_DevicePatchEmbedding Tests ===\n\n";
+  std::cout<<"=== CAIF_DevicePatchEmbedding<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestForwardShape();
@@ -829,13 +748,5 @@ int main()
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

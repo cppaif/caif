@@ -13,19 +13,21 @@
 // limitations under the License.
 
 #include "caif_device_lora_adapter.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_host_tensor.h"
 #include "caif_exception.h"
 #include <random>
 #include <cmath>
 #include <ctime>
 
-using namespace instance;
+namespace instance
+{
 
-CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
                                              std::unique_ptr<CAIF_DeviceLayer> base_layer,
                                              CAIF_CudaStream &stream,
-                                             uint32_t seed):CAIF_DeviceLayer(stream),
+                                             uint32_t seed):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                                             _config(config),
                                                             _base_layer(std::move(base_layer)),
                                                             _lora_a(),
@@ -46,12 +48,14 @@ CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
       THROW_CAIFE("LoRAAdapter: base_layer must not be null");
     }
 
-    // Allocate LoRA tensors: A=[rank, input_dim], B=[output_dim, rank]
-    _lora_a=CAIF_DeviceTensor::Uninitialized({config.rank,config.input_dim},stream);
-    _lora_b=CAIF_DeviceTensor::Zeros({config.output_dim,config.rank},stream);
+    // Allocate LoRA tensors at the templated storage dtype.
+    // A=[rank, input_dim], B=[output_dim, rank]
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    _lora_a=CAIF_DeviceTensor::Uninitialized({config.rank,config.input_dim},stream,sd);
+    _lora_b=CAIF_DeviceTensor::Zeros({config.output_dim,config.rank},stream,sd);
 
-    _grad_lora_a=CAIF_DeviceTensor::Zeros({config.rank,config.input_dim},stream);
-    _grad_lora_b=CAIF_DeviceTensor::Zeros({config.output_dim,config.rank},stream);
+    _grad_lora_a=CAIF_DeviceTensor::Zeros({config.rank,config.input_dim},stream,sd);
+    _grad_lora_b=CAIF_DeviceTensor::Zeros({config.output_dim,config.rank},stream,sd);
 
     // Initialize A with Kaiming uniform: U(-bound, bound), bound=sqrt(1/input_dim)
     if(seed==0)
@@ -68,14 +72,15 @@ CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
     {
       host_a[i]=dist(gen);
     }
-    _lora_a.CopyFromHost(host_a.data(),a_count);
+    LoRAAMut().CopyFromHostFp32(host_a.data(),a_count);
 
     // B is already zeros (LoRA starts as identity)
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(CAIF_DeviceLoRAAdapter &&other):CAIF_DeviceLayer(std::move(other)),
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::CAIF_DeviceLoRAAdapter(CAIF_DeviceLoRAAdapter<ComputeT,StorageT> &&other):CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
                                                       _config(other._config),
                                                       _base_layer(std::move(other._base_layer)),
                                                       _lora_a(std::move(other._lora_a)),
@@ -87,13 +92,14 @@ CAIF_DeviceLoRAAdapter::CAIF_DeviceLoRAAdapter(CAIF_DeviceLoRAAdapter &&other):C
 {
 }
 
-CAIF_DeviceLoRAAdapter &CAIF_DeviceLoRAAdapter::operator=(CAIF_DeviceLoRAAdapter &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLoRAAdapter<ComputeT,StorageT> &CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::operator=(CAIF_DeviceLoRAAdapter<ComputeT,StorageT> &&other)
 {
   try
   {
     if(this!=&other)
     {
-      CAIF_DeviceLayer::operator=(std::move(other));
+      CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
       _config=other._config;
       _base_layer=std::move(other._base_layer);
       _lora_a=std::move(other._lora_a);
@@ -108,14 +114,15 @@ CAIF_DeviceLoRAAdapter &CAIF_DeviceLoRAAdapter::operator=(CAIF_DeviceLoRAAdapter
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input,
-                                                 bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                     CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
+    if(CAIF_DeviceLayer::HasStream()==false)
     {
-      THROW_CAIFE("LoRAAdapter: layer has been moved from");
+      THROW_CAIFE("LoRAAdapter: stream is null");
     }
 
     const auto &shape=input.Shape();
@@ -129,7 +136,7 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input
     }
 
     // Base layer forward
-    CAIF_DeviceTensor base_out=_base_layer->Forward(input,training);
+    CAIF_DeviceTensor base_out=_base_layer->Forward(input,ctx);
 
     // Reshape to 2D for LoRA matmuls
     uint32_t n=1;
@@ -141,28 +148,31 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input
     input_2d.Reshape({n,_config.input_dim});
 
     // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_input=input_2d.Clone();
     }
 
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
+
     // lora_hidden = input_2d @ A^T: [N, input_dim] @ [input_dim, rank] = [N, rank]
-    CAIF_DeviceTensor lora_hidden=CAIF_DeviceTensor::Uninitialized({n,_config.rank},*_stream);
-    CAIF_DeviceOps::MatMulTransposeB(input_2d,_lora_a,lora_hidden);
+    CAIF_DeviceTensor lora_hidden=CAIF_DeviceTensor::Uninitialized({n,_config.rank},Stream(),sd);
+    CAIF_Ops::MatMulTransposeB(input_2d,_lora_a,lora_hidden,ctx,cdt);
 
     // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_lora_hidden=lora_hidden.Clone();
     }
 
     // lora_out = lora_hidden @ B^T: [N, rank] @ [rank, output_dim] = [N, output_dim]
-    CAIF_DeviceTensor lora_out=CAIF_DeviceTensor::Uninitialized({n,_config.output_dim},*_stream);
-    CAIF_DeviceOps::MatMulTransposeB(lora_hidden,_lora_b,lora_out);
+    CAIF_DeviceTensor lora_out=CAIF_DeviceTensor::Uninitialized({n,_config.output_dim},Stream(),sd);
+    CAIF_Ops::MatMulTransposeB(lora_hidden,_lora_b,lora_out,ctx,cdt);
 
     // Scale by alpha/rank
     const float scale=_config.alpha/static_cast<float>(_config.rank);
-    CAIF_DeviceOps::Scale(lora_out,scale);
+    CAIF_Ops::Scale(lora_out,scale);
 
     // Reshape lora_out to match base_out shape
     if(shape.size()>2)
@@ -172,22 +182,32 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Forward(const CAIF_DeviceTensor &input
       lora_out.Reshape(out_shape);
     }
 
-    // output = base_out + lora_out
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(base_out.Shape(),*_stream);
-    CAIF_DeviceOps::Add(base_out,lora_out,output);
+    // output = base_out + lora_out — base may emit fp32 (e.g. FrozenLinear's
+    // fp32-accumulated output); cast to StorageT so the Add matches lora_out.
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(base_out.Shape(),Stream(),sd);
+    if(base_out.Dtype()==sd)
+    {
+      CAIF_Ops::Add(base_out,lora_out,output);
+    }
+    else
+    {
+      CAIF_DeviceTensor base_out_cast=base_out.To(sd);
+      CAIF_Ops::Add(base_out_cast,lora_out,output);
+    }
 
     return output;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
+    if(CAIF_DeviceLayer::HasStream()==false)
     {
-      THROW_CAIFE("LoRAAdapter: layer has been moved from");
+      THROW_CAIFE("LoRAAdapter: stream is null");
     }
     if(_cached_input.IsEmpty()==true)
     {
@@ -206,29 +226,31 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Backward(const CAIF_DeviceTensor &grad
     grad_2d.Reshape({n,_config.output_dim});
 
     const float scale=_config.alpha/static_cast<float>(_config.rank);
+    const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
     // d_lora_scaled = grad_output * scale
     CAIF_DeviceTensor d_lora_scaled=grad_2d.Clone();
-    CAIF_DeviceOps::Scale(d_lora_scaled,scale);
+    CAIF_Ops::Scale(d_lora_scaled,scale);
 
     // _grad_lora_b += d_lora_scaled^T @ _cached_lora_hidden
     // [output_dim, N] @ [N, rank] = [output_dim, rank]
-    CAIF_DeviceOps::MatMulTransposeA(d_lora_scaled,_cached_lora_hidden,_grad_lora_b);
+    CAIF_Ops::MatMulTransposeA(d_lora_scaled,_cached_lora_hidden,_grad_lora_b,ctx,cdt);
 
     // d_lora_hidden = d_lora_scaled @ B: [N, output_dim] @ [output_dim, rank] = [N, rank]
-    CAIF_DeviceTensor d_lora_hidden=CAIF_DeviceTensor::Uninitialized({n,_config.rank},*_stream);
-    CAIF_DeviceOps::MatMul(d_lora_scaled,_lora_b,d_lora_hidden);
+    CAIF_DeviceTensor d_lora_hidden=CAIF_DeviceTensor::Uninitialized({n,_config.rank},Stream(),sd);
+    CAIF_Ops::MatMul(d_lora_scaled,_lora_b,d_lora_hidden,ctx,cdt);
 
     // _grad_lora_a += d_lora_hidden^T @ _cached_input
     // [rank, N] @ [N, input_dim] = [rank, input_dim]
-    CAIF_DeviceOps::MatMulTransposeA(d_lora_hidden,_cached_input,_grad_lora_a);
+    CAIF_Ops::MatMulTransposeA(d_lora_hidden,_cached_input,_grad_lora_a,ctx,cdt);
 
     // d_input_lora = d_lora_hidden @ A: [N, rank] @ [rank, input_dim] = [N, input_dim]
-    CAIF_DeviceTensor d_input_lora=CAIF_DeviceTensor::Uninitialized({n,_config.input_dim},*_stream);
-    CAIF_DeviceOps::MatMul(d_lora_hidden,_lora_a,d_input_lora);
+    CAIF_DeviceTensor d_input_lora=CAIF_DeviceTensor::Uninitialized({n,_config.input_dim},Stream(),sd);
+    CAIF_Ops::MatMul(d_lora_hidden,_lora_a,d_input_lora,ctx,cdt);
 
     // Base layer backward
-    CAIF_DeviceTensor grad_base=_base_layer->Backward(grad_output);
+    CAIF_DeviceTensor grad_base=_base_layer->Backward(grad_output,ctx);
 
     // Reshape d_input_lora to match grad_base shape
     if(shape.size()>2)
@@ -238,41 +260,61 @@ CAIF_DeviceTensor CAIF_DeviceLoRAAdapter::Backward(const CAIF_DeviceTensor &grad
       d_input_lora.Reshape(in_shape);
     }
 
-    // grad_input = grad_base + d_input_lora
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized(
-        grad_base.Shape(),*_stream);
-    CAIF_DeviceOps::Add(grad_base,d_input_lora,grad_input);
+    // grad_input = grad_base + d_input_lora — base layer (e.g. FrozenLinear)
+    // may emit fp32 grads; cast to StorageT to match d_input_lora.
+    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized(grad_base.Shape(),Stream(),sd);
+    if(grad_base.Dtype()==sd)
+    {
+      CAIF_Ops::Add(grad_base,d_input_lora,grad_input);
+    }
+    else
+    {
+      CAIF_DeviceTensor grad_base_cast=grad_base.To(sd);
+      CAIF_Ops::Add(grad_base_cast,d_input_lora,grad_input);
+    }
 
     return grad_input;
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceLoRAAdapter::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_lora_a.Fill(0.0f);
-    _grad_lora_b.Fill(0.0f);
+    _grad_lora_a.FillZero();
+    _grad_lora_b.FillZero();
     _base_layer->ZeroGradients();
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceLoRAAdapter::ParameterTensorCount()const
-{
-  return 2;
-}
-
-CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ParameterTensorCount()const
 {
   try
   {
-    if(index==0)
+    return _base_layer->ParameterTensorCount()+2;
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ParameterTensor(size_t index)
+{
+  try
+  {
+    const size_t base_count=_base_layer->ParameterTensorCount();
+    if(index<base_count)
+    {
+      return _base_layer->ParameterTensor(index);
+    }
+    if(index==base_count)
     {
       return _lora_a;
     }
-    if(index==1)
+    if(index==base_count+1)
     {
       return _lora_b;
     }
@@ -281,15 +323,21 @@ CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
   try
   {
-    if(index==0)
+    const size_t base_count=_base_layer->ParameterTensorCount();
+    if(index<base_count)
+    {
+      return _base_layer->ParameterTensor(index);
+    }
+    if(index==base_count)
     {
       return _lora_a;
     }
-    if(index==1)
+    if(index==base_count+1)
     {
       return _lora_b;
     }
@@ -298,15 +346,21 @@ const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::ParameterTensor(size_t index)co
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   try
   {
-    if(index==0)
+    const size_t base_count=_base_layer->ParameterTensorCount();
+    if(index<base_count)
+    {
+      return _base_layer->GradientTensor(index);
+    }
+    if(index==base_count)
     {
       return _grad_lora_a;
     }
-    if(index==1)
+    if(index==base_count+1)
     {
       return _grad_lora_b;
     }
@@ -315,15 +369,21 @@ CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   try
   {
-    if(index==0)
+    const size_t base_count=_base_layer->ParameterTensorCount();
+    if(index<base_count)
+    {
+      return _base_layer->GradientTensor(index);
+    }
+    if(index==base_count)
     {
       return _grad_lora_a;
     }
-    if(index==1)
+    if(index==base_count+1)
     {
       return _grad_lora_b;
     }
@@ -332,17 +392,20 @@ const CAIF_DeviceTensor &CAIF_DeviceLoRAAdapter::GradientTensor(size_t index)con
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceLoRAAdapter::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::TotalParameterCount()const
 {
   try
   {
-    return static_cast<size_t>(_config.rank)*_config.input_dim+
+    return _base_layer->TotalParameterCount()+
+           static_cast<size_t>(_config.rank)*_config.input_dim+
            static_cast<size_t>(_config.output_dim)*_config.rank;
   }
   CAIF_CATCH_BLOCK()
 }
 
-std::string CAIF_DeviceLoRAAdapter::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -359,15 +422,60 @@ std::string CAIF_DeviceLoRAAdapter::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceLoRAAdapter::ParameterNames(
+template<typename ComputeT,typename StorageT>
+std::vector<std::string> CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::ParameterNames(
     const std::string &prefix)const
 {
   try
   {
-    std::vector<std::string> names;
-    names.push_back(prefix+"lora_a.weight");
-    names.push_back(prefix+"lora_b.weight");
+    std::vector<std::string> names=BaseLayer().ParameterNames(prefix);
+    names.push_back(prefix+g_caif_name_lora_a+"."+g_caif_name_weight);
+    names.push_back(prefix+g_caif_name_lora_b+"."+g_caif_name_weight);
     return names;
   }
   CAIF_CATCH_BLOCK()
 }
+
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::FrozenTensorCount()const
+{
+  try
+  {
+    return BaseLayer().FrozenTensorCount();
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::FrozenTensorFP32(size_t index)const
+{
+  try
+  {
+    return BaseLayer().FrozenTensorFP32(index);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+std::vector<std::string> CAIF_DeviceLoRAAdapter<ComputeT,StorageT>::FrozenTensorNames(
+    const std::string &prefix)const
+{
+  try
+  {
+    return BaseLayer().FrozenTensorNames(prefix);
+  }
+  CAIF_CATCH_BLOCK()
+}
+template class CAIF_DeviceLoRAAdapter<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceLoRAAdapter<float,__half>;
+template class CAIF_DeviceLoRAAdapter<float,__nv_bfloat16>;
+template class CAIF_DeviceLoRAAdapter<__half,float>;
+template class CAIF_DeviceLoRAAdapter<__half,__half>;
+template class CAIF_DeviceLoRAAdapter<__half,__nv_bfloat16>;
+template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,float>;
+template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,__half>;
+template class CAIF_DeviceLoRAAdapter<__nv_bfloat16,__nv_bfloat16>;
+#endif
+
+}//end instance namespace

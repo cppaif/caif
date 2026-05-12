@@ -155,7 +155,13 @@
 # ===========================================================================
 
 cmake_minimum_required(VERSION 3.18)
-project(caif VERSION 1.0.0 LANGUAGES CXX)
+project(caif VERSION 0.2.0 LANGUAGES CXX)
+# Pre-release tag appended to PROJECT_VERSION for display / packaging.
+# The numeric PROJECT_VERSION above stays strictly numeric so it can stamp
+# the libcaif.so SOVERSION; the full release string with the pre-release
+# suffix lives in CAIF_VERSION_STRING for callers / display.
+set(CAIF_VERSION_PRERELEASE "alpha")
+set(CAIF_VERSION_STRING "${PROJECT_VERSION}-${CAIF_VERSION_PRERELEASE}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

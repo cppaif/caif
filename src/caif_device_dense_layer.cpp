@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "caif_device_dense_layer.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_host_tensor.h"
 #include "caif_exception.h"
 #include <random>
@@ -23,73 +23,77 @@
 namespace instance
 {
 
-CAIF_DeviceDenseLayer::CAIF_DeviceDenseLayer(uint32_t input_size,
-                                           uint32_t output_size,
-                                           CAIF_DeviceActivation_e activation,
-                                           CAIF_CudaStream &stream,
-                                           bool use_bias):CAIF_DeviceLayer(stream),
-                                                          _input_size(input_size),
-                                                          _output_size(output_size),
-                                                          _activation(activation),
-                                                          _use_bias(use_bias),
-                                                          _weights(),
-                                                          _bias(),
-                                                          _weight_grads(),
-                                                          _bias_grads(),
-                                                          _output_buffer(),
-                                                          _output_batch(0),
-                                                          _last_input(),
-                                                          _last_preactivation(),
-                                                          _last_output()
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(uint32_t input_size,
+                                                                uint32_t output_size,
+                                                                CAIF_DeviceActivation_e activation,
+                                                                CAIF_CudaStream &stream,
+                                                                bool use_bias):
+                                            CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                            _input_size(input_size),
+                                            _output_size(output_size),
+                                            _activation(activation),
+                                            _use_bias(use_bias),
+                                            _weights(),
+                                            _bias(),
+                                            _weight_grads(),
+                                            _bias_grads(),
+                                            _output_buffer(),
+                                            _output_batch(0),
+                                            _last_input(),
+                                            _last_preactivation(),
+                                            _last_output()
 {
   try
   {
     if(input_size==0||output_size==0)
     {
-      THROW_CAIFE("DeviceDenseLayer: input_size and output_size must be > 0");
+      THROW_CAIFE("CAIF_DeviceDenseLayer: input_size and output_size must be > 0");
     }
 
-    // Allocate tensors using static factory methods
-    _weights=CAIF_DeviceTensor::Uninitialized({input_size,output_size},stream);
-    _weight_grads=CAIF_DeviceTensor::Zeros({input_size,output_size},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    _weights=CAIF_DeviceTensor::Uninitialized({input_size,output_size},stream,sdt);
+    _weight_grads=CAIF_DeviceTensor::Zeros({input_size,output_size},stream,sdt);
 
     if(_use_bias==true)
     {
-      _bias=CAIF_DeviceTensor::Zeros({output_size},stream);
-      _bias_grads=CAIF_DeviceTensor::Zeros({output_size},stream);
+      _bias=CAIF_DeviceTensor::Zeros({output_size},stream,sdt);
+      _bias_grads=CAIF_DeviceTensor::Zeros({output_size},stream,sdt);
     }
 
-    // Initialize weights
     InitializeWeights(0);
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceDenseLayer::CAIF_DeviceDenseLayer(
-  CAIF_DeviceDenseLayer &&other):CAIF_DeviceLayer(std::move(other)),
-                                _input_size(other._input_size),
-                                _output_size(other._output_size),
-                                _activation(other._activation),
-                                _use_bias(other._use_bias),
-                                _weights(std::move(other._weights)),
-                                _bias(std::move(other._bias)),
-                                _weight_grads(std::move(other._weight_grads)),
-                                _bias_grads(std::move(other._bias_grads)),
-                                _output_buffer(std::move(other._output_buffer)),
-                                _output_batch(other._output_batch),
-                                _last_input(std::move(other._last_input)),
-                                _last_preactivation(std::move(other._last_preactivation)),
-                                _last_output(std::move(other._last_output))
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(CAIF_DeviceDenseLayer &&other):
+                              CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                              _input_size(other._input_size),
+                              _output_size(other._output_size),
+                              _activation(other._activation),
+                              _use_bias(other._use_bias),
+                              _weights(std::move(other._weights)),
+                              _bias(std::move(other._bias)),
+                              _weight_grads(std::move(other._weight_grads)),
+                              _bias_grads(std::move(other._bias_grads)),
+                              _output_buffer(std::move(other._output_buffer)),
+                              _output_batch(other._output_batch),
+                              _last_input(std::move(other._last_input)),
+                              _last_preactivation(std::move(other._last_preactivation)),
+                              _last_output(std::move(other._last_output))
 {
 }
 
-CAIF_DeviceDenseLayer &CAIF_DeviceDenseLayer::operator=(CAIF_DeviceDenseLayer &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceDenseLayer<ComputeT,StorageT> &
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::operator=(CAIF_DeviceDenseLayer &&other)
 {
   try
   {
     if(this!=&other)
     {
-      CAIF_DeviceLayer::operator=(std::move(other));
+      CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
       _input_size=other._input_size;
       _output_size=other._output_size;
       _activation=other._activation;
@@ -109,7 +113,8 @@ CAIF_DeviceDenseLayer &CAIF_DeviceDenseLayer::operator=(CAIF_DeviceDenseLayer &&
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceDenseLayer::InitializeWeights(uint32_t seed)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceDenseLayer<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
 {
   try
   {
@@ -118,44 +123,42 @@ void CAIF_DeviceDenseLayer::InitializeWeights(uint32_t seed)
       seed=static_cast<uint32_t>(std::time(nullptr));
     }
 
-    // Xavier/Glorot initialization: scale = sqrt(2 / (fan_in + fan_out))
     const float scale=std::sqrt(2.0f/static_cast<float>(_input_size+_output_size));
-
     std::mt19937 gen(seed);
     std::normal_distribution<float> dist(0.0f,scale);
 
-    // Generate weights on host then upload
     const size_t weight_count=static_cast<size_t>(_input_size)*_output_size;
     std::vector<float> host_weights(weight_count);
     for(size_t i=0;i<weight_count;++i)
     {
       host_weights[i]=dist(gen);
     }
-    _weights.CopyFromHost(host_weights.data(),weight_count);
+    Weights().CopyFromHostFp32(host_weights.data(),weight_count);
 
-    // Initialize bias to zero
     if(_use_bias==true)
     {
-      _bias.Fill(0.0f);
+      _bias.FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceDenseLayer::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceDenseLayer<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _weight_grads.Fill(0.0f);
+    _weight_grads.FillZero();
     if(_use_bias==true)
     {
-      _bias_grads.Fill(0.0f);
+      _bias_grads.FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceDenseLayer::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceDenseLayer<ComputeT,StorageT>::TotalParameterCount()const
 {
   try
   {
@@ -169,7 +172,8 @@ size_t CAIF_DeviceDenseLayer::TotalParameterCount()const
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceDenseLayer::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensorCount()const
 {
   try
   {
@@ -182,7 +186,8 @@ size_t CAIF_DeviceDenseLayer::ParameterTensorCount()const
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceDenseLayer::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
   try
   {
@@ -194,12 +199,14 @@ CAIF_DeviceTensor &CAIF_DeviceDenseLayer::ParameterTensor(size_t index)
     {
       return _bias;
     }
-    THROW_CAIFE("DeviceDenseLayer::ParameterTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceDenseLayer::ParameterTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceDenseLayer::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
   try
   {
@@ -211,12 +218,13 @@ const CAIF_DeviceTensor &CAIF_DeviceDenseLayer::ParameterTensor(size_t index)con
     {
       return _bias;
     }
-    THROW_CAIFE("DeviceDenseLayer::ParameterTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceDenseLayer::ParameterTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceDenseLayer::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &CAIF_DeviceDenseLayer<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   try
   {
@@ -228,12 +236,14 @@ CAIF_DeviceTensor &CAIF_DeviceDenseLayer::GradientTensor(size_t index)
     {
       return _bias_grads;
     }
-    THROW_CAIFE("DeviceDenseLayer::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceDenseLayer::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceDenseLayer::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
   try
   {
@@ -245,12 +255,13 @@ const CAIF_DeviceTensor &CAIF_DeviceDenseLayer::GradientTensor(size_t index)cons
     {
       return _bias_grads;
     }
-    THROW_CAIFE("DeviceDenseLayer::GradientTensor: index out of range");
+    THROW_CAIFE("CAIF_DeviceDenseLayer::GradientTensor: index out of range");
   }
   CAIF_CATCH_BLOCK()
 }
 
-std::string CAIF_DeviceDenseLayer::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceDenseLayer<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -259,7 +270,9 @@ std::string CAIF_DeviceDenseLayer::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceDenseLayer::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
@@ -274,91 +287,89 @@ std::vector<std::string> CAIF_DeviceDenseLayer::ParameterNames(const std::string
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceDenseLayer::Forward(const CAIF_DeviceTensor &input,bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                      CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceDenseLayer: layer has been moved from");
-    }
-
-    const auto &shape=input.Shape();
+    const std::vector<uint32_t> &shape=input.Shape();
     if(shape.size()!=2)
     {
-      THROW_CAIFE("DeviceDenseLayer::Forward: input must be 2D [batch x features]");
+      THROW_CAIFE("CAIF_DeviceDenseLayer::Forward: input must be 2D [batch x features]");
     }
     if(shape[1]!=_input_size)
     {
-      THROW_CAIFE("DeviceDenseLayer::Forward: input features must match input_size");
+      THROW_CAIFE("CAIF_DeviceDenseLayer::Forward: input features must match input_size");
     }
 
-    const uint32_t batch_size=shape[0];
+    AssertInputDtype(input);
 
-    // Ensure output buffer is allocated
+    const uint32_t batch_size=shape[0];
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
+
     if(batch_size!=_output_batch)
     {
-      _output_buffer=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},*_stream);
+      _output_buffer=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},ctx.Stream(),sdt);
       _output_batch=batch_size;
     }
 
-    // Compute linear = input * weights + bias (fused) or just input * weights
     if(_use_bias==true)
     {
-      CAIF_DeviceOps::MatMulBias(input,_weights,_bias,_output_buffer,_stream->Handle());
+      CAIF_Ops::MatMulBias(input,_weights,_bias,_output_buffer,ctx.Stream().Handle(),ctx,cdt);
     }
     else
     {
-      CAIF_DeviceOps::MatMul(input,_weights,_output_buffer);
+      CAIF_Ops::MatMul(input,_weights,_output_buffer,ctx,cdt);
     }
 
-    // Cache for backward if training
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _last_input=input.Clone();
       _last_preactivation=_output_buffer.Clone();
     }
 
-    // Apply activation
     if(_activation==CAIF_DeviceActivation_e::None)
     {
       return _output_buffer.Clone();
     }
 
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},*_stream);
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},
+                                                              ctx.Stream(),sdt);
 
     switch(_activation)
     {
       case CAIF_DeviceActivation_e::None:
         break;
       case CAIF_DeviceActivation_e::ReLU:
-        CAIF_DeviceOps::ReLU(_output_buffer,output);
+        CAIF_Ops::ReLU(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::Sigmoid:
-        CAIF_DeviceOps::Sigmoid(_output_buffer,output);
+        CAIF_Ops::Sigmoid(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::Tanh:
-        CAIF_DeviceOps::Tanh(_output_buffer,output);
+        CAIF_Ops::Tanh(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::Softmax:
-        CAIF_DeviceOps::Softmax(_output_buffer,output);
+        CAIF_Ops::Softmax(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::LeakyReLU:
-        CAIF_DeviceOps::LeakyReLU(_output_buffer,output);
+        CAIF_Ops::LeakyReLU(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::ELU:
-        CAIF_DeviceOps::ELU(_output_buffer,output);
+        CAIF_Ops::ELU(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::GELU:
-        CAIF_DeviceOps::GELU(_output_buffer,output);
+        CAIF_Ops::GELU(_output_buffer,output);
         break;
       case CAIF_DeviceActivation_e::Swish:
-        CAIF_DeviceOps::Swish(_output_buffer,output);
+        CAIF_Ops::Swish(_output_buffer,output);
         break;
     }
 
-    // Cache for backward: activations that need output for backward pass
-    if(training==true)
+    if(ctx.Training()==true)
     {
       if(_activation==CAIF_DeviceActivation_e::Sigmoid||
          _activation==CAIF_DeviceActivation_e::Tanh||
@@ -375,82 +386,102 @@ CAIF_DeviceTensor CAIF_DeviceDenseLayer::Forward(const CAIF_DeviceTensor &input,
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceDenseLayer::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                       CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceDenseLayer: layer has been moved from");
-    }
     if(_last_input.IsEmpty()==true)
     {
-      THROW_CAIFE("DeviceDenseLayer::Backward: must call Forward with training=true first");
+      THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: must call Forward with training=true first");
     }
 
-    const auto &shape=grad_output.Shape();
+    const std::vector<uint32_t> &shape=grad_output.Shape();
     if(shape.size()!=2)
     {
-      THROW_CAIFE("DeviceDenseLayer::Backward: grad_output must be 2D [batch x output_size]");
+      THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: grad_output must be 2D");
     }
     if(shape[1]!=_output_size)
     {
-      THROW_CAIFE("DeviceDenseLayer::Backward: grad_output must match output_size");
+      THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: grad_output must match output_size");
     }
 
     const uint32_t batch_size=shape[0];
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
-    // Compute activation gradient
-    CAIF_DeviceTensor linear_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},*_stream);
-
-    switch(_activation)
+    CAIF_DeviceTensor linear_grad;
+    if(_activation==CAIF_DeviceActivation_e::None)
     {
-      case CAIF_DeviceActivation_e::None:
-        // Linear activation: gradient passes through unchanged
-        linear_grad=grad_output.Clone();
-        break;
-      case CAIF_DeviceActivation_e::ReLU:
-        CAIF_DeviceOps::ReLUBackward(grad_output,_last_preactivation,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::Sigmoid:
-        CAIF_DeviceOps::SigmoidBackward(grad_output,_last_output,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::Tanh:
-        CAIF_DeviceOps::TanhBackward(grad_output,_last_output,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::Softmax:
-        CAIF_DeviceOps::SoftmaxBackward(grad_output,_last_output,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::LeakyReLU:
-        CAIF_DeviceOps::LeakyReLUBackward(grad_output,_last_preactivation,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::ELU:
-        CAIF_DeviceOps::ELUBackward(grad_output,_last_preactivation,_last_output,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::GELU:
-        CAIF_DeviceOps::GELUBackward(grad_output,_last_preactivation,linear_grad);
-        break;
-      case CAIF_DeviceActivation_e::Swish:
-        CAIF_DeviceOps::SwishBackward(grad_output,_last_preactivation,_last_output,linear_grad);
-        break;
+      linear_grad=CAIF_DeviceTensor::WrapView(
+                   const_cast<void *>(grad_output.DeviceDataRaw()),
+                   {batch_size,_output_size},
+                   ctx.Stream(),
+                   grad_output.Dtype());
+    }
+    else
+    {
+      linear_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},ctx.Stream(),sdt);
+      switch(_activation)
+      {
+        case CAIF_DeviceActivation_e::None:
+          break;
+        case CAIF_DeviceActivation_e::ReLU:
+          CAIF_Ops::ReLUBackward(grad_output,_last_preactivation,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::Sigmoid:
+          CAIF_Ops::SigmoidBackward(grad_output,_last_output,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::Tanh:
+          CAIF_Ops::TanhBackward(grad_output,_last_output,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::Softmax:
+          CAIF_Ops::SoftmaxBackward(grad_output,_last_output,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::LeakyReLU:
+          CAIF_Ops::LeakyReLUBackward(grad_output,_last_preactivation,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::ELU:
+          CAIF_Ops::ELUBackward(grad_output,_last_preactivation,_last_output,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::GELU:
+          CAIF_Ops::GELUBackward(grad_output,_last_preactivation,linear_grad);
+          break;
+        case CAIF_DeviceActivation_e::Swish:
+          CAIF_Ops::SwishBackward(grad_output,_last_preactivation,_last_output,linear_grad);
+          break;
+      }
     }
 
-    // Compute weight gradients: dW = input^T * linear_grad
-    CAIF_DeviceOps::MatMulTransposeA(_last_input,linear_grad,_weight_grads);
+    CAIF_Ops::MatMulTransposeA(_last_input,linear_grad,_weight_grads,ctx,cdt);
 
-    // Compute bias gradients: db = sum over batch of linear_grad
     if(_use_bias==true)
     {
-      CAIF_DeviceOps::BiasGradient(linear_grad,_bias_grads);
+      CAIF_Ops::BiasGradient(linear_grad,_bias_grads);
     }
 
-    // Compute input gradient: dX = linear_grad * weights^T
-    CAIF_DeviceTensor input_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_input_size},*_stream);
-    CAIF_DeviceOps::MatMulTransposeB(linear_grad,_weights,input_grad);
+    CAIF_DeviceTensor input_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_input_size},
+                                                                    ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeB(linear_grad,_weights,input_grad,ctx,cdt);
 
     return input_grad;
   }
   CAIF_CATCH_BLOCK()
 }
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceDenseLayer<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceDenseLayer<float,__half>;
+template class CAIF_DeviceDenseLayer<float,__nv_bfloat16>;
+template class CAIF_DeviceDenseLayer<__half,float>;
+template class CAIF_DeviceDenseLayer<__half,__half>;
+template class CAIF_DeviceDenseLayer<__half,__nv_bfloat16>;
+template class CAIF_DeviceDenseLayer<__nv_bfloat16,float>;
+template class CAIF_DeviceDenseLayer<__nv_bfloat16,__half>;
+template class CAIF_DeviceDenseLayer<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

@@ -17,18 +17,23 @@
 // Device-resident Vision Transformer implementation
 //------------------------------------------------------------------------------
 #include "caif_device_vit_model.h"
-#include "caif_device_ops.h"
-#include <cstring>
+#include "caif_ops.h"
+#include "caif_constants.h"
 #include "caif_exception.h"
+
+#include <cstring>
 #include <cmath>
 
 namespace instance
 {
 
-CAIF_DeviceViTModel::CAIF_DeviceViTModel(const Config_t &config,
-                                       CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
-                                       _config(config),
-                                       _cached_batch(0)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(const Config_t &config,
+                                                             CAIF_CudaStream &stream):
+                                                             CAIF_DeviceContainer(stream),
+                                                             _config(config),
+                                                             _cached_cls_output(),
+                                                             _cached_batch(0)
 {
   try
   {
@@ -50,32 +55,31 @@ CAIF_DeviceViTModel::CAIF_DeviceViTModel(const Config_t &config,
       THROW_CAIFE("DeviceViTModel: dim must be divisible by num_heads");
     }
 
-    // Create patch embedding (with CLS token)
-    CAIF_DevicePatchEmbedding::Config_t patch_config;
+    // [0] Patch embedding (with CLS token)
+    typename CAIF_DevicePatchEmbedding<ComputeT,StorageT>::Config_t patch_config;
     patch_config.image_height=config.image_height;
     patch_config.image_width=config.image_width;
     patch_config.channels=config.channels;
     patch_config.patch_size=config.patch_size;
     patch_config.dim=config.dim;
-    patch_config.use_cls_token=true;  // ViT uses CLS token
-    _patch_embedding=std::make_unique<CAIF_DevicePatchEmbedding>(patch_config,stream);
+    patch_config.use_cls_token=true;
+    AddLayer(std::make_unique<CAIF_DevicePatchEmbedding<ComputeT,StorageT>>(patch_config,stream));
 
-    // Compute sequence length (num_patches + 1 for CLS)
+    // [1] Positional encoding — ViT uses learnable position embeddings
     const uint32_t num_patches_h=config.image_height/config.patch_size;
     const uint32_t num_patches_w=config.image_width/config.patch_size;
-    const uint32_t seq_len=num_patches_h*num_patches_w+1;
+    const uint32_t seq_len=num_patches_h*num_patches_w+1;  // +1 for CLS
 
-    // Create positional encoding
-    CAIF_DevicePositionalEncoding::Config_t pe_config;
+    typename CAIF_DevicePositionalEncoding<ComputeT,StorageT>::Config_t pe_config;
     pe_config.max_seq_len=seq_len;
     pe_config.dim=config.dim;
-    pe_config.mode=PositionalEncodingMode_e::Learned;  // ViT uses learnable position embeddings
-    _positional_encoding=std::make_unique<CAIF_DevicePositionalEncoding>(pe_config,stream);
+    pe_config.mode=PositionalEncodingMode_e::Learned;
+    AddLayer(std::make_unique<CAIF_DevicePositionalEncoding<ComputeT,StorageT>>(pe_config,stream));
 
-    // Create transformer blocks
+    // [2 .. 1+N] Transformer blocks
     for(uint32_t i=0;i<config.num_layers;++i)
     {
-      CAIF_DeviceTransformerBlock::TransformerBlockConfig_t block_config;
+      typename CAIF_DeviceTransformerBlock<ComputeT,StorageT>::TransformerBlockConfig_t block_config;
       block_config.dim=config.dim;
       block_config.num_heads=config.num_heads;
       block_config.num_kv_heads=config.num_heads;  // Standard MHA for ViT
@@ -83,65 +87,56 @@ CAIF_DeviceViTModel::CAIF_DeviceViTModel(const Config_t &config,
       block_config.causal=false;  // ViT is bidirectional
       block_config.use_rope=config.use_rope;
       block_config.rope_base=config.rope_base;
+      block_config.rope_style=config.rope_style;
       block_config.dropout_rate=config.dropout_rate;
-
-      _transformer_blocks.push_back(
-        std::make_unique<CAIF_DeviceTransformerBlock>(block_config,stream));
+      AddLayer(std::make_unique<CAIF_DeviceTransformerBlock<ComputeT,StorageT>>(block_config,stream));
     }
 
-    // Create final layer norm
-    constexpr float kLayerNormEps=1e-6f;
-    _final_norm=std::make_unique<CAIF_DeviceLayerNorm>(config.dim,stream,kLayerNormEps);
+    // [2+N] Final layer norm
+    AddLayer(std::make_unique<CAIF_DeviceLayerNorm<ComputeT,StorageT>>(config.dim,
+                                                                        stream,
+                                                                        g_caif_vit_layernorm_eps));
 
-    // Create classification head (CLS token -> num_classes)
-    CAIF_DeviceLinearHead::Config_t head_config;
+    // [3+N] Classification head (CLS token -> num_classes)
+    typename CAIF_DeviceLinearHead<ComputeT,StorageT>::Config_t head_config;
     head_config.input_dim=config.dim;
     head_config.output_dim=config.num_classes;
     head_config.use_bias=true;
-    _classification_head=std::make_unique<CAIF_DeviceLinearHead>(head_config,stream);
+    AddLayer(std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(head_config,stream));
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceViTModel::CAIF_DeviceViTModel(CAIF_DeviceViTModel &&other):CAIF_DeviceLayer(std::move(other)),
-                                       _config(other._config),
-                                       _patch_embedding(std::move(other._patch_embedding)),
-                                       _positional_encoding(std::move(other._positional_encoding)),
-                                       _transformer_blocks(std::move(other._transformer_blocks)),
-                                       _final_norm(std::move(other._final_norm)),
-                                       _classification_head(std::move(other._classification_head)),
-                                       _cached_cls_output(std::move(other._cached_cls_output)),
-                                       _cached_batch(other._cached_batch)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(CAIF_DeviceViTModel &&other):
+                                  CAIF_DeviceContainer(std::move(other)),
+                                  _config(other._config),
+                                  _cached_cls_output(std::move(other._cached_cls_output)),
+                                  _cached_batch(other._cached_batch)
 {
 }
 
-CAIF_DeviceViTModel &CAIF_DeviceViTModel::operator=(CAIF_DeviceViTModel &&other)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceViTModel<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::operator=(CAIF_DeviceViTModel &&other)
 {
   if(this!=&other)
   {
-    CAIF_DeviceLayer::operator=(std::move(other));
+    CAIF_DeviceContainer::operator=(std::move(other));
     _config=other._config;
-    _patch_embedding=std::move(other._patch_embedding);
-    _positional_encoding=std::move(other._positional_encoding);
-    _transformer_blocks=std::move(other._transformer_blocks);
-    _final_norm=std::move(other._final_norm);
-    _classification_head=std::move(other._classification_head);
     _cached_cls_output=std::move(other._cached_cls_output);
     _cached_batch=other._cached_batch;
   }
   return *this;
 }
 
-CAIF_DeviceTensor CAIF_DeviceViTModel::Forward(const CAIF_DeviceTensor &input,
-                                              bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceViTModel<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                     CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceViTModel: layer has been moved from");
-    }
-
     // Validate input shape [batch, H, W, C]
     const auto &shape=input.Shape();
     if(shape.size()!=4)
@@ -161,325 +156,127 @@ CAIF_DeviceTensor CAIF_DeviceViTModel::Forward(const CAIF_DeviceTensor &input,
     _cached_batch=batch;
 
     // Step 1: Patch embedding -> [batch, seq_len, dim]
-    CAIF_DeviceTensor x=_patch_embedding->Forward(input,training);
+    CAIF_DeviceTensor x=Layer(PatchEmbeddingSlot()).Forward(input,ctx);
 
     // Step 2: Add positional encoding
-    x=_positional_encoding->Forward(x,training);
+    x=Layer(PositionalEncodingSlot()).Forward(x,ctx);
 
     // Step 3: Pass through transformer blocks
-    for(auto &block:_transformer_blocks)
+    for(uint32_t i=0;i<_config.num_layers;++i)
     {
-      x=block->Forward(x,training);
+      x=Layer(FirstBlockSlot()+i).Forward(x,ctx);
     }
 
     // Step 4: Final layer norm
-    x=_final_norm->Forward(x,training);
+    x=Layer(FinalNormSlot()).Forward(x,ctx);
 
     // Step 5: Extract CLS token (position 0) -> [batch, dim]
-    // x is [batch, seq_len, dim], we need [batch, 1, dim] then squeeze to [batch, dim]
+    constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
     const uint32_t seq_len=SequenceLength();
     const uint32_t dim=_config.dim;
 
-    // Copy just the first position (CLS token)
-    CAIF_DeviceTensor cls_output=CAIF_DeviceTensor::Uninitialized(
-                                  {batch,dim},*_stream);
+    CAIF_DeviceTensor cls_output=CAIF_DeviceTensor::Uninitialized({batch,dim},ctx.Stream(),sd);
 
-    // x is contiguous [batch, seq_len, dim], CLS is at positions [b*seq_len*dim]
+    // Pointer arithmetic and memcpy size must follow StorageT, not fp32.
+    StorageT *cls_ptr=cls_output.template DevicePtr<StorageT>();
+    const StorageT *x_ptr=x.template DevicePtr<StorageT>();
     for(uint32_t b=0;b<batch;++b)
     {
       const size_t src_offset=b*seq_len*dim;
       const size_t dst_offset=b*dim;
 #ifdef USE_CAIF_CUDA
-      cudaMemcpyAsync(cls_output.DevicePtr()+dst_offset,
-                      x.DevicePtr()+src_offset,
-                      dim*sizeof(float),
+      cudaMemcpyAsync(cls_ptr+dst_offset,
+                      x_ptr+src_offset,
+                      dim*sizeof(StorageT),
                       cudaMemcpyDeviceToDevice,
-                      _stream->Handle());
+                      ctx.Stream().Handle());
 #else
-      std::memcpy(cls_output.DevicePtr()+dst_offset,
-                  x.DevicePtr()+src_offset,
-                  dim*sizeof(float));
+      std::memcpy(cls_ptr+dst_offset,
+                  x_ptr+src_offset,
+                  dim*sizeof(StorageT));
 #endif
     }
 
-    // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_cls_output=cls_output.Clone();
     }
 
     // Step 6: Classification head -> [batch, num_classes]
-    CAIF_DeviceTensor logits=_classification_head->Forward(cls_output,training);
+    CAIF_DeviceTensor logits=Layer(ClassificationHeadSlot()).Forward(cls_output,ctx);
 
     return logits;
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceViTModel::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceViTModel<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                      CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceViTModel: layer has been moved from");
-    }
-
+    constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
     const uint32_t batch=_cached_batch;
     const uint32_t seq_len=SequenceLength();
     const uint32_t dim=_config.dim;
 
     // Step 1: Backward through classification head
-    CAIF_DeviceTensor grad_cls=_classification_head->Backward(grad_output);
+    CAIF_DeviceTensor grad_cls=Layer(ClassificationHeadSlot()).Backward(grad_output,ctx);
 
-    // Step 2: Expand CLS gradient to full sequence
-    // grad_cls is [batch, dim], need [batch, seq_len, dim] with zeros except at position 0
-    CAIF_DeviceTensor grad_seq=CAIF_DeviceTensor::Zeros({batch,seq_len,dim},*_stream);
+    // Step 2: Expand CLS gradient to full sequence ([batch, seq_len, dim])
+    CAIF_DeviceTensor grad_seq=CAIF_DeviceTensor::Zeros({batch,seq_len,dim},ctx.Stream(),sd);
 
+    // StorageT-typed pointer arithmetic so the memcpy size and stride
+    // match the actual element size (fp16/bf16 = 2 bytes, fp32 = 4 bytes).
+    StorageT *gs_ptr=grad_seq.template DevicePtr<StorageT>();
+    const StorageT *gc_ptr=grad_cls.template DevicePtr<StorageT>();
     for(uint32_t b=0;b<batch;++b)
     {
       const size_t src_offset=b*dim;
       const size_t dst_offset=b*seq_len*dim;
 #ifdef USE_CAIF_CUDA
-      cudaMemcpyAsync(grad_seq.DevicePtr()+dst_offset,
-                      grad_cls.DevicePtr()+src_offset,
-                      dim*sizeof(float),
+      cudaMemcpyAsync(gs_ptr+dst_offset,
+                      gc_ptr+src_offset,
+                      dim*sizeof(StorageT),
                       cudaMemcpyDeviceToDevice,
-                      _stream->Handle());
+                      ctx.Stream().Handle());
 #else
-      std::memcpy(grad_seq.DevicePtr()+dst_offset,
-                  grad_cls.DevicePtr()+src_offset,
-                  dim*sizeof(float));
+      std::memcpy(gs_ptr+dst_offset,
+                  gc_ptr+src_offset,
+                  dim*sizeof(StorageT));
 #endif
     }
 
     // Step 3: Backward through final norm
-    CAIF_DeviceTensor grad_x=_final_norm->Backward(grad_seq);
+    CAIF_DeviceTensor grad_x=Layer(FinalNormSlot()).Backward(grad_seq,ctx);
 
     // Step 4: Backward through transformer blocks (in reverse order)
-    for(int i=static_cast<int>(_transformer_blocks.size())-1;i>=0;--i)
+    for(int i=static_cast<int>(_config.num_layers)-1;i>=0;--i)
     {
-      grad_x=_transformer_blocks[static_cast<size_t>(i)]->Backward(grad_x);
+      grad_x=Layer(FirstBlockSlot()+static_cast<size_t>(i)).Backward(grad_x,ctx);
     }
 
     // Step 5: Backward through positional encoding
-    grad_x=_positional_encoding->Backward(grad_x);
+    grad_x=Layer(PositionalEncodingSlot()).Backward(grad_x,ctx);
 
     // Step 6: Backward through patch embedding
-    CAIF_DeviceTensor grad_input=_patch_embedding->Backward(grad_x);
+    CAIF_DeviceTensor grad_input=Layer(PatchEmbeddingSlot()).Backward(grad_x,ctx);
 
     return grad_input;
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceViTModel::ZeroGradients()
-{
-  try
-  {
-    _patch_embedding->ZeroGradients();
-    _positional_encoding->ZeroGradients();
-    for(auto &block:_transformer_blocks)
-    {
-      block->ZeroGradients();
-    }
-    _final_norm->ZeroGradients();
-    _classification_head->ZeroGradients();
-  }
-  CAIF_CATCH_BLOCK()
-}
-
-size_t CAIF_DeviceViTModel::ParameterTensorCount()const
-{
-  size_t count=0;
-  count+=_patch_embedding->ParameterTensorCount();
-  count+=_positional_encoding->ParameterTensorCount();
-  for(const auto &block:_transformer_blocks)
-  {
-    count+=block->ParameterTensorCount();
-  }
-  count+=_final_norm->ParameterTensorCount();
-  count+=_classification_head->ParameterTensorCount();
-  return count;
-}
-
-CAIF_DeviceTensor &CAIF_DeviceViTModel::ParameterTensor(size_t index)
-{
-  size_t offset=0;
-
-  // Patch embedding
-  size_t patch_count=_patch_embedding->ParameterTensorCount();
-  if(index<offset+patch_count)
-  {
-    return _patch_embedding->ParameterTensor(index-offset);
-  }
-  offset+=patch_count;
-
-  // Positional encoding
-  size_t pe_count=_positional_encoding->ParameterTensorCount();
-  if(index<offset+pe_count)
-  {
-    return _positional_encoding->ParameterTensor(index-offset);
-  }
-  offset+=pe_count;
-
-  // Transformer blocks
-  for(auto &block:_transformer_blocks)
-  {
-    size_t block_count=block->ParameterTensorCount();
-    if(index<offset+block_count)
-    {
-      return block->ParameterTensor(index-offset);
-    }
-    offset+=block_count;
-  }
-
-  // Final norm
-  size_t norm_count=_final_norm->ParameterTensorCount();
-  if(index<offset+norm_count)
-  {
-    return _final_norm->ParameterTensor(index-offset);
-  }
-  offset+=norm_count;
-
-  // Classification head
-  return _classification_head->ParameterTensor(index-offset);
-}
-
-const CAIF_DeviceTensor &CAIF_DeviceViTModel::ParameterTensor(size_t index)const
-{
-  size_t offset=0;
-
-  size_t patch_count=_patch_embedding->ParameterTensorCount();
-  if(index<offset+patch_count)
-  {
-    return _patch_embedding->ParameterTensor(index-offset);
-  }
-  offset+=patch_count;
-
-  size_t pe_count=_positional_encoding->ParameterTensorCount();
-  if(index<offset+pe_count)
-  {
-    return _positional_encoding->ParameterTensor(index-offset);
-  }
-  offset+=pe_count;
-
-  for(const auto &block:_transformer_blocks)
-  {
-    size_t block_count=block->ParameterTensorCount();
-    if(index<offset+block_count)
-    {
-      return block->ParameterTensor(index-offset);
-    }
-    offset+=block_count;
-  }
-
-  size_t norm_count=_final_norm->ParameterTensorCount();
-  if(index<offset+norm_count)
-  {
-    return _final_norm->ParameterTensor(index-offset);
-  }
-  offset+=norm_count;
-
-  return _classification_head->ParameterTensor(index-offset);
-}
-
-CAIF_DeviceTensor &CAIF_DeviceViTModel::GradientTensor(size_t index)
-{
-  size_t offset=0;
-
-  size_t patch_count=_patch_embedding->ParameterTensorCount();
-  if(index<offset+patch_count)
-  {
-    return _patch_embedding->GradientTensor(index-offset);
-  }
-  offset+=patch_count;
-
-  size_t pe_count=_positional_encoding->ParameterTensorCount();
-  if(index<offset+pe_count)
-  {
-    return _positional_encoding->GradientTensor(index-offset);
-  }
-  offset+=pe_count;
-
-  for(auto &block:_transformer_blocks)
-  {
-    size_t block_count=block->ParameterTensorCount();
-    if(index<offset+block_count)
-    {
-      return block->GradientTensor(index-offset);
-    }
-    offset+=block_count;
-  }
-
-  size_t norm_count=_final_norm->ParameterTensorCount();
-  if(index<offset+norm_count)
-  {
-    return _final_norm->GradientTensor(index-offset);
-  }
-  offset+=norm_count;
-
-  return _classification_head->GradientTensor(index-offset);
-}
-
-const CAIF_DeviceTensor &CAIF_DeviceViTModel::GradientTensor(size_t index)const
-{
-  size_t offset=0;
-
-  size_t patch_count=_patch_embedding->ParameterTensorCount();
-  if(index<offset+patch_count)
-  {
-    return _patch_embedding->GradientTensor(index-offset);
-  }
-  offset+=patch_count;
-
-  size_t pe_count=_positional_encoding->ParameterTensorCount();
-  if(index<offset+pe_count)
-  {
-    return _positional_encoding->GradientTensor(index-offset);
-  }
-  offset+=pe_count;
-
-  for(const auto &block:_transformer_blocks)
-  {
-    size_t block_count=block->ParameterTensorCount();
-    if(index<offset+block_count)
-    {
-      return block->GradientTensor(index-offset);
-    }
-    offset+=block_count;
-  }
-
-  size_t norm_count=_final_norm->ParameterTensorCount();
-  if(index<offset+norm_count)
-  {
-    return _final_norm->GradientTensor(index-offset);
-  }
-  offset+=norm_count;
-
-  return _classification_head->GradientTensor(index-offset);
-}
-
-size_t CAIF_DeviceViTModel::TotalParameterCount()const
-{
-  size_t total=0;
-  total+=_patch_embedding->TotalParameterCount();
-  total+=_positional_encoding->TotalParameterCount();
-  for(const auto &block:_transformer_blocks)
-  {
-    total+=block->TotalParameterCount();
-  }
-  total+=_final_norm->TotalParameterCount();
-  total+=_classification_head->TotalParameterCount();
-  return total;
-}
-
-std::string CAIF_DeviceViTModel::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceViTModel<ComputeT,StorageT>::Description()const
 {
   try
   {
     const uint32_t num_patches=NumPatches();
-    return "ViT(img="+std::to_string(_config.image_height)+"x"+
+    return std::string(g_caif_description_vit_prefix)+
+           "(img="+std::to_string(_config.image_height)+"x"+
            std::to_string(_config.image_width)+
            ",patch="+std::to_string(_config.patch_size)+
            ",patches="+std::to_string(num_patches)+
@@ -491,71 +288,140 @@ std::string CAIF_DeviceViTModel::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceViTModel::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceViTModel<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
     std::vector<std::string> names;
+    std::vector<std::string> slot_names;
 
     // Patch embedding
-    auto patch_names=_patch_embedding->ParameterNames(prefix+"embeddings.patch_embeddings.");
-    names.insert(names.end(),patch_names.begin(),patch_names.end());
+    slot_names=Layer(PatchEmbeddingSlot()).ParameterNames(prefix+g_caif_name_vit_patch_embeddings);
+    names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Positional encoding
-    auto pe_names=_positional_encoding->ParameterNames(prefix+"embeddings.position_embeddings.");
-    names.insert(names.end(),pe_names.begin(),pe_names.end());
+    slot_names=Layer(PositionalEncodingSlot()).ParameterNames(prefix+g_caif_name_vit_position_embeddings);
+    names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Transformer blocks
-    for(size_t i=0;i<_transformer_blocks.size();++i)
+    for(uint32_t i=0;i<_config.num_layers;++i)
     {
-      std::string block_prefix=prefix+"encoder.layer."+std::to_string(i)+".";
-      auto block_names=_transformer_blocks[i]->ParameterNames(block_prefix);
-      names.insert(names.end(),block_names.begin(),block_names.end());
+      std::string block_prefix=prefix+g_caif_name_vit_encoder_layer+std::to_string(i)+".";
+      slot_names=Layer(FirstBlockSlot()+i).ParameterNames(block_prefix);
+      names.insert(names.end(),slot_names.begin(),slot_names.end());
     }
 
     // Final norm
-    auto norm_names=_final_norm->ParameterNames(prefix+"layernorm.");
-    names.insert(names.end(),norm_names.begin(),norm_names.end());
+    slot_names=Layer(FinalNormSlot()).ParameterNames(prefix+g_caif_name_vit_layernorm);
+    names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Classification head
-    auto head_names=_classification_head->ParameterNames(prefix+"classifier.");
-    names.insert(names.end(),head_names.begin(),head_names.end());
+    slot_names=Layer(ClassificationHeadSlot()).ParameterNames(prefix+g_caif_name_vit_classifier);
+    names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     return names;
   }
   CAIF_CATCH_BLOCK()
 }
 
-uint32_t CAIF_DeviceViTModel::NumPatches()const
+template<typename ComputeT,typename StorageT>
+uint32_t CAIF_DeviceViTModel<ComputeT,StorageT>::NumPatches()const
 {
   const uint32_t num_patches_h=_config.image_height/_config.patch_size;
   const uint32_t num_patches_w=_config.image_width/_config.patch_size;
   return num_patches_h*num_patches_w;
 }
 
-uint32_t CAIF_DeviceViTModel::SequenceLength()const
+template<typename ComputeT,typename StorageT>
+uint32_t CAIF_DeviceViTModel<ComputeT,StorageT>::SequenceLength()const
 {
   return NumPatches()+1;  // +1 for CLS token
 }
 
-void CAIF_DeviceViTModel::InitializeWeights(uint32_t seed)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceViTModel<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
 {
   try
   {
-    // Each sublayer initializes its own weights
-    // For reproducibility, we could pass different seeds to each
-    (void)seed;  // Currently each sublayer uses its default initialization
+    static_cast<void>(seed);  // Each sublayer uses its own default initialization
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTransformerBlock &CAIF_DeviceViTModel::TransformerBlock(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DevicePatchEmbedding<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::PatchEmbedding()
 {
-  if(index>=_transformer_blocks.size())
+  try
   {
-    THROW_CAIFE("DeviceViTModel: transformer block index out of range");
+    return static_cast<CAIF_DevicePatchEmbedding<ComputeT,StorageT> &>(Layer(PatchEmbeddingSlot()));
   }
-  return *_transformer_blocks[index];
+  CAIF_CATCH_BLOCK()
 }
+
+template<typename ComputeT,typename StorageT>
+CAIF_DevicePositionalEncoding<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::PositionalEncoding()
+{
+  try
+  {
+    return static_cast<CAIF_DevicePositionalEncoding<ComputeT,StorageT> &>(
+              Layer(PositionalEncodingSlot()));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTransformerBlock<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::TransformerBlock(size_t index)
+{
+  try
+  {
+    if(index>=_config.num_layers)
+    {
+      THROW_CAIFE("DeviceViTModel: transformer block index out of range");
+    }
+    return static_cast<CAIF_DeviceTransformerBlock<ComputeT,StorageT> &>(
+              Layer(FirstBlockSlot()+index));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLayerNorm<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::FinalNorm()
+{
+  try
+  {
+    return static_cast<CAIF_DeviceLayerNorm<ComputeT,StorageT> &>(Layer(FinalNormSlot()));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceLinearHead<ComputeT,StorageT> &
+CAIF_DeviceViTModel<ComputeT,StorageT>::ClassificationHead()
+{
+  try
+  {
+    return static_cast<CAIF_DeviceLinearHead<ComputeT,StorageT> &>(
+              Layer(ClassificationHeadSlot()));
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+template class CAIF_DeviceViTModel<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceViTModel<float,__half>;
+template class CAIF_DeviceViTModel<float,__nv_bfloat16>;
+template class CAIF_DeviceViTModel<__half,float>;
+template class CAIF_DeviceViTModel<__half,__half>;
+template class CAIF_DeviceViTModel<__half,__nv_bfloat16>;
+template class CAIF_DeviceViTModel<__nv_bfloat16,float>;
+template class CAIF_DeviceViTModel<__nv_bfloat16,__half>;
+template class CAIF_DeviceViTModel<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

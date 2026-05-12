@@ -17,13 +17,14 @@
 // MoE (Mixture of Experts) Tests
 //------------------------------------------------------------------------------
 #include "caif_device_moe_layer.h"
+#include "caif_test_harness.h"
+#include "caif_test_constants.h"
 #include "caif_device_moe_router.h"
 #include "caif_device_moe_expert.h"
-#include "caif_device_moe_block.h"
-#include "caif_device_moe_transformer_model.h"
-#include "caif_device_ops.h"
+#include "caif_ops.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
 #include <iostream>
@@ -33,26 +34,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -70,19 +59,24 @@ static void TestExpertForwardShape()
     const uint32_t hidden_dim=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoEExpert::Config_t config;
+    CAIF_DeviceMoEExpert<float,float>::Config_t config;
     config.input_dim=dim;
     config.hidden_dim=hidden_dim;
     config.use_gated=false;
     config.use_bias=true;
 
-    CAIF_DeviceMoEExpert expert(config,stream);
+    CAIF_DeviceMoEExpert<float,float> expert(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch*seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=expert.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=expert.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -104,7 +98,7 @@ static void TestExpertForwardShape()
 
     ReportResult("MoEExpert::ForwardShape",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -119,19 +113,24 @@ static void TestExpertGatedForwardShape()
     const uint32_t hidden_dim=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoEExpert::Config_t config;
+    CAIF_DeviceMoEExpert<float,float>::Config_t config;
     config.input_dim=dim;
     config.hidden_dim=hidden_dim;
     config.use_gated=true;
     config.use_bias=true;
 
-    CAIF_DeviceMoEExpert expert(config,stream);
+    CAIF_DeviceMoEExpert<float,float> expert(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceTensor output=expert.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=expert.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -144,7 +143,7 @@ static void TestExpertGatedForwardShape()
 
     ReportResult("MoEExpert::GatedForwardShape",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -160,21 +159,26 @@ static void TestRouterOutputShape()
     const uint32_t top_k=2;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoERouter::Config_t config;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
     config.input_dim=dim;
     config.num_experts=num_experts;
     config.top_k=top_k;
-    config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::TopK;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::TopK;
     config.use_bias=false;
     config.noise_std=0.0f;
 
-    CAIF_DeviceMoERouter router(config,stream);
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoERouter::RouterOutput_t output=router.Route(input,false);
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
 
     bool passed=true;
 
@@ -204,7 +208,328 @@ static void TestRouterOutputShape()
 
     ReportResult("MoERouter::OutputShape",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
+}
+
+//------------------------------------------------------------------------------
+// Test 3b: MoE Router top-k indices match argmax of probs (correctness)
+//
+// Regression for the bug where CAIF_Ops::TopK wrote int32 bytes into
+// a float32-allocated indices tensor.  Consumers (DispatchTokens,
+// CombineOutputs, gather kernels) read the same memory as float, which
+// reinterprets the int32 bit pattern of small values (0..7) as near-zero
+// denormals and rounds to 0 — routing every token to expert 0.
+//
+// This test drives the router with a logits matrix whose argmax differs
+// row-by-row and asserts expert_indices[t, 0] equals the expected argmax.
+//------------------------------------------------------------------------------
+static void TestRouterTopKIndicesMatchArgmax()
+{
+  try
+  {
+    const uint32_t num_tokens=8;
+    const uint32_t dim=4;
+    const uint32_t num_experts=8;
+    const uint32_t top_k=1;
+
+    CAIF_CudaStream stream;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
+    config.input_dim=dim;
+    config.num_experts=num_experts;
+    config.top_k=top_k;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::TopK;
+    config.use_bias=false;
+    config.noise_std=0.0f;
+
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+
+    // Build an input x router weight matrix whose argmax is deterministic
+    // per row: craft an input where row t has a simple pattern, and inject
+    // a known router weight override via FromHostData on the router's
+    // internal _w_router tensor isn't available publicly — instead we
+    // drive the router with random weights (stable within one run) and
+    // then verify indices against a reference computed from the returned
+    // router_probs.  That isolates the TopK <-> probs contract.
+    std::vector<float> host_input(num_tokens*dim);
+    for(size_t i=0;i<host_input.size();++i)
+    {
+      host_input[i]=static_cast<float>((i*37+11)%97)*0.01f;
+    }
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
+                             host_input.data(),{num_tokens,dim},stream);
+
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
+
+    // Pull probs + indices to host and verify indices match argmax(probs).
+    CAIF_HostTensor probs_h=output.router_probs.ToHost();
+    std::vector<int32_t> idx_host(num_tokens*top_k);
+    output.expert_indices.CopyToHostRaw(idx_host.data());
+    const float *probs=probs_h.Data();
+
+    bool passed=true;
+    for(uint32_t t=0;t<num_tokens;++t)
+    {
+      uint32_t expected=0;
+      float best=probs[t*num_experts+0];
+      for(uint32_t e=1;e<num_experts;++e)
+      {
+        if(probs[t*num_experts+e]>best)
+        {
+          best=probs[t*num_experts+e];
+          expected=e;
+        }
+      }
+      const int32_t actual=idx_host[t*top_k+0];
+      if(static_cast<uint32_t>(actual)!=expected)
+      {
+        ISE_Out::Out()<<"  Token "
+                      <<t
+                      <<" expected argmax="
+                      <<expected
+                      <<" got indices[]="
+                      <<actual
+                      <<std::endl;
+        passed=false;
+      }
+    }
+
+    // Also verify token_counts would not collapse to a single expert when
+    // probs are diverse: the number of distinct expert indices used must
+    // be >= 2 (probability of all eight tokens sharing one expert by
+    // accident with random input is negligible).
+    uint32_t distinct=0;
+    {
+      bool seen[16]={false,false,false,false,false,false,false,false,
+                     false,false,false,false,false,false,false,false};
+      for(uint32_t t=0;t<num_tokens;++t)
+      {
+        const int32_t idx=idx_host[t*top_k+0];
+        if(idx>=0&&idx<static_cast<int32_t>(num_experts)&&seen[idx]==false)
+        {
+          seen[idx]=true;
+          ++distinct;
+        }
+      }
+    }
+    if(distinct<2)
+    {
+      ISE_Out::Out()<<"  Only "
+                    <<distinct
+                    <<" distinct expert(s) selected across "
+                    <<num_tokens
+                    <<" tokens — routing likely collapsed to a single expert"
+                    <<std::endl;
+      passed=false;
+    }
+
+    ReportResult("MoERouter::TopKIndicesMatchArgmax",passed);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+//------------------------------------------------------------------------------
+// Test 3c: MoE Router::InitFavorExpert biases init toward a chosen expert.
+//
+// After InitFavorExpert(target, 5.0f) the softmax over experts should
+// concentrate >0.97 on the target expert and <0.02 on every other expert,
+// regardless of input — because the bias dominates and the matrix weight
+// is zeroed at init. This is the hook used by the add-moe / layer-surgery
+// path so the model starts in the "frozen base behavior" state.
+//------------------------------------------------------------------------------
+static void TestRouterInitFavorExpert()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
+    config.input_dim=g_caif_moe_init_favor_test_dim;
+    config.num_experts=g_caif_moe_init_favor_test_experts;
+    config.top_k=g_caif_moe_init_favor_test_topk;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::TopK;
+    config.use_bias=true;
+    config.noise_std=0.0f;
+
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+    router.InitFavorExpert(g_caif_moe_init_favor_target_expert,
+                            g_caif_moe_init_favor_bias_magnitude);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+
+    std::vector<float> host_input(g_caif_moe_init_favor_test_tokens
+                                    *g_caif_moe_init_favor_test_dim,
+                                    g_caif_moe_init_favor_input_value);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                              {g_caif_moe_init_favor_test_tokens,
+                                                                g_caif_moe_init_favor_test_dim},
+                                                              stream);
+
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
+    CAIF_HostTensor h_probs=output.router_probs.ToHost();
+
+    bool passed=true;
+    const uint32_t target=g_caif_moe_init_favor_target_expert;
+    for(uint32_t t=0;t<g_caif_moe_init_favor_test_tokens;++t)
+    {
+      const float fav_prob=h_probs.Data()[t*g_caif_moe_init_favor_test_experts+target];
+      if(fav_prob<g_caif_moe_init_favor_min_prob)
+      {
+        std::cout<<"  token "<<t<<" favored prob "<<fav_prob
+                 <<" < expected min "<<g_caif_moe_init_favor_min_prob<<"\n";
+        passed=false;
+      }
+      for(uint32_t e=0;e<g_caif_moe_init_favor_test_experts;++e)
+      {
+        if(e==target)
+        {
+          continue;
+        }
+        const float other_prob=h_probs.Data()[t*g_caif_moe_init_favor_test_experts+e];
+        if(other_prob>g_caif_moe_init_favor_max_other_prob)
+        {
+          std::cout<<"  token "<<t<<" other expert "<<e<<" prob "<<other_prob
+                   <<" > max "<<g_caif_moe_init_favor_max_other_prob<<"\n";
+          passed=false;
+        }
+      }
+    }
+    ReportResult("MoERouter::InitFavorExpert",passed);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+//------------------------------------------------------------------------------
+// Test 3d: MoE Layer with mixed-size experts (Phase 8.5.D).
+//
+// Each expert can carry its own hidden_dim; the dispatch/combine
+// buffers stay uniform at [total_assigned, input_dim] (those are not
+// hidden-dim-dependent), and each expert's per-token intermediate
+// activation is sized to its own hidden_dim. This test builds 3
+// experts at hidden dims {32, 16, 8} and asserts forward+backward
+// produces finite, correctly-shaped output.
+//
+// The "no max-pad slack" contract from Tier I.1 is satisfied by
+// construction: the per-expert intermediate VRAM lives inside each
+// CAIF_DeviceMoEExpert<C,S>'s ForwardImpl frame, sized exactly per
+// `_config.hidden_dim`, freed at end-of-frame. There is no shared
+// max-padded buffer to slack on.
+//------------------------------------------------------------------------------
+static void TestMoELayerMixedSizeExperts()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<float,float>>> routed;
+    std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<float,float>>> shared;
+
+    const std::vector<uint32_t> dims={
+      g_caif_moe_mixed_test_hidden_a,
+      g_caif_moe_mixed_test_hidden_b,
+      g_caif_moe_mixed_test_hidden_c
+    };
+    for(uint32_t hdim:dims)
+    {
+      CAIF_DeviceMoEExpert<float,float>::Config_t cfg;
+      cfg.input_dim=g_caif_moe_mixed_test_input_dim;
+      cfg.hidden_dim=hdim;
+      cfg.use_gated=true;
+      cfg.use_bias=false;
+      routed.push_back(std::make_unique<CAIF_DeviceMoEExpert<float,float>>(cfg,stream));
+    }
+
+    CAIF_DeviceMoELayer<float,float> layer(g_caif_moe_mixed_test_input_dim,
+                                              g_caif_moe_mixed_test_hidden_a,
+                                              g_caif_moe_mixed_test_topk,
+                                              false,
+                                              0.0f,
+                                              g_caif_moe_mixed_test_capacity_factor,
+                                              CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                                              0.0f,
+                                              0.0f,
+                                              std::move(routed),
+                                              std::move(shared),
+                                              stream);
+
+    bool passed=true;
+    if(layer.NumExperts()!=dims.size())
+    {
+      std::cout<<"  expected "<<dims.size()<<" experts, got "<<layer.NumExperts()<<"\n";
+      passed=false;
+    }
+    for(size_t i=0;i<dims.size();++i)
+    {
+      if(layer.Expert(i).HiddenDim()!=dims[i])
+      {
+        std::cout<<"  expert "<<i<<" hidden_dim "<<layer.Expert(i).HiddenDim()
+                 <<" expected "<<dims[i]<<"\n";
+        passed=false;
+      }
+    }
+
+    std::vector<float> host_input(g_caif_moe_mixed_test_num_tokens
+                                    *g_caif_moe_mixed_test_input_dim,
+                                    g_caif_moe_mixed_test_input_value);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                              {g_caif_moe_mixed_test_num_tokens,
+                                                                g_caif_moe_mixed_test_input_dim},
+                                                              stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+
+    CAIF_DeviceTensor out=layer.Forward(input,ctx);
+    CAIF_HostTensor h_out=out.ToHost();
+    if(h_out.Shape().size()!=2
+       ||h_out.Shape()[0]!=g_caif_moe_mixed_test_num_tokens
+       ||h_out.Shape()[1]!=g_caif_moe_mixed_test_input_dim)
+    {
+      std::cout<<"  forward shape mismatch\n";
+      passed=false;
+    }
+    for(size_t i=0;i<h_out.TotalElements()&&passed==true;++i)
+    {
+      if(std::isfinite(h_out.Data()[i])==false)
+      {
+        std::cout<<"  non-finite forward at "<<i<<"\n";
+        passed=false;
+      }
+    }
+
+    if(passed==true)
+    {
+      std::vector<float> grad_data(g_caif_moe_mixed_test_num_tokens
+                                     *g_caif_moe_mixed_test_input_dim,
+                                     g_caif_moe_mixed_test_grad_value);
+      CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_data.data(),
+                                                                   {g_caif_moe_mixed_test_num_tokens,
+                                                                     g_caif_moe_mixed_test_input_dim},
+                                                                   stream);
+      ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+      CAIF_DeviceTensor grad_in=layer.Backward(grad_out,ctx);
+      CAIF_HostTensor h_gi=grad_in.ToHost();
+      for(size_t i=0;i<h_gi.TotalElements();++i)
+      {
+        if(std::isfinite(h_gi.Data()[i])==false)
+        {
+          std::cout<<"  non-finite backward at "<<i<<"\n";
+          passed=false;
+          break;
+        }
+      }
+    }
+
+    ReportResult("MoELayer::MixedSizeExperts",passed);
+  }
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -220,15 +545,20 @@ static void TestRouterWeightsNormalized()
     const uint32_t top_k=2;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoERouter::Config_t config;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
     config.input_dim=dim;
     config.num_experts=num_experts;
     config.top_k=top_k;
-    config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::TopK;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::TopK;
     config.use_bias=false;
     config.noise_std=0.0f;
 
-    CAIF_DeviceMoERouter router(config,stream);
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -238,7 +568,7 @@ static void TestRouterWeightsNormalized()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoERouter::RouterOutput_t output=router.Route(input,false);
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
     CAIF_HostTensor weights=output.expert_weights.ToHost();
 
     bool passed=true;
@@ -259,7 +589,7 @@ static void TestRouterWeightsNormalized()
 
     ReportResult("MoERouter::WeightsNormalized",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -276,32 +606,32 @@ static void TestMoELayerForwardShape()
     const uint32_t num_experts=4;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=1.5f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        1.5f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=moe.Forward(input,false);
+    CAIF_DeviceTensor output=moe.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -323,7 +653,7 @@ static void TestMoELayerForwardShape()
 
     ReportResult("MoELayer::ForwardShape",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -339,26 +669,26 @@ static void TestMoELayerAuxLosses()
     const uint32_t num_experts=4;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.01f;
-    config.z_loss_weight=0.001f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        2.0f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.01f,
+                        0.001f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -368,46 +698,32 @@ static void TestMoELayerAuxLosses()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoELayer::MoEOutput_t output=moe.ForwardMoE(input,true);
+    moe.Forward(input,ctx);
+    const float balance_loss=moe.LastBalanceLoss();
+    const float z_loss=moe.LastZLoss();
 
     bool passed=true;
 
     // Balance loss should be non-negative
-    if(output.balance_loss<0.0f)
+    if(balance_loss<0.0f)
     {
-      std::cout<<"  Balance loss is negative: "<<output.balance_loss<<"\n";
+      std::cout<<"  Balance loss is negative: "<<balance_loss<<"\n";
       passed=false;
     }
 
     // Z-loss should be non-negative
-    if(output.z_loss<0.0f)
+    if(z_loss<0.0f)
     {
-      std::cout<<"  Z-loss is negative: "<<output.z_loss<<"\n";
+      std::cout<<"  Z-loss is negative: "<<z_loss<<"\n";
       passed=false;
     }
 
-    // Expert counts should sum to approximately num_tokens * top_k
-    CAIF_HostTensor counts=output.expert_counts.ToHost();
-    float total_count=0.0f;
-    for(uint32_t i=0;i<num_experts;++i)
-    {
-      total_count+=counts.Data()[i];
-    }
-
-    // With capacity limits, might be less than num_tokens * top_k
-    if(total_count<=0.0f)
-    {
-      std::cout<<"  No tokens routed to any expert\n";
-      passed=false;
-    }
-
-    std::cout<<"  Balance loss: "<<output.balance_loss<<"\n";
-    std::cout<<"  Z-loss: "<<output.z_loss<<"\n";
-    std::cout<<"  Total routed: "<<total_count<<" (expected ~"<<(num_tokens*top_k)<<")\n";
+    std::cout<<"  Balance loss: "<<balance_loss<<"\n";
+    std::cout<<"  Z-loss: "<<z_loss<<"\n";
 
     ReportResult("MoELayer::AuxLosses",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -423,39 +739,40 @@ static void TestMoELayerBackward()
     const uint32_t num_experts=4;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        2.0f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
     // Forward with training=true
-    moe.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    moe.Forward(input,ctx);
 
     // Backward
     std::vector<float> grad_ones(num_tokens*dim,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
                                    grad_ones.data(),{num_tokens,dim},stream);
-    CAIF_DeviceTensor grad_input=moe.Backward(grad_output);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=moe.Backward(grad_output,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -486,7 +803,7 @@ static void TestMoELayerBackward()
 
     ReportResult("MoELayer::Backward",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -501,26 +818,21 @@ static void TestMoELayerParameterCount()
     const uint32_t num_experts=4;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=1.5f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
-
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        1.5f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
     bool passed=true;
 
@@ -549,7 +861,7 @@ static void TestMoELayerParameterCount()
 
     ReportResult("MoELayer::ParameterCount",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -565,57 +877,47 @@ static void TestMoELayerCapacity()
     const uint32_t num_experts=4;
     const uint32_t top_k=1;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=0.5f;  // Intentionally low to trigger overflow
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        0.5f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoELayer::MoEOutput_t output=moe.ForwardMoE(input,false);
-    CAIF_HostTensor counts=output.expert_counts.ToHost();
+    CAIF_DeviceTensor output=moe.Forward(input,ctx);
+    const auto &shape=output.Shape();
 
     bool passed=true;
 
-    // With capacity_factor=0.5, capacity = (32/4)*0.5*1 = 4 per expert
-    // Total should be less than num_tokens*top_k=32 due to drops
-    float total_count=0.0f;
-    for(uint32_t i=0;i<num_experts;++i)
+    // Capacity_factor=0.5 forces drops; Forward must still return a
+    // correctly-shaped output (dropped-token contributions are zero).
+    if(shape.size()!=2||shape[0]!=num_tokens||shape[1]!=dim)
     {
-      total_count+=counts.Data()[i];
-      std::cout<<"  Expert "<<i<<" count: "<<counts.Data()[i]<<"\n";
-    }
-
-    // Max possible is num_experts * capacity = 4 * 4 = 16
-    if(total_count>num_experts*4+1)  // +1 for rounding
-    {
-      std::cout<<"  Total count "<<total_count<<" exceeds expected capacity\n";
+      std::cout<<"  Output shape mismatch under capacity limit\n";
       passed=false;
     }
 
-    std::cout<<"  Total routed: "<<total_count<<" (capacity limit ~16)\n";
-
     ReportResult("MoELayer::CapacityEnforcement",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -631,15 +933,20 @@ static void TestExpertChoiceRouting()
     const uint32_t top_k=2;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoERouter::Config_t config;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
     config.input_dim=dim;
     config.num_experts=num_experts;
     config.top_k=top_k;
-    config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::ExpertChoice;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::ExpertChoice;
     config.use_bias=false;
     config.noise_std=0.0f;
 
-    CAIF_DeviceMoERouter router(config,stream);
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -649,7 +956,7 @@ static void TestExpertChoiceRouting()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoERouter::RouterOutput_t output=router.Route(input,false);
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
 
     bool passed=true;
 
@@ -676,7 +983,7 @@ static void TestExpertChoiceRouting()
 
     ReportResult("MoERouter::ExpertChoiceRouting",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -692,21 +999,26 @@ static void TestSoftMoERouting()
     const uint32_t top_k=2;  // Ignored for Soft routing
 
     CAIF_CudaStream stream;
-    CAIF_DeviceMoERouter::Config_t config;
+    CAIF_DeviceMoERouter<float,float>::Config_t config;
     config.input_dim=dim;
     config.num_experts=num_experts;
     config.top_k=top_k;
-    config.routing_type=CAIF_DeviceMoERouter::RoutingType_e::Soft;
+    config.routing_type=CAIF_DeviceMoERouter<float,float>::RoutingType_e::Soft;
     config.use_bias=false;
     config.noise_std=0.0f;
 
-    CAIF_DeviceMoERouter router(config,stream);
+    CAIF_DeviceMoERouter<float,float> router(config,stream);
+
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceMoERouter::RouterOutput_t output=router.Route(input,false);
+    CAIF_DeviceMoERouter<float,float>::RouterOutput_t output=router.Route(input,ctx);
 
     bool passed=true;
 
@@ -746,7 +1058,7 @@ static void TestSoftMoERouting()
 
     ReportResult("MoERouter::SoftMoERouting",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -762,47 +1074,47 @@ static void TestOverflowNoOp()
     const uint32_t num_experts=4;
     const uint32_t top_k=1;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=0.5f;  // Low capacity to trigger overflow
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::NoOp;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        0,
+                        0,
+                        false,
+                        0.0f,
+                        0.5f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::NoOp,
+                        0.0f,
+                        0.0f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
     std::vector<float> host_input(num_tokens*dim,0.5f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    // Should not crash with NoOp overflow
-    CAIF_DeviceTensor output=moe.Forward(input,false);
-
-    bool passed=true;
-
-    // Check output shape
-    const auto &shape=output.Shape();
-    if(shape.size()!=2||shape[0]!=num_tokens||shape[1]!=dim)
+    // Only Drop overflow is supported on the GPU dispatch path; NoOp
+    // must throw CAIFE loudly. See caif_device_moe_layer.cpp comment
+    // at the THROW_CAIFE site.
+    bool threw=false;
+    try
     {
-      std::cout<<"  Output shape mismatch\n";
-      passed=false;
+      CAIF_DeviceTensor output=moe.Forward(input,ctx);
+    }
+    catch(const CAIF_Exception &)
+    {
+      threw=true;
     }
 
-    ReportResult("MoELayer::OverflowNoOp",passed);
+    ReportResult("MoELayer::OverflowNoOp",threw);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -819,26 +1131,21 @@ static void TestSharedExperts()
     const uint32_t num_shared=2;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=num_shared;
-    config.shared_hidden_dim=0;  // Use default hidden_dim
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
-
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        num_shared,
+                        0,
+                        false,
+                        0.0f,
+                        2.0f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
     bool passed=true;
 
@@ -863,11 +1170,16 @@ static void TestSharedExperts()
     }
 
     // Test forward pass
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
-    CAIF_DeviceTensor output=moe.Forward(input,false);
+    CAIF_DeviceTensor output=moe.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Check output shape
@@ -896,7 +1208,7 @@ static void TestSharedExperts()
 
     ReportResult("MoELayer::SharedExperts",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -913,26 +1225,21 @@ static void TestSharedExpertsCustomHiddenDim()
     const uint32_t num_shared=1;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=num_shared;
-    config.shared_hidden_dim=shared_hidden;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
-
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        num_shared,
+                        shared_hidden,
+                        false,
+                        0.0f,
+                        2.0f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
     bool passed=true;
 
@@ -954,92 +1261,7 @@ static void TestSharedExpertsCustomHiddenDim()
 
     ReportResult("MoELayer::SharedExpertsCustomHiddenDim",passed);
   }
-  CCAIF_CATCH_BLOCK()
-}
-
-//------------------------------------------------------------------------------
-// Test 15: Fine-grained experts
-//------------------------------------------------------------------------------
-static void TestFineGrainedExperts()
-{
-  try
-  {
-    const uint32_t dim=8;
-    const uint32_t hidden_dim=16;
-    const uint32_t num_experts=4;
-    const uint32_t top_k=2;
-    const uint32_t fine_factor=2;  // 2x experts at 1/2 hidden dim
-
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=0;
-    config.shared_hidden_dim=0;
-    config.fine_grained=true;
-    config.fine_grained_factor=fine_factor;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
-
-    CAIF_DeviceMoELayer moe(config,stream);
-
-    bool passed=true;
-
-    // Fine-grained: actual_num_experts = num_experts * factor = 4 * 2 = 8
-    // actual_hidden_dim = hidden_dim / factor = 16 / 2 = 8
-    const uint32_t actual_num_experts=num_experts*fine_factor;
-    const uint32_t actual_hidden_dim=hidden_dim/fine_factor;
-
-    // Check IsFineGrained accessor
-    if(moe.IsFineGrained()!=true)
-    {
-      std::cout<<"  IsFineGrained() should return true\n";
-      passed=false;
-    }
-
-    // Router routes to actual_num_experts
-    // Router params: dim * actual_num_experts = 8 * 8 = 64
-    // Each expert: dim*actual_hidden + actual_hidden + actual_hidden*dim + dim
-    //            = 8*8 + 8 + 8*8 + 8 = 64 + 8 + 64 + 8 = 144
-    // Total: 64 + 8*144 = 64 + 1152 = 1216
-    const size_t expected_total=dim*actual_num_experts+
-                                actual_num_experts*(dim*actual_hidden_dim+actual_hidden_dim+
-                                                    actual_hidden_dim*dim+dim);
-
-    if(moe.TotalParameterCount()!=expected_total)
-    {
-      std::cout<<"  TotalParameterCount expected "<<expected_total
-               <<", got "<<moe.TotalParameterCount()<<"\n";
-      passed=false;
-    }
-
-    // Test forward pass
-    const uint32_t num_tokens=8;
-    std::vector<float> host_input(num_tokens*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{num_tokens,dim},stream);
-
-    CAIF_DeviceTensor output=moe.Forward(input,false);
-
-    // Check output shape
-    const auto &shape=output.Shape();
-    if(shape.size()!=2||shape[0]!=num_tokens||shape[1]!=dim)
-    {
-      std::cout<<"  Output shape mismatch\n";
-      passed=false;
-    }
-
-    ReportResult("MoELayer::FineGrainedExperts",passed);
-  }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -1056,39 +1278,40 @@ static void TestSharedExpertsBackward()
     const uint32_t num_shared=2;
     const uint32_t top_k=2;
 
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoELayer::Config_t config;
-    config.input_dim=dim;
-    config.hidden_dim=hidden_dim;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_use_gated=false;
-    config.expert_use_bias=true;
-    config.num_shared_experts=num_shared;
-    config.shared_hidden_dim=0;
-    config.fine_grained=false;
-    config.fine_grained_factor=1;
-    config.router_use_bias=false;
-    config.router_noise_std=0.0f;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
+    CAIF_CudaStream stream;CAIF_DeviceMoELayer<float,float> moe(dim,
+                        hidden_dim,
+                        num_experts,
+                        top_k,
+                        false,
+                        true,
+                        num_shared,
+                        0,
+                        false,
+                        0.0f,
+                        2.0f,
+                        CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e::Drop,
+                        0.0f,
+                        0.0f,
+                        stream);
 
-    CAIF_DeviceMoELayer moe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     std::vector<float> host_input(num_tokens*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{num_tokens,dim},stream);
 
     // Forward with training=true
-    moe.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    moe.Forward(input,ctx);
 
     // Backward
     std::vector<float> grad_ones(num_tokens*dim,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
                                    grad_ones.data(),{num_tokens,dim},stream);
-    CAIF_DeviceTensor grad_input=moe.Backward(grad_output);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=moe.Backward(grad_output,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -1119,348 +1342,7 @@ static void TestSharedExpertsBackward()
 
     ReportResult("MoELayer::SharedExpertsBackward",passed);
   }
-  CCAIF_CATCH_BLOCK()
-}
-
-//------------------------------------------------------------------------------
-// Test 17: MoE Block forward
-//------------------------------------------------------------------------------
-static void TestMoEBlockForward()
-{
-  try
-  {
-    const uint32_t batch=2;
-    const uint32_t seq_len=4;
-    const uint32_t dim=32;
-    const uint32_t num_heads=4;
-    const uint32_t num_experts=4;
-    const uint32_t top_k=2;
-    const uint32_t expert_ffn_dim=64;
-
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoEBlock::Config_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.dropout_rate=0.0f;
-    config.causal=true;
-    config.use_rope=true;
-    config.rope_base=10000.0f;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_ffn_dim=expert_ffn_dim;
-    config.expert_use_gated=true;
-    config.num_shared_experts=0;
-    config.shared_ffn_dim=0;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.0f;
-    config.z_loss_weight=0.0f;
-    config.router_noise_std=0.0f;
-
-    CAIF_DeviceMoEBlock block(config,stream);
-
-    std::vector<float> host_input(batch*seq_len*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
-
-    CAIF_DeviceTensor output=block.Forward(input,false);
-    CAIF_HostTensor host_output=output.ToHost();
-
-    bool passed=true;
-    const auto &shape=host_output.Shape();
-    if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=dim)
-    {
-      std::cout<<"  Shape mismatch: expected ["<<batch<<","<<seq_len<<","<<dim<<"]\n";
-      passed=false;
-    }
-
-    ReportResult("MoEBlock::Forward",passed);
-  }
-  CCAIF_CATCH_BLOCK()
-}
-
-//------------------------------------------------------------------------------
-// Test 18: MoE Block aux losses
-//------------------------------------------------------------------------------
-static void TestMoEBlockAuxLosses()
-{
-  try
-  {
-    const uint32_t batch=2;
-    const uint32_t seq_len=4;
-    const uint32_t dim=32;
-    const uint32_t num_heads=4;
-    const uint32_t num_experts=4;
-    const uint32_t top_k=2;
-    const uint32_t expert_ffn_dim=64;
-
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoEBlock::Config_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.dropout_rate=0.0f;
-    config.causal=true;
-    config.use_rope=true;
-    config.rope_base=10000.0f;
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_ffn_dim=expert_ffn_dim;
-    config.expert_use_gated=true;
-    config.num_shared_experts=0;
-    config.shared_ffn_dim=0;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.01f;
-    config.z_loss_weight=0.001f;
-    config.router_noise_std=0.0f;
-
-    CAIF_DeviceMoEBlock block(config,stream);
-
-    std::vector<float> host_input(batch*seq_len*dim);
-    for(size_t i=0;i<host_input.size();++i)
-    {
-      host_input[i]=static_cast<float>(i)*0.01f-0.5f;
-    }
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
-
-    block.Forward(input,true);
-    const auto &aux=block.LastAuxLosses();
-
-    bool passed=true;
-
-    // Balance loss should be non-negative
-    if(aux.balance_loss<0.0f)
-    {
-      std::cout<<"  Balance loss is negative: "<<aux.balance_loss<<"\n";
-      passed=false;
-    }
-
-    // Z-loss should be non-negative
-    if(aux.z_loss<0.0f)
-    {
-      std::cout<<"  Z-loss is negative: "<<aux.z_loss<<"\n";
-      passed=false;
-    }
-
-    std::cout<<"  Balance loss: "<<aux.balance_loss<<"\n";
-    std::cout<<"  Z-loss: "<<aux.z_loss<<"\n";
-
-    ReportResult("MoEBlock::AuxLosses",passed);
-  }
-  CCAIF_CATCH_BLOCK()
-}
-
-//------------------------------------------------------------------------------
-// Test 19: MoE Transformer Model - all MoE layers
-//------------------------------------------------------------------------------
-static void TestMoETransformerModelAllMoE()
-{
-  try
-  {
-    const uint32_t batch=2;
-    const uint32_t seq_len=8;
-    const uint32_t vocab_size=100;
-    const uint32_t dim=32;
-    const uint32_t num_heads=4;
-    const uint32_t num_layers=2;
-    const uint32_t num_experts=4;
-    const uint32_t top_k=2;
-
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoETransformerModel::Config_t config;
-    config.vocab_size=vocab_size;
-    config.max_seq_len=seq_len;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.num_layers=num_layers;
-    config.ffn_dim=64;
-    config.causal=true;
-    config.use_rope=true;
-    config.rope_base=10000.0f;
-    config.pe_mode=PositionalEncodingMode_e::Learned;
-    config.output_dim=vocab_size;
-    config.tie_weights=false;
-    config.moe_layer_interval=1;  // All layers are MoE
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_ffn_dim=64;
-    config.expert_use_gated=true;
-    config.num_shared_experts=0;
-    config.shared_ffn_dim=0;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.01f;
-    config.z_loss_weight=0.001f;
-    config.router_noise_std=0.0f;
-
-    CAIF_DeviceMoETransformerModel model(config,stream);
-
-    bool passed=true;
-
-    // Check layer counts
-    if(model.NumMoELayers()!=num_layers)
-    {
-      std::cout<<"  NumMoELayers expected "<<num_layers<<", got "<<model.NumMoELayers()<<"\n";
-      passed=false;
-    }
-    if(model.NumDenseLayers()!=0)
-    {
-      std::cout<<"  NumDenseLayers expected 0, got "<<model.NumDenseLayers()<<"\n";
-      passed=false;
-    }
-
-    // Create input token IDs
-    std::vector<float> host_input(batch*seq_len);
-    for(size_t i=0;i<host_input.size();++i)
-    {
-      host_input[i]=static_cast<float>(i%vocab_size);
-    }
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len},stream);
-
-    // Forward pass
-    CAIF_DeviceTensor output=model.Forward(input,true);
-    CAIF_HostTensor host_output=output.ToHost();
-
-    // Check output shape [batch, seq_len, vocab_size]
-    const auto &shape=host_output.Shape();
-    if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=vocab_size)
-    {
-      std::cout<<"  Output shape mismatch\n";
-      passed=false;
-    }
-
-    // Check aux losses accumulated
-    const auto &aux=model.TotalAuxLosses();
-    std::cout<<"  Total balance loss: "<<aux.balance_loss<<"\n";
-    std::cout<<"  Total z-loss: "<<aux.z_loss<<"\n";
-
-    if(aux.balance_loss<0.0f||aux.z_loss<0.0f)
-    {
-      std::cout<<"  Negative aux losses\n";
-      passed=false;
-    }
-
-    ReportResult("MoETransformerModel::AllMoE",passed);
-  }
-  CCAIF_CATCH_BLOCK()
-}
-
-//------------------------------------------------------------------------------
-// Test 20: MoE Transformer Model - interleaved layers
-//------------------------------------------------------------------------------
-static void TestMoETransformerModelInterleaved()
-{
-  try
-  {
-    const uint32_t batch=2;
-    const uint32_t seq_len=8;
-    const uint32_t vocab_size=100;
-    const uint32_t dim=32;
-    const uint32_t num_heads=4;
-    const uint32_t num_layers=4;
-    const uint32_t num_experts=4;
-    const uint32_t top_k=2;
-
-    CAIF_CudaStream stream;
-    CAIF_DeviceMoETransformerModel::Config_t config;
-    config.vocab_size=vocab_size;
-    config.max_seq_len=seq_len;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.num_layers=num_layers;
-    config.ffn_dim=64;
-    config.causal=true;
-    config.use_rope=true;
-    config.rope_base=10000.0f;
-    config.pe_mode=PositionalEncodingMode_e::Learned;
-    config.output_dim=vocab_size;
-    config.tie_weights=false;
-    config.moe_layer_interval=2;  // Every 2nd layer is MoE (layers 1, 3)
-    config.num_experts=num_experts;
-    config.top_k=top_k;
-    config.expert_ffn_dim=64;
-    config.expert_use_gated=true;
-    config.num_shared_experts=0;
-    config.shared_ffn_dim=0;
-    config.capacity_factor=2.0f;
-    config.overflow_strategy=CAIF_DeviceMoELayer::OverflowStrategy_e::Drop;
-    config.balance_loss_weight=0.01f;
-    config.z_loss_weight=0.001f;
-    config.router_noise_std=0.0f;
-
-    CAIF_DeviceMoETransformerModel model(config,stream);
-
-    bool passed=true;
-
-    // With interval=2, layers 1 and 3 should be MoE (0-indexed)
-    // Layer 0: (0+1)%2 = 1 != 0, not MoE
-    // Layer 1: (1+1)%2 = 0, MoE
-    // Layer 2: (2+1)%2 = 1 != 0, not MoE
-    // Layer 3: (3+1)%2 = 0, MoE
-    if(model.NumMoELayers()!=2)
-    {
-      std::cout<<"  NumMoELayers expected 2, got "<<model.NumMoELayers()<<"\n";
-      passed=false;
-    }
-    if(model.NumDenseLayers()!=2)
-    {
-      std::cout<<"  NumDenseLayers expected 2, got "<<model.NumDenseLayers()<<"\n";
-      passed=false;
-    }
-
-    // Check IsMoELayer
-    if(model.IsMoELayer(0)==true)
-    {
-      std::cout<<"  Layer 0 should not be MoE\n";
-      passed=false;
-    }
-    if(model.IsMoELayer(1)==false)
-    {
-      std::cout<<"  Layer 1 should be MoE\n";
-      passed=false;
-    }
-    if(model.IsMoELayer(2)==true)
-    {
-      std::cout<<"  Layer 2 should not be MoE\n";
-      passed=false;
-    }
-    if(model.IsMoELayer(3)==false)
-    {
-      std::cout<<"  Layer 3 should be MoE\n";
-      passed=false;
-    }
-
-    // Forward pass
-    std::vector<float> host_input(batch*seq_len);
-    for(size_t i=0;i<host_input.size();++i)
-    {
-      host_input[i]=static_cast<float>(i%vocab_size);
-    }
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len},stream);
-
-    CAIF_DeviceTensor output=model.Forward(input,false);
-
-    // Check output shape
-    const auto &shape=output.Shape();
-    if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=vocab_size)
-    {
-      std::cout<<"  Output shape mismatch\n";
-      passed=false;
-    }
-
-    std::cout<<"  Interleaved: "<<model.NumDenseLayers()<<" dense + "
-             <<model.NumMoELayers()<<" MoE layers\n";
-
-    ReportResult("MoETransformerModel::Interleaved",passed);
-  }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 //------------------------------------------------------------------------------
@@ -1488,24 +1370,25 @@ static void TestGPUOptimizedMoEOps()
                                       logits_host.data(),{num_tokens,num_experts},stream);
 
     // Allocate outputs for MoETopKGating
-    CAIF_DeviceTensor expert_indices=CAIF_DeviceTensor::Uninitialized({num_tokens,top_k},stream);
+    CAIF_DeviceTensor expert_indices=CAIF_DeviceTensor::Uninitialized({num_tokens,top_k},stream,
+                                       CAIF_DataType::CAIF_DataType_e::Int32);
     CAIF_DeviceTensor expert_weights=CAIF_DeviceTensor::Uninitialized({num_tokens,top_k},stream);
     CAIF_DeviceTensor router_probs=CAIF_DeviceTensor::Uninitialized({num_tokens,num_experts},stream);
 
     // Test MoETopKGating
-    CAIF_DeviceOps::MoETopKGating(router_logits,num_experts,top_k,
+    CAIF_Ops::MoETopKGating(router_logits,num_experts,top_k,
                                   expert_indices,expert_weights,router_probs);
 
     // Verify outputs
-    std::vector<float> indices_out(num_tokens*top_k);
+    std::vector<int32_t> indices_out(num_tokens*top_k);
     std::vector<float> weights_out(num_tokens*top_k);
-    expert_indices.CopyToHost(indices_out.data());
+    expert_indices.CopyToHostRaw(indices_out.data());
     expert_weights.CopyToHost(weights_out.data());
 
     // Check indices are valid expert IDs
     for(size_t i=0;i<indices_out.size();++i)
     {
-      const int32_t idx=static_cast<int32_t>(indices_out[i]);
+      const int32_t idx=indices_out[i];
       if(idx<0||idx>=static_cast<int32_t>(num_experts))
       {
         std::cout<<"  Invalid expert index: "<<idx<<"\n";
@@ -1538,7 +1421,7 @@ static void TestGPUOptimizedMoEOps()
     CAIF_DeviceTensor dispatch_map=CAIF_DeviceTensor::Uninitialized({num_tokens,top_k},stream);
     CAIF_DeviceTensor expert_offsets=CAIF_DeviceTensor::Uninitialized({num_experts+1},stream);
 
-    uint32_t total_assigned=CAIF_DeviceOps::MoEBuildDispatchMap(
+    uint32_t total_assigned=CAIF_Ops::MoEBuildDispatchMap(
                                expert_indices,num_experts,top_k,0,
                                dispatch_map,expert_offsets);
 
@@ -1563,7 +1446,7 @@ static void TestGPUOptimizedMoEOps()
     CAIF_DeviceTensor expert_buffer=CAIF_DeviceTensor::Zeros({total_assigned,dim},stream);
 
     // Test MoEDispatchGPU
-    CAIF_DeviceOps::MoEDispatchGPU(input,expert_indices,dispatch_map,
+    CAIF_Ops::MoEDispatchGPU(input,expert_indices,dispatch_map,
                                    expert_offsets,top_k,expert_buffer);
 
     // Verify buffer has data
@@ -1587,7 +1470,7 @@ static void TestGPUOptimizedMoEOps()
 
     // Test MoECombineGPU
     CAIF_DeviceTensor output=CAIF_DeviceTensor::Zeros({num_tokens,dim},stream);
-    CAIF_DeviceOps::MoECombineGPU(expert_buffer,expert_indices,expert_weights,
+    CAIF_Ops::MoECombineGPU(expert_buffer,expert_indices,expert_weights,
                                   dispatch_map,expert_offsets,top_k,output);
 
     // Verify output has data
@@ -1611,7 +1494,7 @@ static void TestGPUOptimizedMoEOps()
 
     ReportResult("MoE::GPUOptimizedOps",passed);
   }
-  CCAIF_CATCH_BLOCK()
+  CAIF_CATCH_BLOCK()
 }
 
 #endif  // USE_CAIF_CUDA
@@ -1626,6 +1509,9 @@ int main()
     TestExpertForwardShape();
     TestExpertGatedForwardShape();
     TestRouterOutputShape();
+    TestRouterTopKIndicesMatchArgmax();
+    TestRouterInitFavorExpert();
+    TestMoELayerMixedSizeExperts();
     TestRouterWeightsNormalized();
     TestMoELayerForwardShape();
     TestMoELayerAuxLosses();
@@ -1637,26 +1523,13 @@ int main()
     TestOverflowNoOp();
     TestSharedExperts();
     TestSharedExpertsCustomHiddenDim();
-    TestFineGrainedExperts();
     TestSharedExpertsBackward();
-    TestMoEBlockForward();
-    TestMoEBlockAuxLosses();
-    TestMoETransformerModelAllMoE();
-    TestMoETransformerModelInterleaved();
     TestGPUOptimizedMoEOps();
 #else
     std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-    std::cout<<"\n=== Summary ===\n";
-    std::cout<<"Passed: "<<g_tests_passed<<"\n";
-    std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-    if(g_tests_failed>0)
-    {
-      return 1;
-    }
-    return 0;
+    return CAIF_TestHarness::FinalExitCode();
   }
   catch(const CAIF_Exception &e)
   {

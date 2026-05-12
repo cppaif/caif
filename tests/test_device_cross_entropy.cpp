@@ -25,126 +25,13 @@
 #include "caif_cuda_stream.h"
 #include "caif_host_tensor.h"
 
+#include "caif_test_harness.h"
+#include "caif_cpu_reference/caif_cpu_cross_entropy.h"
 using namespace instance;
-
-static int g_tests_passed=0;
-static int g_tests_failed=0;
 
 static void ReportTest(const std::string &name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"  PASS: "<<name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"  FAIL: "<<name<<"\n";
-    ++g_tests_failed;
-  }
-}
-
-//------------------------------------------------------------------------------
-// CPU reference implementation
-//------------------------------------------------------------------------------
-static float CpuCrossEntropyLoss(const std::vector<float> &logits,
-                                  const std::vector<int> &targets,
-                                  int n,
-                                  int vocab_size,
-                                  int ignore_index)
-{
-  float total_loss=0.0f;
-  int count=0;
-
-  for(int i=0;i<n;++i)
-  {
-    if(targets[i]==ignore_index)
-    {
-      continue;
-    }
-
-    // Find max for stability
-    float max_logit=-1e30f;
-    for(int v=0;v<vocab_size;++v)
-    {
-      const float val=logits[i*vocab_size+v];
-      if(val>max_logit)
-      {
-        max_logit=val;
-      }
-    }
-
-    // Compute log-sum-exp
-    float sum_exp=0.0f;
-    for(int v=0;v<vocab_size;++v)
-    {
-      sum_exp+=std::exp(logits[i*vocab_size+v]-max_logit);
-    }
-    const float log_sum_exp=max_logit+std::log(sum_exp);
-
-    // Loss for this position
-    const float target_logit=logits[i*vocab_size+targets[i]];
-    total_loss+=log_sum_exp-target_logit;
-    ++count;
-  }
-
-  if(count==0)
-  {
-    return 0.0f;
-  }
-  return total_loss/static_cast<float>(count);
-}
-
-static void CpuCrossEntropyGradient(const std::vector<float> &logits,
-                                     const std::vector<int> &targets,
-                                     std::vector<float> &grad,
-                                     int n,
-                                     int vocab_size,
-                                     int ignore_index)
-{
-  grad.resize(n*vocab_size);
-
-  for(int i=0;i<n;++i)
-  {
-    if(targets[i]==ignore_index)
-    {
-      for(int v=0;v<vocab_size;++v)
-      {
-        grad[i*vocab_size+v]=0.0f;
-      }
-      continue;
-    }
-
-    // Find max for stability
-    float max_logit=-1e30f;
-    for(int v=0;v<vocab_size;++v)
-    {
-      const float val=logits[i*vocab_size+v];
-      if(val>max_logit)
-      {
-        max_logit=val;
-      }
-    }
-
-    // Compute sum of exp
-    float sum_exp=0.0f;
-    for(int v=0;v<vocab_size;++v)
-    {
-      sum_exp+=std::exp(logits[i*vocab_size+v]-max_logit);
-    }
-
-    // Gradient: softmax - one_hot
-    for(int v=0;v<vocab_size;++v)
-    {
-      const float softmax_val=std::exp(logits[i*vocab_size+v]-max_logit)/sum_exp;
-      float g=softmax_val;
-      if(v==targets[i])
-      {
-        g-=1.0f;
-      }
-      grad[i*vocab_size+v]=g/static_cast<float>(n);
-    }
-  }
+  CAIF_TestHarness::Report(name.c_str(),passed);
 }
 
 //------------------------------------------------------------------------------
@@ -173,7 +60,7 @@ static void TestLossShape()
                                                            {static_cast<uint32_t>(n)},
                                                            stream);
 
-  float loss=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits,targets,stream);
+  float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
   // Loss should be a finite positive number
   bool passed=(std::isfinite(loss)==true&&loss>=0.0f);
@@ -209,7 +96,7 @@ static void TestLossValues()
 
   // CPU reference
   constexpr int ignore_index=-100;
-  const float cpu_loss=CpuCrossEntropyLoss(logits_data,targets_int,n,vocab_size,ignore_index);
+  const float cpu_loss=CAIF_CpuCrossEntropy::Loss(logits_data,targets_int,n,vocab_size,ignore_index);
 
   // GPU
   CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
@@ -220,7 +107,7 @@ static void TestLossValues()
                                                            {static_cast<uint32_t>(n)},
                                                            stream);
 
-  const float gpu_loss=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits,targets,stream);
+  const float gpu_loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
   const float diff=std::abs(gpu_loss-cpu_loss);
   constexpr float tol=1e-4f;
@@ -261,7 +148,7 @@ static void TestLossNumericalStability()
                                                            {static_cast<uint32_t>(n)},
                                                            stream);
 
-  const float loss=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits,targets,stream);
+  const float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
   // Loss should be finite (not NaN or Inf)
   const bool passed=(std::isfinite(loss)==true);
@@ -295,7 +182,7 @@ static void TestGradientShape()
                                                            {static_cast<uint32_t>(n)},
                                                            stream);
 
-  CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss::ComputeGradient(logits,targets,stream);
+  CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
 
   const auto &grad_shape=grad.Shape();
   const bool passed=(grad_shape.size()==2&&
@@ -333,7 +220,7 @@ static void TestGradientValues()
   // CPU reference
   constexpr int ignore_index=-100;
   std::vector<float> cpu_grad;
-  CpuCrossEntropyGradient(logits_data,targets_int,cpu_grad,n,vocab_size,ignore_index);
+  CAIF_CpuCrossEntropy::Gradient(logits_data,targets_int,cpu_grad,n,vocab_size,ignore_index);
 
   // GPU
   CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
@@ -344,7 +231,7 @@ static void TestGradientValues()
                                                            {static_cast<uint32_t>(n)},
                                                            stream);
 
-  CAIF_DeviceTensor gpu_grad=CAIF_DeviceCrossEntropyLoss::ComputeGradient(logits,targets,stream);
+  CAIF_DeviceTensor gpu_grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
   CAIF_HostTensor host_grad=gpu_grad.ToHost();
 
   // Compare
@@ -398,7 +285,7 @@ static void TestGradientFiniteDiff()
                                                            stream);
 
   // Compute analytical gradient
-  CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss::ComputeGradient(logits,targets,stream);
+  CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
   CAIF_HostTensor host_grad=grad.ToHost();
 
   // Check a few elements with finite difference
@@ -416,7 +303,7 @@ static void TestGradientFiniteDiff()
                                                               {static_cast<uint32_t>(n),
                                                                static_cast<uint32_t>(vocab_size)},
                                                               stream);
-    const float loss_plus=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits_p,targets,stream);
+    const float loss_plus=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits_p,targets,stream);
 
     // f(x-h)
     std::vector<float> logits_minus=logits_data;
@@ -425,7 +312,7 @@ static void TestGradientFiniteDiff()
                                                               {static_cast<uint32_t>(n),
                                                                static_cast<uint32_t>(vocab_size)},
                                                               stream);
-    const float loss_minus=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits_m,targets,stream);
+    const float loss_minus=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits_m,targets,stream);
 
     const float numerical_grad=(loss_plus-loss_minus)/(2.0f*h);
     const float analytical_grad=host_grad.Data()[idx];
@@ -472,7 +359,7 @@ static void TestIgnoreIndex()
                                                            stream);
 
   // Loss should only consider positions 0 and 2
-  const float loss_with_ignore=CAIF_DeviceCrossEntropyLoss::ComputeLoss(
+  const float loss_with_ignore=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(
       logits,targets,stream,ignore_index);
 
   // Reference: compute loss for just positions 0 and 2
@@ -483,7 +370,7 @@ static void TestIgnoreIndex()
     logits_subset[1*vocab_size+v]=logits_data[2*vocab_size+v];
   }
   std::vector<int> targets_subset={0,2};
-  const float loss_subset=CpuCrossEntropyLoss(logits_subset,targets_subset,2,vocab_size,-100);
+  const float loss_subset=CAIF_CpuCrossEntropy::Loss(logits_subset,targets_subset,2,vocab_size,-100);
 
   const float diff=std::abs(loss_with_ignore-loss_subset);
   constexpr float tol=1e-4f;
@@ -524,12 +411,12 @@ static void TestFusedMatchesSeparate()
                                                            stream);
 
   // Separate computation
-  const float loss_separate=CAIF_DeviceCrossEntropyLoss::ComputeLoss(logits,targets,stream);
-  CAIF_DeviceTensor grad_separate=CAIF_DeviceCrossEntropyLoss::ComputeGradient(logits,targets,stream);
+  const float loss_separate=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
+  CAIF_DeviceTensor grad_separate=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
 
   // Fused computation
   CAIF_DeviceTensor grad_fused;
-  const float loss_fused=CAIF_DeviceCrossEntropyLoss::ComputeLossAndGradient(
+  const float loss_fused=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
       logits,targets,grad_fused,stream);
 
   // Compare loss
@@ -577,10 +464,10 @@ int main()
   TestFusedMatchesSeparate();
 
   std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
+  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-  if(g_tests_failed==0)
+  if(CAIF_TestHarness::FailedCount()==0)
   {
     std::cout<<"All tests passed!\n";
     return 0;

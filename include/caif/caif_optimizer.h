@@ -12,194 +12,123 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/**
- * @file aif_optimizer.h
- * @brief Base optimizer class for neural network parameter updates
- * @author CAIF Development Team
- * @version 1.0
- * @date 2024
- */
-
 #pragma once
 
 #include "caif_constants.h"
-#include "caif_tensor.h"
-#include "caif_base.h"
+#include "caif_device_tensor.h"
+
+#include <cstddef>
 #include <vector>
-#include <memory>
-#include <string>
-#include "caif_exception.h"
 
 namespace instance
 {
-  class CAIF_Framework;
-  /**
-   * @brief Abstract base class for all optimizers
-   * 
-   * The CAIF_Optimizer class provides the interface for parameter
-   * optimization algorithms like SGD, Adam, etc.
-   */
-  class CAIF_Optimizer:public CAIF_Base
-  {
-    public:
-      /**
-       * @brief Parameterized constructor
-       * @param framework Reference to CAIF framework instance
-       * @param learning_rate Learning rate for parameter updates
-       */
-      explicit CAIF_Optimizer(CAIF_Framework &framework,
-                             const float learning_rate=g_caif_default_learning_rate
-                            )
-        :_framework(framework),
-         _learning_rate(learning_rate),
-         _iteration(0){}
-      
-      /**
-       * @brief Virtual destructor for proper inheritance
-       */
-      virtual ~CAIF_Optimizer()=default;
-      
-      /**
-       * @brief Copy constructor
-       * @param other Optimizer to copy from
-       * @note The framework reference is copied from the source (same framework instance)
-       */
-      CAIF_Optimizer(const CAIF_Optimizer &other):_framework(other._framework),  // Copy framework reference
-                                                _learning_rate(other._learning_rate),
-                                                _iteration(other._iteration){}
-      
-      /**
-       * @brief Move constructor
-       * @param other Optimizer to move from
-       */
-      CAIF_Optimizer(CAIF_Optimizer &&other):_framework(other._framework),
-                                           _learning_rate(other._learning_rate),
-                                           _iteration(other._iteration){}
-      
-      /**
-       * @brief Copy assignment operator
-       * @param other Optimizer to copy from
-       * @return Reference to this optimizer
-       */
-      CAIF_Optimizer &operator=(const CAIF_Optimizer &other)
-      {
-        if(this!=&other)
-        {
-          // Note: reference cannot be reassigned, so we only copy other members
-          _learning_rate=other._learning_rate;
-          _iteration=other._iteration;
-        }
-        return *this;
-      }
-      
-      /**
-       * @brief Move assignment operator
-       * @param other Optimizer to move from
-       * @return Reference to this optimizer
-       */
-      CAIF_Optimizer &operator=(CAIF_Optimizer &&other)noexcept
-      {
-        if(this!=&other)
-        {
-          // Note: reference cannot be reassigned, so we only move other members
-          _learning_rate=other._learning_rate;
-          _iteration=other._iteration;
-        }
-        return *this;
-      }
 
-      // Pure virtual methods
-      
-      /**
-       * @brief Update parameters using gradients
-       * @param parameters Current parameter tensors
-       * @param gradients Gradient tensors
-       * @return Updated parameters
-       */
-      virtual std::vector<CAIF_Tensor> UpdateParameters(
-                                                       const std::vector<CAIF_Tensor> &parameters,
-                                                       const std::vector<CAIF_Tensor> &gradients
-                                                      )=0;
-      
-      /**
-       * @brief Get optimizer type
-       * @return Optimizer type enum
-       */
-      virtual CAIF_OptimizerType_e OptimizerType()const=0;
-      
-      /**
-       * @brief Clone the optimizer
-       * @return A new optimizer instance with the same configuration
-       * @note The framework reference is copied from this optimizer (same framework instance)
-       */
-      virtual std::unique_ptr<CAIF_Optimizer> Clone()const=0;
-      
-      /**
-       * @brief Reset optimizer state
-       */
-      virtual void Reset()=0;
+class CAIF_DeviceNetwork;
 
-      /**
-       * @brief Get optimizer state for training resumption
-       * @return Vector of tensors containing the optimizer state
-       */
-      virtual std::vector<CAIF_Tensor> State()const=0;
-      
-      /**
-       * @brief Set optimizer state for training resumption
-       * @param state Vector of tensors containing the optimizer state
-       */
-      virtual void SetState(const std::vector<CAIF_Tensor> &state)=0;
+// Pure-virtual optimizer base. Holds the scaffolding every optimizer
+// needs (learning rate, weight decay, step counter, AMP fp32-master +
+// grad-fp32 buffers when the network's params are non-fp32). Concrete
+// subclasses (Adam, SGD, Momentum, RMSprop, AdaGrad) own their own
+// per-parameter state vectors and override AllocateState + UpdateOne.
+class CAIF_Optimizer
+{
+  public:
+    // Pair-of-indices addressing a single trainable param:
+    // (top-level layer index in the network, parameter index within
+    // that layer's flattened ParameterTensor walk). The optimizer
+    // captures these at Initialize() time so it can iterate exactly
+    // the trainable subset at Step() without re-querying
+    // IsLayerTrainable / IsParameterTrainable on every step.
+    struct ParamRef_t
+    {
+      public:
+        ParamRef_t()=default;
+        ParamRef_t(const size_t layer_idx,
+                   const size_t param_idx):_layer_idx(layer_idx),
+                                           _param_idx(param_idx){}
 
-      // Virtual methods with default implementations
-      
-      /**
-       * @brief Set learning rate
-       * @param learning_rate New learning rate
-       */
-      virtual void SetLearningRate(const float learning_rate){_learning_rate=learning_rate;}
-      
-      /**
-       * @brief Get current learning rate
-       * @return Current learning rate
-       */
-      virtual float LearningRate()const{return _learning_rate;}
-      
-      /**
-       * @brief Get current iteration count
-       * @return Current iteration
-       */
-      virtual uint32_t Iteration()const{return _iteration;}
-      
-      /**
-       * @brief Increment iteration counter
-       */
-      virtual void IncrementIteration(){++_iteration;}
-      
-      /**
-       * @brief Set iteration counter
-       * @param iteration New iteration value
-       */
-      virtual void SetIteration(const uint32_t iteration){_iteration=iteration;}
+        size_t LayerIndex()const{return _layer_idx;}
+        size_t ParamIndex()const{return _param_idx;}
+        void SetLayerIndex(const size_t i){_layer_idx=i;}
+        void SetParamIndex(const size_t i){_param_idx=i;}
 
-    protected:
-      /**
-       * @brief Get framework reference
-       * @return Reference to CAIF framework instance
-       */
-      CAIF_Framework &Framework(){return _framework;}
-      
-      /**
-       * @brief Get framework reference (const)
-       * @return Const reference to CAIF framework instance
-       */
-      const CAIF_Framework &Framework()const{return _framework;}
-      
-    private:
-      CAIF_Framework &_framework;
-      float _learning_rate;
-      uint32_t _iteration;
+      private:
+        size_t _layer_idx=0;
+        size_t _param_idx=0;
+    };
 
-      // Private members go here
-  };
+    typedef std::vector<ParamRef_t> ParamRefVec_t;
+
+    CAIF_Optimizer(const float lr,
+                   const float weight_decay,
+                   CAIF_CudaStream &stream);
+    virtual ~CAIF_Optimizer()=default;
+
+    // Walk the network's trainable layers and allocate per-parameter
+    // state. Idempotent: calling Initialize a second time discards
+    // previous state and re-allocates.
+    void Initialize(CAIF_DeviceNetwork &network);
+
+    // One optimizer step across every (param, grad) pair owned by the
+    // network's trainable layers. Increments StepCount() and dispatches
+    // to UpdateOne() per parameter.
+    void Step(CAIF_DeviceNetwork &network);
+
+    float LearningRate()const{return _lr;}
+    void SetLearningRate(const float lr){_lr=lr;}
+
+    int StepCount()const{return _t;}
+
+    virtual CAIF_OptimizerType_e Type()const=0;
+
+  protected:
+    // Subclass extension point: allocate any per-parameter state the
+    // subclass needs (m+v for Adam, velocity for Momentum, etc).
+    // Called once per trainable parameter tensor by Initialize().
+    virtual void AllocateState(const CAIF_DeviceTensor &param)=0;
+
+    // Subclass extension point: do the parameter update for the idx-th
+    // trainable param. `target` is the fp32 master copy when AMP is
+    // active (param's native dtype != fp32), otherwise `target` aliases
+    // the param itself. `grad` is fp32 in both cases (the caller upcasts
+    // when needed). Subclasses call CAIF_Ops::<Optimizer>Update.
+    virtual void UpdateOne(CAIF_DeviceTensor &target,
+                           const CAIF_DeviceTensor &grad,
+                           const size_t idx)=0;
+
+    float WeightDecay()const{return _weight_decay;}
+    CAIF_CudaStream &Stream()const{return *_stream;}
+
+  private:
+    void IncrementStep(){_t++;}
+    void ResetStepCount(){_t=0;}
+    const std::vector<CAIF_DeviceTensor> &Masters()const{return _master;}
+    std::vector<CAIF_DeviceTensor> &MastersMut(){return _master;}
+    const std::vector<CAIF_DeviceTensor> &GradFp32s()const{return _grad_fp32;}
+    std::vector<CAIF_DeviceTensor> &GradFp32sMut(){return _grad_fp32;}
+    const ParamRefVec_t &TrainableRefs()const{return _trainable_refs;}
+    ParamRefVec_t &TrainableRefsMut(){return _trainable_refs;}
+
+    float _lr;
+    float _weight_decay;
+    int _t;
+    CAIF_CudaStream *_stream;
+
+    // AMP master + grad-fp32 buffers — one per trainable param, in
+    // network-walk order. Empty (Tensor::TotalElements()==0) when the
+    // param is already fp32 (fast path, no upcast/downcast needed);
+    // otherwise master holds the fp32 copy that Update* writes to and
+    // grad_fp32 is the per-step upcast scratch.
+    std::vector<CAIF_DeviceTensor> _master;
+    std::vector<CAIF_DeviceTensor> _grad_fp32;
+
+    // (layer, param) refs of every parameter the optimizer owns state
+    // for. Populated by Initialize via IsLayerTrainable +
+    // IsParameterTrainable on each candidate param; iterated 1:1 by
+    // Step. Indices into _master / _grad_fp32 / per-subclass state
+    // vectors are positional within this list — the optimizer never
+    // re-queries the network's trainable flags after Initialize.
+    ParamRefVec_t _trainable_refs;
+};
+
 }//end instance namespace

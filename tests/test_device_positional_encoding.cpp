@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include "caif_device_positional_encoding.h"
+#include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -22,26 +24,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -59,14 +49,18 @@ static void TestLearnedForwardShape()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     std::vector<float> input_data(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=pe.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=pe.Forward(input,ctx);
     const auto &shape=output.Shape();
 
     bool passed=(shape.size()==3&&shape[0]==batch&&
@@ -87,11 +81,7 @@ static void TestLearnedForwardShape()
 
     ReportResult("PositionalEncoding::LearnedForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::LearnedForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::LearnedForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -107,8 +97,10 @@ static void TestLearnedForwardValues()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     // Read PE table
     CAIF_HostTensor host_pe=pe.ParameterTensor(0).ToHost();
@@ -122,7 +114,9 @@ static void TestLearnedForwardValues()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=pe.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=pe.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -148,11 +142,7 @@ static void TestLearnedForwardValues()
 
     ReportResult("PositionalEncoding::LearnedForwardValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::LearnedForwardValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::LearnedForwardValues")
 }
 
 //------------------------------------------------------------------------------
@@ -168,16 +158,20 @@ static void TestSinusoidalForwardValues()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,
                                       PositionalEncodingMode_e::Sinusoidal};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     // Zero input -> output should be pure PE
     std::vector<float> input_data(batch*seq_len*dim,0.0f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=pe.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=pe.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Compute expected sin/cos values
@@ -213,11 +207,7 @@ static void TestSinusoidalForwardValues()
 
     ReportResult("PositionalEncoding::SinusoidalForwardValues",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::SinusoidalForwardValues",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::SinusoidalForwardValues")
 }
 
 //------------------------------------------------------------------------------
@@ -233,15 +223,19 @@ static void TestSinusoidalOrthogonality()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,
                                       PositionalEncodingMode_e::Sinusoidal};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     std::vector<float> input_data(batch*seq_len*dim,0.0f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=pe.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=pe.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // Check that PE vectors at different positions are different
@@ -271,11 +265,7 @@ static void TestSinusoidalOrthogonality()
 
     ReportResult("PositionalEncoding::SinusoidalOrthogonality",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::SinusoidalOrthogonality",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::SinusoidalOrthogonality")
 }
 
 //------------------------------------------------------------------------------
@@ -291,13 +281,17 @@ static void TestLearnedBackwardInputGrad()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     std::vector<float> input_data(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
-    pe.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    pe.Forward(input,ctx);
 
     // Create specific grad_output
     std::vector<float> grad_data(batch*seq_len*dim);
@@ -308,7 +302,8 @@ static void TestLearnedBackwardInputGrad()
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_data.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor grad_input=pe.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=pe.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
 
     // grad_input should equal grad_output (identity)
@@ -326,11 +321,7 @@ static void TestLearnedBackwardInputGrad()
 
     ReportResult("PositionalEncoding::LearnedBackwardInputGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::LearnedBackwardInputGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::LearnedBackwardInputGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -346,13 +337,17 @@ static void TestLearnedBackwardWeightGrad()
     constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePositionalEncoding::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe(config,stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config{max_seq,dim,PositionalEncodingMode_e::Learned};
+    CAIF_DevicePositionalEncoding<float,float> pe(config,stream);
 
     std::vector<float> input_data(batch*seq_len*dim,1.0f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,dim},stream);
-    pe.Forward(input,true);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    pe.Forward(input,ctx);
 
     // grad_output with known values
     std::vector<float> grad_data(batch*seq_len*dim);
@@ -362,7 +357,8 @@ static void TestLearnedBackwardWeightGrad()
     }
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
                                 grad_data.data(),{batch,seq_len,dim},stream);
-    pe.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    pe.Backward(grad_out,ctx);
 
     CAIF_HostTensor host_grad_pe=pe.GradientTensor(0).ToHost();
 
@@ -389,11 +385,7 @@ static void TestLearnedBackwardWeightGrad()
 
     ReportResult("PositionalEncoding::LearnedBackwardWeightGrad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::LearnedBackwardWeightGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::LearnedBackwardWeightGrad")
 }
 
 //------------------------------------------------------------------------------
@@ -409,14 +401,14 @@ static void TestParameterCount()
     CAIF_CudaStream stream;
 
     // Learned: 1 tensor
-    CAIF_DevicePositionalEncoding::Config_t config_l{max_seq,dim,
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config_l{max_seq,dim,
                                         PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe_l(config_l,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe_l(config_l,stream);
 
     // Sinusoidal: 0 tensors
-    CAIF_DevicePositionalEncoding::Config_t config_s{max_seq,dim,
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config_s{max_seq,dim,
                                         PositionalEncodingMode_e::Sinusoidal};
-    CAIF_DevicePositionalEncoding pe_s(config_s,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe_s(config_s,stream);
 
     bool passed=true;
     if(pe_l.ParameterTensorCount()!=1)
@@ -444,11 +436,7 @@ static void TestParameterCount()
 
     ReportResult("PositionalEncoding::ParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::ParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::ParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -463,13 +451,13 @@ static void TestDescription()
 
     CAIF_CudaStream stream;
 
-    CAIF_DevicePositionalEncoding::Config_t config_l{max_seq,dim,
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config_l{max_seq,dim,
                                         PositionalEncodingMode_e::Learned};
-    CAIF_DevicePositionalEncoding pe_l(config_l,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe_l(config_l,stream);
 
-    CAIF_DevicePositionalEncoding::Config_t config_s{max_seq,dim,
+    CAIF_DevicePositionalEncoding<float,float>::Config_t config_s{max_seq,dim,
                                         PositionalEncodingMode_e::Sinusoidal};
-    CAIF_DevicePositionalEncoding pe_s(config_s,stream);
+    CAIF_DevicePositionalEncoding<float,float> pe_s(config_s,stream);
 
     const std::string desc_l=pe_l.Description();
     const std::string expected_l="PositionalEncoding(max_seq=8,dim=8,mode=learned)";
@@ -489,18 +477,14 @@ static void TestDescription()
 
     ReportResult("PositionalEncoding::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PositionalEncoding::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PositionalEncoding::Description")
 }
 
 #endif  // USE_CAIF_CUDA
 
 int main()
 {
-  std::cout<<"=== CAIF_DevicePositionalEncoding Tests ===\n\n";
+  std::cout<<"=== CAIF_DevicePositionalEncoding<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
   TestLearnedForwardShape();
@@ -515,13 +499,5 @@ int main()
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

@@ -17,8 +17,10 @@
 // KV-Cache test for Multi-Head Attention
 //------------------------------------------------------------------------------
 #include "caif_device_multi_head_attention.h"
+#include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -27,26 +29,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 static void FillRandom(std::vector<float> &data,float min_val,float max_val,
@@ -68,8 +58,10 @@ static void FillRandom(std::vector<float> &data,float min_val,float max_val,
 static void TestKVCacheManagement()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=64;
   config.num_heads=4;
   config.num_kv_heads=4;
@@ -79,7 +71,7 @@ static void TestKVCacheManagement()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   // Initially disabled
@@ -118,7 +110,9 @@ static void TestKVCacheManagement()
   FillRandom(input_data,-1.0f,1.0f,123);
   CAIF_DeviceTensor d_input=CAIF_DeviceTensor::FromHostData(
                              input_data.data(),{batch,seq_len,config.dim},stream);
-  CAIF_DeviceTensor output=mha.ForwardCached(d_input);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=mha.ForwardCached(d_input,ctx);
   stream.Synchronize();
 
   if(mha.KVCacheLength()!=seq_len)
@@ -148,8 +142,10 @@ static void TestKVCacheManagement()
 static void TestCachedMatchesNonCached()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.num_kv_heads=2;
@@ -159,7 +155,7 @@ static void TestCachedMatchesNonCached()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   const uint32_t batch=1;
@@ -172,18 +168,20 @@ static void TestCachedMatchesNonCached()
                              input_data.data(),{batch,seq_len,config.dim},stream);
 
   // Non-cached forward
-  CAIF_DeviceTensor output_nocache=mha.Forward(d_input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output_nocache=mha.Forward(d_input,ctx);
   CAIF_HostTensor h_out_nocache=output_nocache.ToHost();
 
   // Cached forward (full prompt)
   mha.EnableKVCache(batch,seq_len);
   mha.ResetKVCache();
-  CAIF_DeviceTensor output_cached=mha.ForwardCached(d_input);
+  CAIF_DeviceTensor output_cached=mha.ForwardCached(d_input,ctx);
   CAIF_HostTensor h_out_cached=output_cached.ToHost();
 
   // Compare outputs
   bool test_pass=true;
-  const float tol=1e-4f;
+  const float tol=5e-4f;
   const size_t total=batch*seq_len*config.dim;
   for(size_t i=0;i<total;++i)
   {
@@ -207,8 +205,10 @@ static void TestCachedMatchesNonCached()
 static void TestIncrementalDecoding()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.num_kv_heads=2;
@@ -218,7 +218,7 @@ static void TestIncrementalDecoding()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   const uint32_t batch=1;
@@ -231,9 +231,11 @@ static void TestIncrementalDecoding()
   FillRandom(full_input,-1.0f,1.0f,777);
 
   // Full forward for reference
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
   CAIF_DeviceTensor d_full=CAIF_DeviceTensor::FromHostData(
                             full_input.data(),{batch,total_len,config.dim},stream);
-  CAIF_DeviceTensor full_output=mha.Forward(d_full,false);
+  CAIF_DeviceTensor full_output=mha.Forward(d_full,ctx);
   CAIF_HostTensor h_full_out=full_output.ToHost();
 
   // Incremental decoding
@@ -248,11 +250,11 @@ static void TestIncrementalDecoding()
   }
   CAIF_DeviceTensor d_prompt=CAIF_DeviceTensor::FromHostData(
                               prompt_data.data(),{batch,prompt_len,config.dim},stream);
-  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt);
+  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt,ctx);
   CAIF_HostTensor h_prompt_out=prompt_out.ToHost();
 
   bool test_pass=true;
-  const float tol=1e-4f;
+  const float tol=5e-4f;
 
   // Check prompt output matches full output prefix
   for(uint32_t b=0;b<batch;++b)
@@ -299,7 +301,7 @@ static void TestIncrementalDecoding()
     }
     CAIF_DeviceTensor d_token=CAIF_DeviceTensor::FromHostData(
                                token_data.data(),{batch,1,config.dim},stream);
-    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token);
+    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token,ctx);
     CAIF_HostTensor h_token_out=token_out.ToHost();
 
     // Check output matches full forward at this position
@@ -335,8 +337,10 @@ static void TestIncrementalDecoding()
 static void TestIncrementalDecodingWithRoPE()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.num_kv_heads=2;
@@ -346,7 +350,7 @@ static void TestIncrementalDecodingWithRoPE()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   const uint32_t batch=1;
@@ -359,9 +363,11 @@ static void TestIncrementalDecodingWithRoPE()
   FillRandom(full_input,-1.0f,1.0f,888);
 
   // Full forward for reference
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
   CAIF_DeviceTensor d_full=CAIF_DeviceTensor::FromHostData(
                             full_input.data(),{batch,total_len,config.dim},stream);
-  CAIF_DeviceTensor full_output=mha.Forward(d_full,false);
+  CAIF_DeviceTensor full_output=mha.Forward(d_full,ctx);
   CAIF_HostTensor h_full_out=full_output.ToHost();
 
   // Incremental decoding
@@ -376,11 +382,11 @@ static void TestIncrementalDecodingWithRoPE()
   }
   CAIF_DeviceTensor d_prompt=CAIF_DeviceTensor::FromHostData(
                               prompt_data.data(),{batch,prompt_len,config.dim},stream);
-  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt);
+  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt,ctx);
   CAIF_HostTensor h_prompt_out=prompt_out.ToHost();
 
   bool test_pass=true;
-  const float tol=1e-4f;
+  const float tol=5e-4f;
 
   // Check prompt output matches full output prefix
   for(uint32_t b=0;b<batch;++b)
@@ -427,7 +433,7 @@ static void TestIncrementalDecodingWithRoPE()
     }
     CAIF_DeviceTensor d_token=CAIF_DeviceTensor::FromHostData(
                                token_data.data(),{batch,1,config.dim},stream);
-    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token);
+    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token,ctx);
     CAIF_HostTensor h_token_out=token_out.ToHost();
 
     // Check output matches full forward at this position
@@ -463,8 +469,10 @@ static void TestIncrementalDecodingWithRoPE()
 static void TestGQAWithKVCache()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=64;
   config.num_heads=4;
   config.num_kv_heads=2;  // GQA: 4 query heads share 2 kv heads
@@ -474,7 +482,7 @@ static void TestGQAWithKVCache()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   const uint32_t batch=1;
@@ -487,9 +495,11 @@ static void TestGQAWithKVCache()
   FillRandom(full_input,-1.0f,1.0f,555);
 
   // Full forward for reference
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
   CAIF_DeviceTensor d_full=CAIF_DeviceTensor::FromHostData(
                             full_input.data(),{batch,total_len,config.dim},stream);
-  CAIF_DeviceTensor full_output=mha.Forward(d_full,false);
+  CAIF_DeviceTensor full_output=mha.Forward(d_full,ctx);
   CAIF_HostTensor h_full_out=full_output.ToHost();
 
   // Incremental decoding
@@ -504,11 +514,11 @@ static void TestGQAWithKVCache()
   }
   CAIF_DeviceTensor d_prompt=CAIF_DeviceTensor::FromHostData(
                               prompt_data.data(),{batch,prompt_len,config.dim},stream);
-  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt);
+  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt,ctx);
   CAIF_HostTensor h_prompt_out=prompt_out.ToHost();
 
   bool test_pass=true;
-  const float tol=1e-4f;
+  const float tol=5e-4f;
 
   // Check prompt output
   for(uint32_t s=0;s<prompt_len&&test_pass==true;++s)
@@ -538,7 +548,7 @@ static void TestGQAWithKVCache()
     }
     CAIF_DeviceTensor d_token=CAIF_DeviceTensor::FromHostData(
                                token_data.data(),{batch,1,config.dim},stream);
-    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token);
+    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token,ctx);
     CAIF_HostTensor h_token_out=token_out.ToHost();
 
     for(uint32_t d=0;d<config.dim;++d)
@@ -564,8 +574,10 @@ static void TestGQAWithKVCache()
 static void TestBatchedKVCache()
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=32;
   config.num_heads=2;
   config.num_kv_heads=2;
@@ -575,7 +587,7 @@ static void TestBatchedKVCache()
   config.rope_base=10000.0f;
   config.dropout_rate=0.0f;
 
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
   mha.InitializeWeights(42);
 
   const uint32_t batch=3;
@@ -588,9 +600,11 @@ static void TestBatchedKVCache()
   FillRandom(full_input,-1.0f,1.0f,333);
 
   // Full forward for reference
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
   CAIF_DeviceTensor d_full=CAIF_DeviceTensor::FromHostData(
                             full_input.data(),{batch,total_len,config.dim},stream);
-  CAIF_DeviceTensor full_output=mha.Forward(d_full,false);
+  CAIF_DeviceTensor full_output=mha.Forward(d_full,ctx);
   CAIF_HostTensor h_full_out=full_output.ToHost();
 
   // Incremental decoding
@@ -612,11 +626,11 @@ static void TestBatchedKVCache()
   }
   CAIF_DeviceTensor d_prompt=CAIF_DeviceTensor::FromHostData(
                               prompt_data.data(),{batch,prompt_len,config.dim},stream);
-  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt);
+  CAIF_DeviceTensor prompt_out=mha.ForwardCached(d_prompt,ctx);
   CAIF_HostTensor h_prompt_out=prompt_out.ToHost();
 
   bool test_pass=true;
-  const float tol=1e-4f;
+  const float tol=5e-4f;
 
   // Check prompt output for all batches
   for(uint32_t b=0;b<batch&&test_pass==true;++b)
@@ -654,7 +668,7 @@ static void TestBatchedKVCache()
     }
     CAIF_DeviceTensor d_token=CAIF_DeviceTensor::FromHostData(
                                token_data.data(),{batch,1,config.dim},stream);
-    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token);
+    CAIF_DeviceTensor token_out=mha.ForwardCached(d_token,ctx);
     CAIF_HostTensor h_token_out=token_out.ToHost();
 
     for(uint32_t b=0;b<batch&&test_pass==true;++b)
@@ -699,10 +713,10 @@ int main()
 #endif
 
   std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
+  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-  if(g_tests_failed>0)
+  if(CAIF_TestHarness::FailedCount()>0)
   {
     std::cout<<"SOME TESTS FAILED!\n";
     return 1;

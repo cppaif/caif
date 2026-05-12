@@ -21,6 +21,7 @@
 #include "caif_device_vit_model.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -95,16 +96,18 @@ static void TestTabularEmbeddingForward()
   std::cout<<"TestTabularEmbeddingForward... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_num_features=8;
   constexpr uint32_t g_dim=16;
   constexpr uint32_t g_batch=2;
 
-  CAIF_DeviceTabularEmbedding::Config_t config;
+  CAIF_DeviceTabularEmbedding<float,float>::Config_t config;
   config.num_features=g_num_features;
   config.dim=g_dim;
 
-  CAIF_DeviceTabularEmbedding embed(config,stream);
+  CAIF_DeviceTabularEmbedding<float,float> embed(config,stream);
 
   // Create input [batch, num_features]
   std::vector<float> input_data(g_batch*g_num_features);
@@ -118,7 +121,9 @@ static void TestTabularEmbeddingForward()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_num_features},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Check output shape: [batch, 1, dim]
   const auto &shape=output.Shape();
@@ -156,17 +161,19 @@ static void TestTabularEmbedding3D()
   std::cout<<"TestTabularEmbedding3D... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_num_features=4;
   constexpr uint32_t g_dim=8;
   constexpr uint32_t g_batch=2;
   constexpr uint32_t g_seq_len=3;
 
-  CAIF_DeviceTabularEmbedding::Config_t config;
+  CAIF_DeviceTabularEmbedding<float,float>::Config_t config;
   config.num_features=g_num_features;
   config.dim=g_dim;
 
-  CAIF_DeviceTabularEmbedding embed(config,stream);
+  CAIF_DeviceTabularEmbedding<float,float> embed(config,stream);
 
   // Create input [batch, seq_len, num_features]
   std::vector<float> input_data(g_batch*g_seq_len*g_num_features);
@@ -180,7 +187,9 @@ static void TestTabularEmbedding3D()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_seq_len,g_num_features},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Check output shape: [batch, seq_len, dim]
   const auto &shape=output.Shape();
@@ -200,16 +209,18 @@ static void TestTabularEmbeddingGradient()
   std::cout<<"TestTabularEmbeddingGradient... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_num_features=4;
   constexpr uint32_t g_dim=6;
   constexpr uint32_t g_batch=2;
 
-  CAIF_DeviceTabularEmbedding::Config_t config;
+  CAIF_DeviceTabularEmbedding<float,float>::Config_t config;
   config.num_features=g_num_features;
   config.dim=g_dim;
 
-  CAIF_DeviceTabularEmbedding embed(config,stream);
+  CAIF_DeviceTabularEmbedding<float,float> embed(config,stream);
 
   std::vector<float> input_data(g_batch*g_num_features);
   std::mt19937 rng(g_test_seed_3);
@@ -223,7 +234,9 @@ static void TestTabularEmbeddingGradient()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_num_features},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Create grad_output (ones)
   std::vector<float> grad_out_data(g_batch*1*g_dim,1.0f);
@@ -232,7 +245,11 @@ static void TestTabularEmbeddingGradient()
                                                               stream);
 
   embed.ZeroGradients();
-  CAIF_DeviceTensor grad_input=embed.Backward(grad_output);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  CAIF_DeviceTensor grad_input=embed.Backward(grad_output,ctx);
+
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
 
   // Finite difference check for input
   std::vector<float> grad_input_host=ToVector(grad_input.ToHost());
@@ -243,14 +260,14 @@ static void TestTabularEmbeddingGradient()
     CAIF_DeviceTensor input_plus=CAIF_DeviceTensor::FromHostData(perturbed.data(),
                                                                {g_batch,g_num_features},
                                                                stream);
-    CAIF_DeviceTensor out_plus=embed.Forward(input_plus,false);
+    CAIF_DeviceTensor out_plus=embed.Forward(input_plus,ctx);
     std::vector<float> out_plus_host=ToVector(out_plus.ToHost());
 
     perturbed[i]=input_data[i]-g_finite_diff_eps;
     CAIF_DeviceTensor input_minus=CAIF_DeviceTensor::FromHostData(perturbed.data(),
                                                                 {g_batch,g_num_features},
                                                                 stream);
-    CAIF_DeviceTensor out_minus=embed.Forward(input_minus,false);
+    CAIF_DeviceTensor out_minus=embed.Forward(input_minus,ctx);
     std::vector<float> out_minus_host=ToVector(out_minus.ToHost());
 
     float numerical_grad=0.0f;
@@ -279,18 +296,20 @@ static void TestSpectrogramEmbeddingForward()
   std::cout<<"TestSpectrogramEmbeddingForward... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_freq_bins=80;
   constexpr uint32_t g_dim=64;
   constexpr uint32_t g_batch=2;
   constexpr uint32_t g_time_frames=10;
 
-  CAIF_DeviceSpectrogramEmbedding::Config_t config;
+  CAIF_DeviceSpectrogramEmbedding<float,float>::Config_t config;
   config.freq_bins=g_freq_bins;
   config.dim=g_dim;
   config.use_cls_token=false;
 
-  CAIF_DeviceSpectrogramEmbedding embed(config,stream);
+  CAIF_DeviceSpectrogramEmbedding<float,float> embed(config,stream);
 
   // Create input [batch, time_frames, freq_bins]
   std::vector<float> input_data(g_batch*g_time_frames*g_freq_bins);
@@ -304,7 +323,9 @@ static void TestSpectrogramEmbeddingForward()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_time_frames,g_freq_bins},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Check output shape: [batch, time_frames, dim]
   const auto &shape=output.Shape();
@@ -324,18 +345,20 @@ static void TestSpectrogramEmbeddingWithCLS()
   std::cout<<"TestSpectrogramEmbeddingWithCLS... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_freq_bins=40;
   constexpr uint32_t g_dim=32;
   constexpr uint32_t g_batch=2;
   constexpr uint32_t g_time_frames=5;
 
-  CAIF_DeviceSpectrogramEmbedding::Config_t config;
+  CAIF_DeviceSpectrogramEmbedding<float,float>::Config_t config;
   config.freq_bins=g_freq_bins;
   config.dim=g_dim;
   config.use_cls_token=true;
 
-  CAIF_DeviceSpectrogramEmbedding embed(config,stream);
+  CAIF_DeviceSpectrogramEmbedding<float,float> embed(config,stream);
 
   // Create input [batch, time_frames, freq_bins]
   std::vector<float> input_data(g_batch*g_time_frames*g_freq_bins);
@@ -349,7 +372,9 @@ static void TestSpectrogramEmbeddingWithCLS()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_time_frames,g_freq_bins},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Check output shape: [batch, time_frames+1, dim] (CLS token prepended)
   const auto &shape=output.Shape();
@@ -387,18 +412,20 @@ static void TestSpectrogramEmbeddingGradient()
   std::cout<<"TestSpectrogramEmbeddingGradient... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_freq_bins=8;
   constexpr uint32_t g_dim=6;
   constexpr uint32_t g_batch=2;
   constexpr uint32_t g_time_frames=3;
 
-  CAIF_DeviceSpectrogramEmbedding::Config_t config;
+  CAIF_DeviceSpectrogramEmbedding<float,float>::Config_t config;
   config.freq_bins=g_freq_bins;
   config.dim=g_dim;
   config.use_cls_token=false;
 
-  CAIF_DeviceSpectrogramEmbedding embed(config,stream);
+  CAIF_DeviceSpectrogramEmbedding<float,float> embed(config,stream);
 
   std::vector<float> input_data(g_batch*g_time_frames*g_freq_bins);
   std::mt19937 rng(g_test_seed_6);
@@ -412,7 +439,9 @@ static void TestSpectrogramEmbeddingGradient()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_time_frames,g_freq_bins},
                                                         stream);
-  CAIF_DeviceTensor output=embed.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=embed.Forward(input,ctx);
 
   // Create grad_output (ones)
   std::vector<float> grad_out_data(g_batch*g_time_frames*g_dim,1.0f);
@@ -421,7 +450,8 @@ static void TestSpectrogramEmbeddingGradient()
                                                               stream);
 
   embed.ZeroGradients();
-  CAIF_DeviceTensor grad_input=embed.Backward(grad_output);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  CAIF_DeviceTensor grad_input=embed.Backward(grad_output,ctx);
 
   // Just check shapes for now
   const auto &grad_shape=grad_input.Shape();
@@ -441,6 +471,8 @@ static void TestViTModelForward()
   std::cout<<"TestViTModelForward... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_image_height=32;
   constexpr uint32_t g_image_width=32;
@@ -455,7 +487,7 @@ static void TestViTModelForward()
   constexpr float g_dropout_rate=0.0f;
   constexpr float g_rope_base=10000.0f;
 
-  CAIF_DeviceViTModel::Config_t config;
+  CAIF_DeviceViTModel<float,float>::Config_t config;
   config.image_height=g_image_height;
   config.image_width=g_image_width;
   config.channels=g_channels;
@@ -469,7 +501,7 @@ static void TestViTModelForward()
   config.use_rope=false;
   config.rope_base=g_rope_base;
 
-  CAIF_DeviceViTModel vit(config,stream);
+  CAIF_DeviceViTModel<float,float> vit(config,stream);
 
   // Check computed properties
   constexpr uint32_t g_expected_num_patches=(g_image_height/g_patch_size)*(g_image_width/g_patch_size);
@@ -488,7 +520,9 @@ static void TestViTModelForward()
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(input_data.data(),
                                                         {g_batch,g_image_height,g_image_width,g_channels},
                                                         stream);
-  CAIF_DeviceTensor output=vit.Forward(input,false);
+  ctx.SetTraining(false);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=vit.Forward(input,ctx);
 
   // Check output shape: [batch, num_classes]
   const auto &shape=output.Shape();
@@ -514,6 +548,8 @@ static void TestViTModelBackward()
   std::cout<<"TestViTModelBackward... "<<std::flush;
 
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
 
   constexpr uint32_t g_image_height=16;
   constexpr uint32_t g_image_width=16;
@@ -528,7 +564,7 @@ static void TestViTModelBackward()
   constexpr float g_dropout_rate=0.0f;
   constexpr float g_rope_base=10000.0f;
 
-  CAIF_DeviceViTModel::Config_t config;
+  CAIF_DeviceViTModel<float,float>::Config_t config;
   config.image_height=g_image_height;
   config.image_width=g_image_width;
   config.channels=g_channels;
@@ -542,7 +578,7 @@ static void TestViTModelBackward()
   config.use_rope=false;
   config.rope_base=g_rope_base;
 
-  CAIF_DeviceViTModel vit(config,stream);
+  CAIF_DeviceViTModel<float,float> vit(config,stream);
 
   // Create input
   std::vector<float> input_data(g_batch*g_image_height*g_image_width*g_channels);
@@ -558,7 +594,9 @@ static void TestViTModelBackward()
                                                         stream);
 
   // Forward with training=true
-  CAIF_DeviceTensor output=vit.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=vit.Forward(input,ctx);
 
   // Create grad_output
   std::vector<float> grad_out_data(g_batch*g_num_classes,1.0f);
@@ -568,7 +606,8 @@ static void TestViTModelBackward()
 
   // Backward
   vit.ZeroGradients();
-  CAIF_DeviceTensor grad_input=vit.Backward(grad_output);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  CAIF_DeviceTensor grad_input=vit.Backward(grad_output,ctx);
 
   // Check grad_input shape
   const auto &shape=grad_input.Shape();
@@ -608,6 +647,11 @@ int main()
 
     std::cout<<"\n=== All Multi-Modal Embedding Tests PASSED ==="<<std::endl;
     return 0;
+  }
+  catch(const CAIF_Exception &e)
+  {
+    std::cerr<<"Test failed with exception: "<<e<<std::endl;
+    return 1;
   }
   catch(const std::exception &e)
   {

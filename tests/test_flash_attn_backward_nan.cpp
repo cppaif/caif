@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include "caif_device_multi_head_attention.h"
+#include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
 #include <iostream>
 #include <vector>
@@ -23,21 +25,9 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -120,13 +110,13 @@ static void FillDeterministic(float *data,
 //------------------------------------------------------------------------------
 // Helper: create GQA config matching Qwen2.5-Coder-1.5B
 //------------------------------------------------------------------------------
-static CAIF_DeviceMultiHeadAttention::AttentionConfig_t MakeQwenConfig(
+static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeQwenConfig(
   const uint32_t dim,
   const uint32_t num_heads,
   const uint32_t num_kv_heads,
   const uint32_t head_dim)
 {
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=dim;
   config.num_heads=num_heads;
   config.num_kv_heads=num_kv_heads;
@@ -154,8 +144,10 @@ static bool RunMHABackwardNanCheck(const char *test_label,
                                    const uint32_t seed)
 {
   CAIF_CudaStream stream;
+  CAIF_RunContext ctx;
+  ctx.SetStream(stream);
   auto config=MakeQwenConfig(dim,num_heads,num_kv_heads,head_dim);
-  CAIF_DeviceMultiHeadAttention mha(config,stream);
+  CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
   std::cout<<"  "<<test_label<<": dim="<<dim
            <<" heads="<<num_heads
@@ -175,7 +167,9 @@ static bool RunMHABackwardNanCheck(const char *test_label,
                                                         stream);
 
   // Forward with training=true
-  CAIF_DeviceTensor output=mha.Forward(input,true);
+  ctx.SetTraining(true);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+  CAIF_DeviceTensor output=mha.Forward(input,ctx);
 
   // Check forward output
   CAIF_HostTensor h_output=output.ToHost();
@@ -200,7 +194,8 @@ static bool RunMHABackwardNanCheck(const char *test_label,
   CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
                                                            {batch,seq_len,dim},
                                                            stream);
-  CAIF_DeviceTensor grad_input=mha.Backward(grad_out);
+  ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+  CAIF_DeviceTensor grad_input=mha.Backward(grad_out,ctx);
 
   // Check input gradient
   CAIF_HostTensor h_grad_input=grad_input.ToHost();
@@ -414,13 +409,5 @@ int main()
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

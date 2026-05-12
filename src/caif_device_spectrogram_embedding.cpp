@@ -14,106 +14,121 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident spectrogram embedding implementation
+// Device-resident spectrogram embedding implementation (templated).
 //------------------------------------------------------------------------------
 #include "caif_device_spectrogram_embedding.h"
-#include "caif_device_ops.h"
-#include <cstring>
+#include "caif_device_spectrogram_embedding_factory.h"
+#include "caif_ops.h"
 #include "caif_cuda_kernels.h"
 #include "caif_exception.h"
+#include <cstring>
 #include <cmath>
-#include <random>
+#include <vector>
 
 namespace instance
 {
 
-CAIF_DeviceSpectrogramEmbedding::CAIF_DeviceSpectrogramEmbedding(const Config_t &config,
-                                                               CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
-                                                               _config(config),
-                                                               _cached_batch(0),
-                                                               _cached_time_frames(0)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::CAIF_DeviceSpectrogramEmbedding(
+                                                  const Config_t &config,
+                                                  CAIF_CudaStream &stream):
+                                          CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+                                          _config(config),
+                                          _w_proj(),
+                                          _b_proj(),
+                                          _cls_token(),
+                                          _grad_w_proj(),
+                                          _grad_b_proj(),
+                                          _grad_cls(),
+                                          _cached_input(),
+                                          _cached_batch(0),
+                                          _cached_time_frames(0)
 {
   try
   {
     if(config.freq_bins==0)
     {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: freq_bins must be > 0");
+      THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding: freq_bins must be > 0");
     }
     if(config.dim==0)
     {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: dim must be > 0");
+      THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding: dim must be > 0");
     }
 
-    // Allocate parameters
-    _w_proj=CAIF_DeviceTensor::Zeros({config.freq_bins,config.dim},stream);
-    _b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
-    // Allocate gradients
-    _grad_w_proj=CAIF_DeviceTensor::Zeros({config.freq_bins,config.dim},stream);
-    _grad_b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream);
+    _w_proj=CAIF_DeviceTensor::Zeros({config.freq_bins,config.dim},stream,sdt);
+    _b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream,sdt);
 
-    // CLS token (optional)
+    _grad_w_proj=CAIF_DeviceTensor::Zeros({config.freq_bins,config.dim},stream,sdt);
+    _grad_b_proj=CAIF_DeviceTensor::Zeros({config.dim},stream,sdt);
+
     if(config.use_cls_token==true)
     {
-      _cls_token=CAIF_DeviceTensor::Zeros({1,config.dim},stream);
-      _grad_cls=CAIF_DeviceTensor::Zeros({1,config.dim},stream);
+      _cls_token=CAIF_DeviceTensor::Zeros({1,config.dim},stream,sdt);
+      _grad_cls=CAIF_DeviceTensor::Zeros({1,config.dim},stream,sdt);
     }
 
-    // Initialize weights
     InitializeWeights(0);
   }
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceSpectrogramEmbedding::CAIF_DeviceSpectrogramEmbedding(
-  CAIF_DeviceSpectrogramEmbedding &&other):CAIF_DeviceLayer(std::move(other)),
-                                          _config(other._config),
-                                          _w_proj(std::move(other._w_proj)),
-                                          _b_proj(std::move(other._b_proj)),
-                                          _cls_token(std::move(other._cls_token)),
-                                          _grad_w_proj(std::move(other._grad_w_proj)),
-                                          _grad_b_proj(std::move(other._grad_b_proj)),
-                                          _grad_cls(std::move(other._grad_cls)),
-                                          _cached_input(std::move(other._cached_input)),
-                                          _cached_batch(other._cached_batch),
-                                          _cached_time_frames(other._cached_time_frames)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::CAIF_DeviceSpectrogramEmbedding(
+                                              CAIF_DeviceSpectrogramEmbedding &&other):
+                              CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                              _config(other._config),
+                              _w_proj(std::move(other._w_proj)),
+                              _b_proj(std::move(other._b_proj)),
+                              _cls_token(std::move(other._cls_token)),
+                              _grad_w_proj(std::move(other._grad_w_proj)),
+                              _grad_b_proj(std::move(other._grad_b_proj)),
+                              _grad_cls(std::move(other._grad_cls)),
+                              _cached_input(std::move(other._cached_input)),
+                              _cached_batch(other._cached_batch),
+                              _cached_time_frames(other._cached_time_frames)
 {
 }
 
-CAIF_DeviceSpectrogramEmbedding &CAIF_DeviceSpectrogramEmbedding::operator=(CAIF_DeviceSpectrogramEmbedding &&other)
-{
-  if(this!=&other)
-  {
-    CAIF_DeviceLayer::operator=(std::move(other));
-    _config=other._config;
-    _w_proj=std::move(other._w_proj);
-    _b_proj=std::move(other._b_proj);
-    _cls_token=std::move(other._cls_token);
-    _grad_w_proj=std::move(other._grad_w_proj);
-    _grad_b_proj=std::move(other._grad_b_proj);
-    _grad_cls=std::move(other._grad_cls);
-    _cached_input=std::move(other._cached_input);
-    _cached_batch=other._cached_batch;
-    _cached_time_frames=other._cached_time_frames;
-  }
-  return *this;
-}
-
-CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTensor &input,
-                                                         bool training)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT> &
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::operator=(CAIF_DeviceSpectrogramEmbedding &&other)
 {
   try
   {
-    if(_stream==nullptr)
+    if(this!=&other)
     {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: layer has been moved from");
+      CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
+      _config=other._config;
+      _w_proj=std::move(other._w_proj);
+      _b_proj=std::move(other._b_proj);
+      _cls_token=std::move(other._cls_token);
+      _grad_w_proj=std::move(other._grad_w_proj);
+      _grad_b_proj=std::move(other._grad_b_proj);
+      _grad_cls=std::move(other._grad_cls);
+      _cached_input=std::move(other._cached_input);
+      _cached_batch=other._cached_batch;
+      _cached_time_frames=other._cached_time_frames;
     }
+    return *this;
+  }
+  CAIF_CATCH_BLOCK()
+}
 
-    // Input: [batch, time_frames, freq_bins]
-    const auto &shape=input.Shape();
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                                 CAIF_RunContext &ctx)
+{
+  try
+  {
+    AssertInputDtype(input);
+
+    const std::vector<uint32_t> &shape=input.Shape();
     if(shape.size()!=3)
     {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: input must be 3D [batch, time_frames, freq_bins]");
+      THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding: input must be 3D [batch, time_frames, freq_bins]");
     }
 
     const uint32_t batch=shape[0];
@@ -122,76 +137,67 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTens
 
     if(freq_bins!=_config.freq_bins)
     {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: freq_bins mismatch");
+      THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding: freq_bins mismatch");
     }
 
     const uint32_t dim=_config.dim;
 
-    // Cache for backward
-    if(training==true)
+    if(ctx.Training()==true)
     {
       _cached_input=input.Clone();
       _cached_batch=batch;
       _cached_time_frames=time_frames;
     }
 
-    // Flatten to [batch*time_frames, freq_bins]
     const uint32_t total_rows=batch*time_frames;
     CAIF_DeviceTensor flat_input=input.Clone();
     flat_input.Reshape({total_rows,freq_bins});
 
-    // Project: output = input @ W_proj
-    CAIF_DeviceTensor proj_output=CAIF_DeviceTensor::Uninitialized({total_rows,dim},*_stream);
-    CAIF_DeviceOps::MatMul(flat_input,_w_proj,proj_output);
+    CAIF_DeviceTensor proj_output=AllocateOutput({total_rows,dim},ctx);
+    CAIF_Ops::MatMul(flat_input,_w_proj,proj_output,ctx);
+    CAIF_Ops::BiasAdd(proj_output,_b_proj,proj_output);
 
-    // Add bias
-    launch_bias_add_2d(proj_output.DevicePtr(),_b_proj.DevicePtr(),
-                       proj_output.DevicePtr(),
-                       static_cast<int>(total_rows),
-                       static_cast<int>(dim),
-                       _stream->Handle());
-
-    // Reshape to [batch, time_frames, dim]
     proj_output.Reshape({batch,time_frames,dim});
 
-    // Optionally prepend CLS token
     if(_config.use_cls_token==true)
     {
       const uint32_t out_seq_len=time_frames+1;
-      CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({batch,out_seq_len,dim},*_stream);
+      CAIF_DeviceTensor output=AllocateOutput({batch,out_seq_len,dim},ctx);
 
-      // Copy CLS token to position 0 for each batch
+      StorageT *output_ptr=StoragePtr(output);
+      const StorageT *cls_ptr=StoragePtr(_cls_token);
+      const StorageT *proj_ptr=StoragePtr(proj_output);
+
       for(uint32_t b=0;b<batch;++b)
       {
-        const size_t dst_offset=b*out_seq_len*dim;
+        const size_t dst_offset=static_cast<size_t>(b)*out_seq_len*dim;
 #ifdef USE_CAIF_CUDA
-        cudaMemcpyAsync(output.DevicePtr()+dst_offset,
-                        _cls_token.DevicePtr(),
-                        dim*sizeof(float),
+        cudaMemcpyAsync(output_ptr+dst_offset,
+                        cls_ptr,
+                        dim*sizeof(StorageT),
                         cudaMemcpyDeviceToDevice,
-                        _stream->Handle());
+                        ctx.Stream().Handle());
 #else
-        std::memcpy(output.DevicePtr()+dst_offset,
-                    _cls_token.DevicePtr(),
-                    dim*sizeof(float));
+        std::memcpy(output_ptr+dst_offset,
+                    cls_ptr,
+                    dim*sizeof(StorageT));
 #endif
       }
 
-      // Copy projected frames to positions 1..time_frames for each batch
       for(uint32_t b=0;b<batch;++b)
       {
-        const size_t src_offset=b*time_frames*dim;
-        const size_t dst_offset=b*out_seq_len*dim+dim;  // +dim to skip CLS
+        const size_t src_offset=static_cast<size_t>(b)*time_frames*dim;
+        const size_t dst_offset=static_cast<size_t>(b)*out_seq_len*dim+dim;
 #ifdef USE_CAIF_CUDA
-        cudaMemcpyAsync(output.DevicePtr()+dst_offset,
-                        proj_output.DevicePtr()+src_offset,
-                        time_frames*dim*sizeof(float),
+        cudaMemcpyAsync(output_ptr+dst_offset,
+                        proj_ptr+src_offset,
+                        static_cast<size_t>(time_frames)*dim*sizeof(StorageT),
                         cudaMemcpyDeviceToDevice,
-                        _stream->Handle());
+                        ctx.Stream().Handle());
 #else
-        std::memcpy(output.DevicePtr()+dst_offset,
-                    proj_output.DevicePtr()+src_offset,
-                    time_frames*dim*sizeof(float));
+        std::memcpy(output_ptr+dst_offset,
+                    proj_ptr+src_offset,
+                    static_cast<size_t>(time_frames)*dim*sizeof(StorageT));
 #endif
       }
 
@@ -203,15 +209,13 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Forward(const CAIF_DeviceTens
   CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTensor &grad_output)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                                  CAIF_RunContext &ctx)
 {
   try
   {
-    if(_stream==nullptr)
-    {
-      THROW_CAIFE("DeviceSpectrogramEmbedding: layer has been moved from");
-    }
-
     const uint32_t batch=_cached_batch;
     const uint32_t time_frames=_cached_time_frames;
     const uint32_t freq_bins=_config.freq_bins;
@@ -222,37 +226,36 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTen
 
     if(_config.use_cls_token==true)
     {
-      // grad_output is [batch, time_frames+1, dim]
       const uint32_t out_seq_len=time_frames+1;
+      StorageT *grad_cls_ptr=StoragePtr(_grad_cls);
+      const StorageT *grad_out_ptr=StoragePtr(grad_output);
 
-      // Extract gradient for CLS token (position 0) and accumulate
       for(uint32_t b=0;b<batch;++b)
       {
-        const size_t src_offset=b*out_seq_len*dim;
-        // Accumulate gradient for CLS token
-        launch_elementwise_add(_grad_cls.DevicePtr(),
-                               grad_output.DevicePtr()+src_offset,
-                               _grad_cls.DevicePtr(),
-                               static_cast<int>(dim),
-                               _stream->Handle());
+        const size_t src_offset=static_cast<size_t>(b)*out_seq_len*dim;
+        launch_elementwise_add<StorageT>(grad_cls_ptr,
+                                          grad_out_ptr+src_offset,
+                                          grad_cls_ptr,
+                                          static_cast<int>(dim),
+                                          ctx.Stream().Handle());
       }
 
-      // Extract gradients for projected frames (positions 1..time_frames)
-      grad_proj=CAIF_DeviceTensor::Uninitialized({batch,time_frames,dim},*_stream);
+      grad_proj=AllocateOutput({batch,time_frames,dim},ctx);
+      StorageT *grad_proj_ptr=StoragePtr(grad_proj);
       for(uint32_t b=0;b<batch;++b)
       {
-        const size_t src_offset=b*out_seq_len*dim+dim;  // +dim to skip CLS
-        const size_t dst_offset=b*time_frames*dim;
+        const size_t src_offset=static_cast<size_t>(b)*out_seq_len*dim+dim;
+        const size_t dst_offset=static_cast<size_t>(b)*time_frames*dim;
 #ifdef USE_CAIF_CUDA
-        cudaMemcpyAsync(grad_proj.DevicePtr()+dst_offset,
-                        grad_output.DevicePtr()+src_offset,
-                        time_frames*dim*sizeof(float),
+        cudaMemcpyAsync(grad_proj_ptr+dst_offset,
+                        grad_out_ptr+src_offset,
+                        static_cast<size_t>(time_frames)*dim*sizeof(StorageT),
                         cudaMemcpyDeviceToDevice,
-                        _stream->Handle());
+                        ctx.Stream().Handle());
 #else
-        std::memcpy(grad_proj.DevicePtr()+dst_offset,
-                    grad_output.DevicePtr()+src_offset,
-                    time_frames*dim*sizeof(float));
+        std::memcpy(grad_proj_ptr+dst_offset,
+                    grad_out_ptr+src_offset,
+                    static_cast<size_t>(time_frames)*dim*sizeof(StorageT));
 #endif
       }
     }
@@ -261,25 +264,17 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTen
       grad_proj=grad_output.Clone();
     }
 
-    // Flatten to [total_rows, dim]
     grad_proj.Reshape({total_rows,dim});
 
-    // grad_b_proj = sum(grad_proj, axis=0)
-    launch_bias_grad_2d(grad_proj.DevicePtr(),_grad_b_proj.DevicePtr(),
-                        static_cast<int>(total_rows),
-                        static_cast<int>(dim),
-                        _stream->Handle());
+    CAIF_Ops::BiasGradient(grad_proj,_grad_b_proj);
 
-    // grad_w_proj = input^T @ grad_proj
     CAIF_DeviceTensor flat_input=_cached_input.Clone();
     flat_input.Reshape({total_rows,freq_bins});
-    CAIF_DeviceOps::MatMulTransposeA(flat_input,grad_proj,_grad_w_proj);
+    CAIF_Ops::MatMulTransposeA(flat_input,grad_proj,_grad_w_proj,ctx);
 
-    // grad_input = grad_proj @ W_proj^T
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({total_rows,freq_bins},*_stream);
-    CAIF_DeviceOps::MatMulTransposeB(grad_proj,_w_proj,grad_input);
+    CAIF_DeviceTensor grad_input=AllocateOutput({total_rows,freq_bins},ctx);
+    CAIF_Ops::MatMulTransposeB(grad_proj,_w_proj,grad_input,ctx);
 
-    // Reshape to [batch, time_frames, freq_bins]
     grad_input.Reshape({batch,time_frames,freq_bins});
 
     return grad_input;
@@ -287,108 +282,136 @@ CAIF_DeviceTensor CAIF_DeviceSpectrogramEmbedding::Backward(const CAIF_DeviceTen
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceSpectrogramEmbedding::ZeroGradients()
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_w_proj.Fill(0.0f);
-    _grad_b_proj.Fill(0.0f);
+    _grad_w_proj.FillZero();
+    _grad_b_proj.FillZero();
     if(_config.use_cls_token==true)
     {
-      _grad_cls.Fill(0.0f);
+      _grad_cls.FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceSpectrogramEmbedding::ParameterTensorCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ParameterTensorCount()const
 {
   if(_config.use_cls_token==true)
   {
-    return 3;  // w_proj, b_proj, cls_token
+    return 3;
   }
-  return 2;  // w_proj, b_proj
+  return 2;
 }
 
-CAIF_DeviceTensor &CAIF_DeviceSpectrogramEmbedding::ParameterTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
-  if(index==0)
+  try
   {
-    return _w_proj;
+    if(index==0)
+    {
+      return _w_proj;
+    }
+    if(index==1)
+    {
+      return _b_proj;
+    }
+    if(index==2&&_config.use_cls_token==true)
+    {
+      return _cls_token;
+    }
+    THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding::ParameterTensor: index out of range");
   }
-  if(index==1)
-  {
-    return _b_proj;
-  }
-  if(index==2&&_config.use_cls_token==true)
-  {
-    return _cls_token;
-  }
-  THROW_CAIFE("DeviceSpectrogramEmbedding: parameter index out of range");
+  CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceSpectrogramEmbedding::ParameterTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)const
 {
-  if(index==0)
+  try
   {
-    return _w_proj;
+    if(index==0)
+    {
+      return _w_proj;
+    }
+    if(index==1)
+    {
+      return _b_proj;
+    }
+    if(index==2&&_config.use_cls_token==true)
+    {
+      return _cls_token;
+    }
+    THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding::ParameterTensor: index out of range");
   }
-  if(index==1)
-  {
-    return _b_proj;
-  }
-  if(index==2&&_config.use_cls_token==true)
-  {
-    return _cls_token;
-  }
-  THROW_CAIFE("DeviceSpectrogramEmbedding: parameter index out of range");
+  CAIF_CATCH_BLOCK()
 }
 
-CAIF_DeviceTensor &CAIF_DeviceSpectrogramEmbedding::GradientTensor(size_t index)
+template<typename ComputeT,typename StorageT>
+CAIF_DeviceTensor &
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)
 {
-  if(index==0)
+  try
   {
-    return _grad_w_proj;
+    if(index==0)
+    {
+      return _grad_w_proj;
+    }
+    if(index==1)
+    {
+      return _grad_b_proj;
+    }
+    if(index==2&&_config.use_cls_token==true)
+    {
+      return _grad_cls;
+    }
+    THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding::GradientTensor: index out of range");
   }
-  if(index==1)
-  {
-    return _grad_b_proj;
-  }
-  if(index==2&&_config.use_cls_token==true)
-  {
-    return _grad_cls;
-  }
-  THROW_CAIFE("DeviceSpectrogramEmbedding: gradient index out of range");
+  CAIF_CATCH_BLOCK()
 }
 
-const CAIF_DeviceTensor &CAIF_DeviceSpectrogramEmbedding::GradientTensor(size_t index)const
+template<typename ComputeT,typename StorageT>
+const CAIF_DeviceTensor &
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)const
 {
-  if(index==0)
+  try
   {
-    return _grad_w_proj;
+    if(index==0)
+    {
+      return _grad_w_proj;
+    }
+    if(index==1)
+    {
+      return _grad_b_proj;
+    }
+    if(index==2&&_config.use_cls_token==true)
+    {
+      return _grad_cls;
+    }
+    THROW_CAIFE("CAIF_DeviceSpectrogramEmbedding::GradientTensor: index out of range");
   }
-  if(index==1)
-  {
-    return _grad_b_proj;
-  }
-  if(index==2&&_config.use_cls_token==true)
-  {
-    return _grad_cls;
-  }
-  THROW_CAIFE("DeviceSpectrogramEmbedding: gradient index out of range");
+  CAIF_CATCH_BLOCK()
 }
 
-size_t CAIF_DeviceSpectrogramEmbedding::TotalParameterCount()const
+template<typename ComputeT,typename StorageT>
+size_t CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::TotalParameterCount()const
 {
-  size_t count=_config.freq_bins*_config.dim+_config.dim;
+  size_t count=static_cast<size_t>(_config.freq_bins)*_config.dim+_config.dim;
   if(_config.use_cls_token==true)
   {
-    count+=_config.dim;  // CLS token
+    count+=_config.dim;
   }
   return count;
 }
 
-std::string CAIF_DeviceSpectrogramEmbedding::Description()const
+template<typename ComputeT,typename StorageT>
+std::string CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::Description()const
 {
   try
   {
@@ -404,7 +427,9 @@ std::string CAIF_DeviceSpectrogramEmbedding::Description()const
   CAIF_CATCH_BLOCK()
 }
 
-std::vector<std::string> CAIF_DeviceSpectrogramEmbedding::ParameterNames(const std::string &prefix)const
+template<typename ComputeT,typename StorageT>
+std::vector<std::string>
+CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
   try
   {
@@ -420,40 +445,53 @@ std::vector<std::string> CAIF_DeviceSpectrogramEmbedding::ParameterNames(const s
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_DeviceSpectrogramEmbedding::InitializeWeights(uint32_t seed)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceSpectrogramEmbedding<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
 {
   try
   {
-    std::mt19937 rng(seed);
+    const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
+    const CAIF_DataType::CAIF_DataType_e fp32=CAIF_DataType::CAIF_DataType_e::Float32;
 
-    // Xavier uniform for W_proj
-    const float limit=std::sqrt(6.0f/static_cast<float>(_config.freq_bins+_config.dim));
-    std::uniform_real_distribution<float> dist(-limit,limit);
-
-    std::vector<float> w_data(_config.freq_bins*_config.dim);
-    for(size_t i=0;i<w_data.size();++i)
+    const float w_limit=std::sqrt(g_caif_xavier_uniform_scale/
+                                   static_cast<float>(_config.freq_bins+_config.dim));
+    const size_t w_size=static_cast<size_t>(_config.freq_bins)*_config.dim;
+    std::vector<float> w_data(w_size);
+    for(size_t i=0;i<w_size;++i)
     {
-      w_data[i]=dist(rng);
+      const float t=static_cast<float>(i+seed)*g_caif_golden_ratio_frac;
+      w_data[i]=(t-std::floor(t))*2.0f*w_limit-w_limit;
     }
-    _w_proj.CopyFromHost(w_data.data(),w_data.size());
 
-    // Bias initialized to zero (already done)
+    WProjMut().CopyFromHostFp32(w_data.data(),w_size);
 
-    // CLS token with Xavier uniform
-    if(_config.use_cls_token==true)
+    if(UseCLSToken()==true)
     {
-      const float cls_limit=std::sqrt(6.0f/static_cast<float>(_config.dim+_config.dim));
-      std::uniform_real_distribution<float> cls_dist(-cls_limit,cls_limit);
-
-      std::vector<float> cls_data(_config.dim);
-      for(size_t i=0;i<cls_data.size();++i)
+      const float cls_limit=std::sqrt(g_caif_xavier_uniform_scale/
+                                       static_cast<float>(Dim()+Dim()));
+      std::vector<float> cls_data(Dim());
+      for(uint32_t i=0;i<Dim();++i)
       {
-        cls_data[i]=cls_dist(rng);
+        const float t=static_cast<float>(i+seed)*g_caif_golden_ratio_frac;
+        cls_data[i]=(t-std::floor(t))*2.0f*cls_limit-cls_limit;
       }
-      _cls_token.CopyFromHost(cls_data.data(),cls_data.size());
+      CLSTokenMut().CopyFromHostFp32(cls_data.data(),Dim());
     }
   }
   CAIF_CATCH_BLOCK()
 }
+
+// Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.
+template class CAIF_DeviceSpectrogramEmbedding<float,float>;
+#ifdef USE_CAIF_CUDA
+template class CAIF_DeviceSpectrogramEmbedding<float,__half>;
+template class CAIF_DeviceSpectrogramEmbedding<float,__nv_bfloat16>;
+template class CAIF_DeviceSpectrogramEmbedding<__half,float>;
+template class CAIF_DeviceSpectrogramEmbedding<__half,__half>;
+template class CAIF_DeviceSpectrogramEmbedding<__half,__nv_bfloat16>;
+template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,float>;
+template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,__half>;
+template class CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#endif
 
 }//end instance namespace

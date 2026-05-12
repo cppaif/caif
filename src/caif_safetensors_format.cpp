@@ -17,6 +17,7 @@
 // SafeTensors format implementation
 //------------------------------------------------------------------------------
 #include "caif_safetensors_format.h"
+#include "caif_constants.h"
 #include "caif_exception.h"
 #include <fstream>
 #include <sstream>
@@ -634,7 +635,7 @@ std::string CAIF_SafeTensorsFormat::ReadHeader(const std::string &path,uint64_t 
   {
     THROW_CAIFE("SafeTensors: file too small");
   }
-  if(static_cast<uint64_t>(file_size)>SafeTensorsConstants::g_max_file_size)
+  if(static_cast<uint64_t>(file_size)>g_caif_safetensors_max_file_size)
   {
     THROW_CAIFE("SafeTensors: file too large");
   }
@@ -642,7 +643,7 @@ std::string CAIF_SafeTensorsFormat::ReadHeader(const std::string &path,uint64_t 
   uint64_t header_size=0;
   in.read(reinterpret_cast<char*>(&header_size),sizeof(uint64_t));
 
-  if(header_size>SafeTensorsConstants::g_max_header_size)
+  if(header_size>g_caif_safetensors_max_header_size)
   {
     THROW_CAIFE("SafeTensors: header too large");
   }
@@ -740,7 +741,7 @@ void CAIF_SafeTensorsFormat::Save(const std::string &path,
 {
   try
   {
-    if(tensors.size()>SafeTensorsConstants::g_max_tensors)
+    if(tensors.size()>g_caif_safetensors_max_tensors)
     {
       THROW_CAIFE("SafeTensors: too many tensors");
     }
@@ -755,7 +756,7 @@ void CAIF_SafeTensorsFormat::Save(const std::string &path,
       json_header+=' ';
     }
 
-    if(json_header.size()>SafeTensorsConstants::g_max_header_size)
+    if(json_header.size()>g_caif_safetensors_max_header_size)
     {
       THROW_CAIFE("SafeTensors: header too large");
     }
@@ -828,7 +829,7 @@ CAIF_SafeTensorsFormat::Load(const std::string &path,CAIF_CudaStream &stream)con
     // Parse tensor infos
     auto tensor_infos=ParseTensorInfos(json_header);
 
-    if(tensor_infos.size()>SafeTensorsConstants::g_max_tensors)
+    if(tensor_infos.size()>g_caif_safetensors_max_tensors)
     {
       THROW_CAIFE("SafeTensors: too many tensors");
     }
@@ -936,6 +937,127 @@ CAIF_SafeTensorsFormat::LoadSharded(const std::string &directory,CAIF_CudaStream
     }
 
     return result;
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+//------------------------------------------------------------------------------
+// OpenShardedHandle / LoadFromHandle — lazy load surface
+//
+// Parses the index file and every shard's JSON header up front, then
+// streams individual tensors on demand without re-parsing. Together these
+// replace the eager `LoadSharded` for callers (add-MoE / finetune
+// loaders) that walk a HF safetensors directory but only consume a
+// subset of the tensors per session.
+//------------------------------------------------------------------------------
+
+CAIF_SafeTensorsFormat::ShardedHandle_t
+CAIF_SafeTensorsFormat::OpenShardedHandle(const std::string &directory)const
+{
+  try
+  {
+    ShardedHandle_t handle;
+    handle.SetDirectory(directory);
+
+    const std::string index_path=directory+"/model.safetensors.index.json";
+    ShardedHandle_t::WeightMap_t wm;
+    {
+      std::ifstream index_test(index_path);
+      const bool has_index=index_test.is_open();
+      index_test.close();
+      if(has_index==true)
+      {
+        wm=ParseShardIndex(index_path);
+        if(wm.empty()==true)
+        {
+          THROW_CAIFE("SafeTensors: empty weight map in index file");
+        }
+      }
+      else
+      {
+        // Single-shard fallback: no index file, but a top-level
+        // `model.safetensors` carrying every tensor. Read the shard's
+        // header, synthesize a weight map mapping every tensor name to
+        // the single shard. Matches the fallback already implemented
+        // for the eager LoadTensorByName path.
+        const std::string single_path=directory+"/model.safetensors";
+        std::ifstream single_test(single_path);
+        if(single_test.is_open()==false)
+        {
+          THROW_CAIFE("SafeTensors: no index file and no model.safetensors in "+directory);
+        }
+        single_test.close();
+        uint64_t hdr_data_start=0;
+        const std::string hdr_json=ReadHeader(single_path,hdr_data_start);
+        const auto infos=ParseTensorInfos(hdr_json);
+        for(const auto &kv:infos)
+        {
+          wm.emplace(kv.first,"model.safetensors");
+        }
+        if(wm.empty()==true)
+        {
+          THROW_CAIFE("SafeTensors: single-shard model.safetensors has no tensors in "+directory);
+        }
+      }
+    }
+    handle.SetWeightMap(std::move(wm));
+
+    // Parse each unique shard's JSON header once.
+    std::map<std::string,std::vector<std::string>> shard_tensors;
+    for(const auto &kv:handle.WeightMap())
+    {
+      shard_tensors[kv.second].push_back(kv.first);
+    }
+    for(const auto &shard_kv:shard_tensors)
+    {
+      const std::string &shard_name=shard_kv.first;
+      ShardedHandle_t::PerShard_t per;
+      per.SetPath(directory+"/"+shard_name);
+      uint64_t data_start=0;
+      const std::string json_header=ReadHeader(per.Path(),data_start);
+      per.SetDataStart(data_start);
+      per.SetTensorInfos(ParseTensorInfos(json_header));
+      handle.MutableShards().emplace(shard_name,std::move(per));
+    }
+    return handle;
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+CAIF_DeviceTensor
+CAIF_SafeTensorsFormat::LoadFromHandle(const ShardedHandle_t &handle,
+                                       const std::string &tensor_name,
+                                       CAIF_CudaStream &stream)const
+{
+  try
+  {
+    const ShardedHandle_t::WeightMap_t &wm=handle.WeightMap();
+    auto wm_it=wm.find(tensor_name);
+    if(wm_it==wm.end())
+    {
+      const std::string msg="SafeTensors: tensor '"+tensor_name+
+                            "' not found in sharded handle index";
+      THROW_CAIFE(msg.c_str());
+    }
+    const std::string &shard_name=wm_it->second;
+    const ShardedHandle_t::ShardMap_t &shards=handle.Shards();
+    auto sh_it=shards.find(shard_name);
+    if(sh_it==shards.end())
+    {
+      const std::string msg="SafeTensors: shard '"+shard_name+
+                            "' not present in handle (index/shard mismatch)";
+      THROW_CAIFE(msg.c_str());
+    }
+    const ShardedHandle_t::PerShard_t &per=sh_it->second;
+    const ShardedHandle_t::InfoMap_t &infos=per.TensorInfos();
+    auto info_it=infos.find(tensor_name);
+    if(info_it==infos.end())
+    {
+      const std::string msg="SafeTensors: tensor '"+tensor_name+
+                            "' not found in shard '"+shard_name+"'";
+      THROW_CAIFE(msg.c_str());
+    }
+    return LoadSingleTensor(per.Path(),per.DataStart(),info_it->second,stream);
   }
   CAIF_CATCH_BLOCK()
 }

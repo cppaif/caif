@@ -1,20 +1,52 @@
 # CAIF — C++ AI Framework
 
-A C++ GPU-accelerated framework for building and training neural networks.
-Supports dense networks, convolutional networks, transformers, vision
-transformers, mixture-of-experts, multi-latent attention (MLA), LoRA
-fine-tuning, and SafeTensors serialization.
+A C++23 GPU-accelerated framework for building, fine-tuning, and serving
+modern large language models. Supports transformer LMs (dense and MoE),
+multi-head and multi-head-latent attention, LoRA, MoE layer surgery with
+frozen experts, mixed-precision dtype templating, CPU offload, and
+SafeTensors I/O.
+
+See `CHANGES.md` for the re-arch release notes.
 
 ## Features
 
-- **Device-resident tensors** — data lives on GPU, explicit host transfers only
-- **Multi-dtype** — fp32, fp16, bf16, int8, int4 with GPU conversion kernels
-- **Transformer stack** — multi-head attention, GQA, MLA, RoPE, RMSNorm, LayerNorm
-- **MoE** — top-k gating router, expert FFN blocks, load balancing loss
-- **LoRA** — low-rank adapters for parameter-efficient fine-tuning
-- **SafeTensors** — read/write `.safetensors` format with weight mapping
-- **Stream pipelining** — CUDA stream association for operation ordering
-- **CPU fallback** — OpenBLAS (or Eigen) backend for non-GPU environments
+- **Mixed-precision dtype templating** — every trainable device layer
+  is `Layer<ComputeT, StorageT>`; mix bf16 / fp16 / fp32 storage with
+  fp32 compute per layer. AdamW carries fp32 master weights regardless
+  of storage dtype. Frozen weights extend the storage spectrum further:
+  `CAIF_DeviceFrozenLinear` supports int8 and int4 quantized storage
+  with on-the-fly dequant during matmul, suitable for the pretrained
+  base in LoRA / add-MoE fine-tunes.
+- **Device-resident tensors** — data lives on GPU, explicit host
+  transfers only. Optional `Host_e` location runs the same op surface
+  on aligned host memory via OpenBLAS / OpenMP.
+- **CPU offload substrate** — pinned host tensors, per-tensor offload
+  policy on frozen linears, a block-level scheduler, and an offloaded
+  Adam optimizer so multi-billion-parameter add-MoE fine-tunes fit
+  in a single consumer GPU.
+- **Gradient (activation) checkpointing** on `CAIF_DevicePreNormBlock` —
+  opt-in, drops the per-block forward cache and recomputes during
+  backward.
+- **Transformer stack** — multi-head attention, GQA, FlashAttention,
+  optional QK-norm (OLMoE / Olmo2 / Qwen3), partial-rotary RoPE for
+  Glm4Moe-style models, RMSNorm, LayerNorm.
+- **Multi-head Latent Attention (MLA)** — DeepSeek-V2 / GLM-4.7-Flash
+  style attention with compressed KV cache.
+- **MoE** — `SoftmaxTopK_e` and `SigmoidNoauxTc_e` (DeepSeek-V2 /
+  GLM-4-MoE) gating, top-k expert FFNs with the standard
+  `silu(gate) * up` SwiGLU, load-balancing and z-loss auxiliaries,
+  `norm_topk_prob` toggle.
+- **MoE Phase 4 — layer surgery** — wrap pretrained experts as frozen
+  via `CAIF_DeviceMoEFrozenExpert` and append new trainable experts to
+  grow MoE capacity from a base checkpoint.
+- **Optimizers** — Adam, AdamW (with master-weights), SGD, Momentum,
+  RMSprop, AdaGrad, plus an offloaded-Adam variant for offload mode.
+  All share `CAIF_DeviceOptimizer`.
+- **LoRA** — low-rank adapters for parameter-efficient fine-tuning.
+- **SafeTensors** — read/write `.safetensors` format with weight
+  mapping; both sharded and single-file checkpoints supported.
+- **Stream pipelining** — CUDA stream association for operation ordering.
+- **CPU fallback** — OpenBLAS (or Eigen) backend for non-GPU environments.
 
 ## Requirements
 
@@ -73,7 +105,7 @@ Pass these with `-D` on the cmake command line:
 | `CAIF_BUILD_TESTS` | `OFF` | Build test executables |
 | `CAIF_BUILD_SHARED` | `ON` | Build shared library (.so) |
 | `CAIF_BUILD_STATIC` | `ON` | Build static library (.a) |
-| `CAIF_BUILD_RETRAINER` | `OFF` | Build retrainer fine-tuning tool (requires CUDA) |
+| `CAIF_BUILD_EXAMPLES` | `OFF` | Build example programs in `examples/` (requires CUDA) |
 
 ### Custom dependency paths
 
@@ -177,16 +209,13 @@ caif/
   include/caif/           # Public headers
   src/                    # Implementation (.cpp, .cu)
   tests/                  # Test source files
-  retrainer/              # LoRA fine-tuning tool (optional, requires CUDA)
-    CMakeLists.txt
-    include/retrainer/
-    src/
-    scripts/              # Python pipeline scripts
-    README.md             # Retrainer documentation
+  examples/               # Small demo programs
   ise_lib/                # Bundled ISE base library (logging, exceptions)
     CMakeLists.txt
     include/ise_lib/
     src/
+  DESIGN.md               # Architecture overview
+  CHANGES.md              # Release notes
   LICENSE                 # Apache 2.0
 ```
 

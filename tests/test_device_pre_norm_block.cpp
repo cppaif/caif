@@ -14,14 +14,20 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Test: CAIF_DevicePreNormBlock (Generic pre-norm residual block)
+// Test: CAIF_DevicePreNormBlock<float,float> (Generic pre-norm residual block)
 //------------------------------------------------------------------------------
 #include "caif_device_pre_norm_block.h"
+#include "caif_test_harness.h"
 #include "caif_device_rmsnorm.h"
 #include "caif_device_ffn.h"
-#include "caif_device_gated_activations.h"
+#include "caif_device_swiglu_activation.h"
+#include "caif_device_geglu_activation.h"
+#include "caif_device_reglu_activation.h"
+#include "caif_device_glu_activation.h"
+#include "caif_device_bilinear_activation.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
@@ -32,21 +38,9 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    ISE_Out::Out()<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    ISE_Out::Out()<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
 #ifdef USE_CAIF_CUDA
@@ -57,22 +51,22 @@ static const uint32_t g_test_ffn_dim=16;
 //------------------------------------------------------------------------------
 // Helper: make a single FFN sub-layer with RMSNorm
 //------------------------------------------------------------------------------
-static CAIF_DevicePreNormBlock::SubLayer_t MakeFFNSubLayer(const std::string &norm_prefix,
+static CAIF_DevicePreNormBlock<float,float>::SubLayer_t MakeFFNSubLayer(const std::string &norm_prefix,
                                                           const std::string &ffn_prefix,
                                                           uint32_t dim,
                                                           uint32_t ffn_dim,
                                                           CAIF_CudaStream &stream)
 {
-  CAIF_DevicePreNormBlock::SubLayer_t stage;
+  CAIF_DevicePreNormBlock<float,float>::SubLayer_t stage;
   stage.norm_prefix=norm_prefix;
   stage.layer_prefix=ffn_prefix;
-  stage.norm=std::make_unique<CAIF_DeviceRMSNorm>(dim,stream);
+  stage.norm=std::make_unique<CAIF_DeviceRMSNorm<float,float>>(dim,stream);
 
-  CAIF_DeviceFFN::FFNConfig_t ffn_config;
+  CAIF_DeviceFFN<float,float>::FFNConfig_t ffn_config;
   ffn_config.dim=dim;
   ffn_config.ffn_dim=ffn_dim;
-  stage.layer=std::make_unique<CAIF_DeviceFFN>(ffn_config,
-                                              std::make_unique<CAIF_DeviceSwiGLUActivation>(),
+  stage.layer=std::make_unique<CAIF_DeviceFFN<float,float>>(ffn_config,
+                                              std::make_unique<CAIF_DeviceSwiGLUActivation<float,float>>(),
                                               stream);
   return stage;
 }
@@ -80,22 +74,22 @@ static CAIF_DevicePreNormBlock::SubLayer_t MakeFFNSubLayer(const std::string &no
 //------------------------------------------------------------------------------
 // Helper: build a single-stage PreNormBlock (RMSNorm + FFN)
 //------------------------------------------------------------------------------
-static CAIF_DevicePreNormBlock MakeSingleStageBlock(CAIF_CudaStream &stream)
+static CAIF_DevicePreNormBlock<float,float> MakeSingleStageBlock(CAIF_CudaStream &stream)
 {
-  CAIF_DevicePreNormBlock::SubLayerVec_t sub_layers;
+  CAIF_DevicePreNormBlock<float,float>::SubLayerVec_t sub_layers;
   sub_layers.push_back(MakeFFNSubLayer("norm.","ffn.",g_test_dim,g_test_ffn_dim,stream));
-  return CAIF_DevicePreNormBlock(std::move(sub_layers),stream);
+  return CAIF_DevicePreNormBlock<float,float>(std::move(sub_layers),stream);
 }
 
 //------------------------------------------------------------------------------
 // Helper: build a two-stage PreNormBlock
 //------------------------------------------------------------------------------
-static CAIF_DevicePreNormBlock MakeTwoStageBlock(CAIF_CudaStream &stream)
+static CAIF_DevicePreNormBlock<float,float> MakeTwoStageBlock(CAIF_CudaStream &stream)
 {
-  CAIF_DevicePreNormBlock::SubLayerVec_t sub_layers;
+  CAIF_DevicePreNormBlock<float,float>::SubLayerVec_t sub_layers;
   sub_layers.push_back(MakeFFNSubLayer("norm1.","attn.",g_test_dim,g_test_ffn_dim,stream));
   sub_layers.push_back(MakeFFNSubLayer("norm2.","ffn.",g_test_dim,g_test_ffn_dim,stream));
-  return CAIF_DevicePreNormBlock(std::move(sub_layers),stream);
+  return CAIF_DevicePreNormBlock<float,float>(std::move(sub_layers),stream);
 }
 
 //------------------------------------------------------------------------------
@@ -109,12 +103,16 @@ static void TestForwardShape()
     const uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -127,11 +125,7 @@ static void TestForwardShape()
 
     ReportResult("PreNormBlock::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -145,7 +139,11 @@ static void TestForwardFinite()
     const uint32_t seq_len=3;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -154,7 +152,7 @@ static void TestForwardFinite()
     }
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -170,11 +168,7 @@ static void TestForwardFinite()
 
     ReportResult("PreNormBlock::ForwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ForwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ForwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -188,7 +182,11 @@ static void TestResidualConnection()
     const uint32_t seq_len=2;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     // Zero all FFN weights (indices 1,2,3 — index 0 is RMSNorm gamma)
     for(size_t p=1;p<block.ParameterTensorCount();++p)
@@ -205,7 +203,7 @@ static void TestResidualConnection()
     }
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -227,11 +225,7 @@ static void TestResidualConnection()
 
     ReportResult("PreNormBlock::ResidualConnection",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ResidualConnection",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ResidualConnection")
 }
 
 //------------------------------------------------------------------------------
@@ -242,7 +236,7 @@ static void TestParameterCount()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     // RMSNorm: 1 tensor (gamma [dim])
     // FFN SwiGLU: 3 tensors (gate [dim*ffn], up [dim*ffn], down [ffn*dim])
@@ -267,11 +261,7 @@ static void TestParameterCount()
 
     ReportResult("PreNormBlock::ParameterCount",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ParameterCount",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ParameterCount")
 }
 
 //------------------------------------------------------------------------------
@@ -282,7 +272,7 @@ static void TestParameterCountTwoStage()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeTwoStageBlock(stream);
+    CAIF_DevicePreNormBlock<float,float> block=MakeTwoStageBlock(stream);
 
     // 2 x (RMSNorm[1] + FFN[3]) = 8 param tensors
     bool passed=true;
@@ -311,11 +301,7 @@ static void TestParameterCountTwoStage()
 
     ReportResult("PreNormBlock::ParameterCountTwoStage",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ParameterCountTwoStage",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ParameterCountTwoStage")
 }
 
 //------------------------------------------------------------------------------
@@ -326,7 +312,7 @@ static void TestParameterNames()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeTwoStageBlock(stream);
+    CAIF_DevicePreNormBlock<float,float> block=MakeTwoStageBlock(stream);
 
     auto names=block.ParameterNames("block.");
 
@@ -354,11 +340,7 @@ static void TestParameterNames()
 
     ReportResult("PreNormBlock::ParameterNames",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ParameterNames",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ParameterNames")
 }
 
 //------------------------------------------------------------------------------
@@ -372,15 +354,20 @@ static void TestZeroGradients()
     const uint32_t seq_len=2;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    block.Forward(input,true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*g_test_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,g_test_dim},stream);
-    block.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    block.Backward(grad_out,ctx);
     block.ZeroGradients();
 
     bool passed=true;
@@ -404,11 +391,7 @@ static void TestZeroGradients()
 
     ReportResult("PreNormBlock::ZeroGradients",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::ZeroGradients",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::ZeroGradients")
 }
 
 //------------------------------------------------------------------------------
@@ -422,7 +405,10 @@ static void TestBackwardFinite()
     const uint32_t seq_len=3;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeSingleStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    CAIF_DevicePreNormBlock<float,float> block=MakeSingleStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -431,11 +417,13 @@ static void TestBackwardFinite()
     }
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    block.Forward(input,true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*g_test_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor grad_input=block.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=block.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -457,11 +445,7 @@ static void TestBackwardFinite()
 
     ReportResult("PreNormBlock::BackwardFinite",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::BackwardFinite",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::BackwardFinite")
 }
 
 //------------------------------------------------------------------------------
@@ -475,11 +459,15 @@ static void TestTwoStageForwardShape()
     const uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeTwoStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DevicePreNormBlock<float,float> block=MakeTwoStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,false);
+    CAIF_DeviceTensor output=block.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -501,11 +489,7 @@ static void TestTwoStageForwardShape()
 
     ReportResult("PreNormBlock::TwoStageForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::TwoStageForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::TwoStageForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -516,7 +500,7 @@ static void TestDescription()
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeTwoStageBlock(stream);
+    CAIF_DevicePreNormBlock<float,float> block=MakeTwoStageBlock(stream);
 
     const std::string desc=block.Description();
 
@@ -534,80 +518,11 @@ static void TestDescription()
 
     ReportResult("PreNormBlock::Description",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::Description",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::Description")
 }
 
 //------------------------------------------------------------------------------
-// Test 11: Norm-less sub-layer (norm=nullptr, layer only)
-//------------------------------------------------------------------------------
-static void TestNormlessSubLayer()
-{
-  try
-  {
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-
-    CAIF_CudaStream stream;
-
-    CAIF_DevicePreNormBlock::SubLayerVec_t sub_layers;
-    CAIF_DevicePreNormBlock::SubLayer_t stage;
-    stage.norm_prefix="";
-    stage.layer_prefix="ffn.";
-    stage.norm=nullptr;
-
-    CAIF_DeviceFFN::FFNConfig_t ffn_config;
-    ffn_config.dim=g_test_dim;
-    ffn_config.ffn_dim=g_test_ffn_dim;
-    stage.layer=std::make_unique<CAIF_DeviceFFN>(ffn_config,
-                                                std::make_unique<CAIF_DeviceSwiGLUActivation>(),
-                                                stream);
-    sub_layers.push_back(std::move(stage));
-    CAIF_DevicePreNormBlock block(std::move(sub_layers),stream);
-
-    // FFN only: 3 param tensors (no RMSNorm)
-    bool passed=true;
-    if(block.ParameterTensorCount()!=3)
-    {
-      ISE_Out::Out()<<"  Expected 3 param tensors, got "<<block.ParameterTensorCount()<<"\n";
-      passed=false;
-    }
-
-    std::vector<float> host_input(batch*seq_len*g_test_dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor output=block.Forward(input,false);
-    CAIF_HostTensor host_output=output.ToHost();
-
-    const auto &shape=host_output.Shape();
-    if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=g_test_dim)
-    {
-      ISE_Out::Out()<<"  Shape mismatch\n";
-      passed=false;
-    }
-
-    for(size_t i=0;i<host_output.TotalElements()&&passed==true;++i)
-    {
-      if(std::isfinite(host_output.Data()[i])==false)
-      {
-        ISE_Out::Out()<<"  Non-finite value at index "<<i<<"\n";
-        passed=false;
-      }
-    }
-
-    ReportResult("PreNormBlock::NormlessSubLayer",passed);
-  }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::NormlessSubLayer",false);
-  }
-}
-
-//------------------------------------------------------------------------------
-// Test 12: Two-stage backward with weight gradient check
+// Test 11: Two-stage backward with weight gradient check
 //------------------------------------------------------------------------------
 static void TestTwoStageBackward()
 {
@@ -617,7 +532,10 @@ static void TestTwoStageBackward()
     const uint32_t seq_len=3;
 
     CAIF_CudaStream stream;
-    CAIF_DevicePreNormBlock block=MakeTwoStageBlock(stream);
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+    CAIF_DevicePreNormBlock<float,float> block=MakeTwoStageBlock(stream);
 
     std::vector<float> host_input(batch*seq_len*g_test_dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -626,11 +544,13 @@ static void TestTwoStageBackward()
     }
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,g_test_dim},stream);
-    block.Forward(input,true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*g_test_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,g_test_dim},stream);
-    CAIF_DeviceTensor grad_input=block.Backward(grad_out);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=block.Backward(grad_out,ctx);
     CAIF_HostTensor h_grad=grad_input.ToHost();
 
     bool passed=true;
@@ -672,11 +592,7 @@ static void TestTwoStageBackward()
 
     ReportResult("PreNormBlock::TwoStageBackward",passed);
   }
-  catch(const std::exception &e)
-  {
-    ISE_Out::Out()<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PreNormBlock::TwoStageBackward",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PreNormBlock::TwoStageBackward")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -685,7 +601,7 @@ int main()
 {
   try
   {
-    ISE_Out::Out()<<"=== CAIF_DevicePreNormBlock Tests ===\n\n";
+    ISE_Out::Out()<<"=== CAIF_DevicePreNormBlock<float,float> Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
     TestForwardShape();
@@ -698,17 +614,16 @@ int main()
     TestBackwardFinite();
     TestTwoStageForwardShape();
     TestDescription();
-    TestNormlessSubLayer();
     TestTwoStageBackward();
 #else
     ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
     ISE_Out::Out()<<"\n=== Summary ===\n";
-    ISE_Out::Out()<<"Passed: "<<g_tests_passed<<"\n";
-    ISE_Out::Out()<<"Failed: "<<g_tests_failed<<"\n";
+    ISE_Out::Out()<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+    ISE_Out::Out()<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-    if(g_tests_failed>0)
+    if(CAIF_TestHarness::FailedCount()>0)
     {
       return 1;
     }

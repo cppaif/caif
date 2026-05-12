@@ -14,34 +14,31 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Device-resident patch embedding layer (ViT-style)
+// Device-resident patch embedding layer (templated on
+// <ComputeT, StorageT>).
+//
+// Uniform two-parameter signature with both defaulting to `float`.
+// Storage tensors (W_proj / b_proj / cls_token / grads) follow StorageT.
+// The patch-extract launchers are currently fp32-only; non-fp32 cells
+// stage through fp32 inside ForwardImpl/BackwardImpl. A future commit
+// templates the launchers and removes the staging.
 //------------------------------------------------------------------------------
-#ifndef CAIF_DEVICE_PATCH_EMBEDDING_H
-#define CAIF_DEVICE_PATCH_EMBEDDING_H
+#pragma once
 
-#include "caif_device_layer.h"
+#include "caif_device_layer_typed.h"
+#include "caif_run_context.h"
 #include "caif_constants.h"
+#include "caif_data_type.h"
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace instance
 {
 
-/**
- * @brief Converts images into patch embedding sequences (ViT-style).
- *
- * Input:  [batch, height, width, channels] (BHWC)
- * Output: [batch, num_patches, dim] or [batch, num_patches+1, dim] (with CLS)
- *
- * Forward: extract_patches -> MatMul(W_proj) -> BiasAdd(b_proj) -> optional cls_prepend
- *
- * Parameters:
- *   0: W_proj     [patch_flat_dim, dim]   Xavier uniform
- *   1: b_proj     [dim]                   Zeros
- *   2: cls_token  [1, dim]               Xavier uniform (only with use_cls_token)
- */
-class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayer
+template<typename ComputeT=float,typename StorageT=float>
+class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
     struct Config_t
@@ -55,7 +52,7 @@ class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayer
     };
 
     CAIF_DevicePatchEmbedding(const Config_t &config,
-                             CAIF_CudaStream &stream);
+                              CAIF_CudaStream &stream);
     ~CAIF_DevicePatchEmbedding()override=default;
 
     // Move
@@ -63,8 +60,12 @@ class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayer
     CAIF_DevicePatchEmbedding &operator=(CAIF_DevicePatchEmbedding &&other);
 
     // CAIF_DeviceLayer interface
-    CAIF_DeviceTensor Forward(const CAIF_DeviceTensor &input,bool training)override;
-    CAIF_DeviceTensor Backward(const CAIF_DeviceTensor &grad_output)override;
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)override;
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)override;
+    CAIF_RunContext::Subsystem_e SubsystemTag()const override
+    {
+      return CAIF_RunContext::Subsystem_e::PatchEmbedding_e;
+    }
     void ZeroGradients()override;
     size_t ParameterTensorCount()const override;
     CAIF_DeviceTensor &ParameterTensor(size_t index)override;
@@ -75,35 +76,65 @@ class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayer
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    // Accessors
     uint32_t PatchSize()const{return _config.patch_size;}
     uint32_t Dim()const{return _config.dim;}
     uint32_t NumPatches()const{return _num_patches;}
     bool UseCLSToken()const{return _config.use_cls_token;}
 
+  public:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
+    using CAIF_DeviceLayer::Stream;
+
   protected:
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AssertInputDtype;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
+    using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
+    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
+    void SetWProj(CAIF_DeviceTensor &&t){_w_proj=std::move(t);}
+    void SetCLSToken(CAIF_DeviceTensor &&t){_cls_token=std::move(t);}
+    void SetBProj(CAIF_DeviceTensor &&t){_b_proj=std::move(t);}
+    void SetGradWProj(CAIF_DeviceTensor &&t){_grad_w_proj=std::move(t);}
+    void SetGradBProj(CAIF_DeviceTensor &&t){_grad_b_proj=std::move(t);}
+    void SetGradCls(CAIF_DeviceTensor &&t){_grad_cls=std::move(t);}
+    uint32_t PatchFlatDim()const{return _patch_flat_dim;}
+
     Config_t _config;
     uint32_t _num_patches_h;
     uint32_t _num_patches_w;
     uint32_t _num_patches;
     uint32_t _patch_flat_dim;
 
-    CAIF_DeviceTensor _w_proj;       // [patch_flat_dim, dim]
-    CAIF_DeviceTensor _b_proj;       // [dim]
-    CAIF_DeviceTensor _cls_token;    // [1, dim] (only when use_cls_token)
+    CAIF_DeviceTensor _w_proj;       // [patch_flat_dim, dim] at StorageT
+    CAIF_DeviceTensor _b_proj;       // [dim] at StorageT
+    CAIF_DeviceTensor _cls_token;    // [1, dim] at StorageT (only when use_cls_token)
 
-    CAIF_DeviceTensor _grad_w_proj;  // [patch_flat_dim, dim]
-    CAIF_DeviceTensor _grad_b_proj;  // [dim]
-    CAIF_DeviceTensor _grad_cls;     // [1, dim] (only when use_cls_token)
+    CAIF_DeviceTensor _grad_w_proj;  // [patch_flat_dim, dim] at StorageT
+    CAIF_DeviceTensor _grad_b_proj;  // [dim] at StorageT
+    CAIF_DeviceTensor _grad_cls;     // [1, dim] at StorageT
 
     // Cached for backward
-    CAIF_DeviceTensor _cached_input;       // [batch, H, W, C]
-    CAIF_DeviceTensor _cached_patches;     // [batch*num_patches, patch_flat_dim]
+    CAIF_DeviceTensor _cached_input;       // at StorageT
+    CAIF_DeviceTensor _cached_patches;     // at fp32 (kernel-internal)
     uint32_t _cached_batch;
 };
 
-}//end instance namespace
+#ifdef USE_CAIF_CUDA
+extern template class CAIF_DevicePatchEmbedding<float,float>;
+extern template class CAIF_DevicePatchEmbedding<float,__half>;
+extern template class CAIF_DevicePatchEmbedding<float,__nv_bfloat16>;
+extern template class CAIF_DevicePatchEmbedding<__half,float>;
+extern template class CAIF_DevicePatchEmbedding<__half,__half>;
+extern template class CAIF_DevicePatchEmbedding<__half,__nv_bfloat16>;
+extern template class CAIF_DevicePatchEmbedding<__nv_bfloat16,float>;
+extern template class CAIF_DevicePatchEmbedding<__nv_bfloat16,__half>;
+extern template class CAIF_DevicePatchEmbedding<__nv_bfloat16,__nv_bfloat16>;
+#else
+extern template class CAIF_DevicePatchEmbedding<float,float>;
+#endif
 
-#endif  // CAIF_DEVICE_PATCH_EMBEDDING_H
+}//end instance namespace

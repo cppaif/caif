@@ -13,133 +13,50 @@
 // limitations under the License.
 
 #include "caif_device_multi_head_attention.h"
+#include "caif_test_harness.h"
+#include "caif_device_network.h"
+#include "caif_device_tensor.h"
+#include "caif_run_context.h"
+#include "caif_settings.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
+#include "caif_cuda_kernels.h"
 #include "caif_constants.h"
+#include "caif_cpu_reference/caif_cpu_softmax.h"
+#include "caif_cpu_reference/caif_cpu_matmul.h"
+#include "caif_cpu_reference/caif_cpu_rope.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
+struct GradMode_t
+{
+  bool precise;
+  float tol;
+  const char *label;
+};
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
+static const GradMode_t kGradModePrecise={true, 8e-2f, "Precise"};
+static const GradMode_t kGradModeTF32=   {false,1.5e-1f,"TF32"};
+
+using namespace instance;
 
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-3f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 #ifdef USE_CAIF_CUDA
 
 //------------------------------------------------------------------------------
-// CPU reference helpers
+// CPU reference helpers (primitives in caif_cpu_reference/)
 //------------------------------------------------------------------------------
-
-static void CpuSoftmax(float *data,int rows,int cols)
-{
-  for(int r=0;r<rows;++r)
-  {
-    float *row=data+r*cols;
-    float max_val=row[0];
-    for(int c=1;c<cols;++c)
-    {
-      if(row[c]>max_val)
-      {
-        max_val=row[c];
-      }
-    }
-    float sum=0.0f;
-    for(int c=0;c<cols;++c)
-    {
-      row[c]=std::exp(row[c]-max_val);
-      sum+=row[c];
-    }
-    for(int c=0;c<cols;++c)
-    {
-      row[c]/=sum;
-    }
-  }
-}
-
-static void CpuMatMul(const float *a,const float *b,float *c,
-                       int m,int k,int n)
-{
-  for(int i=0;i<m;++i)
-  {
-    for(int j=0;j<n;++j)
-    {
-      float sum=0.0f;
-      for(int p=0;p<k;++p)
-      {
-        sum+=a[i*k+p]*b[p*n+j];
-      }
-      c[i*n+j]=sum;
-    }
-  }
-}
-
-static void CpuMatMulTransposeB(const float *a,const float *b,float *c,
-                                 int m,int k,int n)
-{
-  for(int i=0;i<m;++i)
-  {
-    for(int j=0;j<n;++j)
-    {
-      float sum=0.0f;
-      for(int p=0;p<k;++p)
-      {
-        sum+=a[i*k+p]*b[j*k+p];
-      }
-      c[i*n+j]=sum;
-    }
-  }
-}
-
-/**
- * Apply RoPE to data in-place.
- * data layout: [batch_heads, seq_len, head_dim]
- */
-static void CpuRoPE(float *data,int batch_heads,int seq_len,int head_dim,
-                      float base)
-{
-  const int half_dim=head_dim/2;
-  for(int bh=0;bh<batch_heads;++bh)
-  {
-    for(int s=0;s<seq_len;++s)
-    {
-      for(int p=0;p<half_dim;++p)
-      {
-        const float freq_exp=2.0f*static_cast<float>(p)/
-                              static_cast<float>(head_dim);
-        const float theta=static_cast<float>(s)/std::pow(base,freq_exp);
-        const float cos_t=std::cos(theta);
-        const float sin_t=std::sin(theta);
-
-        const int idx=(bh*seq_len+s)*head_dim+p*2;
-        const float x0=data[idx];
-        const float x1=data[idx+1];
-        data[idx]=x0*cos_t-x1*sin_t;
-        data[idx+1]=x0*sin_t+x1*cos_t;
-      }
-    }
-  }
-}
 
 /**
  * CPU reference MHA with RoPE.
@@ -165,9 +82,9 @@ static void CpuMHAWithRoPE(const float *input,
   std::vector<float> q_proj(bs*qk_dim);
   std::vector<float> k_proj(bs*qk_dim);
   std::vector<float> v_proj(bs*qk_dim);
-  CpuMatMul(input,w_q,q_proj.data(),bs,dim,qk_dim);
-  CpuMatMul(input,w_k,k_proj.data(),bs,dim,qk_dim);
-  CpuMatMul(input,w_v,v_proj.data(),bs,dim,qk_dim);
+  CAIF_CpuMatMul::Apply(input,w_q,q_proj.data(),bs,dim,qk_dim);
+  CAIF_CpuMatMul::Apply(input,w_k,k_proj.data(),bs,dim,qk_dim);
+  CAIF_CpuMatMul::Apply(input,w_v,v_proj.data(),bs,dim,qk_dim);
 
   // Split heads and compute attention per head
   std::vector<float> concat(bs*qk_dim,0.0f);
@@ -193,12 +110,12 @@ static void CpuMHAWithRoPE(const float *input,
       }
 
       // Apply RoPE to Q and K heads
-      CpuRoPE(q_head.data(),1,seq_len,head_dim,rope_base);
-      CpuRoPE(k_head.data(),1,seq_len,head_dim,rope_base);
+      CAIF_CpuRoPE::Apply(q_head.data(),1,seq_len,head_dim,rope_base);
+      CAIF_CpuRoPE::Apply(k_head.data(),1,seq_len,head_dim,rope_base);
 
       // scores = Q @ K^T -> [seq_len, seq_len]
       std::vector<float> scores(seq_len*seq_len);
-      CpuMatMulTransposeB(q_head.data(),k_head.data(),scores.data(),
+      CAIF_CpuMatMul::TransposeB(q_head.data(),k_head.data(),scores.data(),
                            seq_len,head_dim,seq_len);
 
       // Scale
@@ -221,11 +138,11 @@ static void CpuMHAWithRoPE(const float *input,
       }
 
       // Softmax
-      CpuSoftmax(scores.data(),seq_len,seq_len);
+      CAIF_CpuSoftmax::Apply(scores.data(),seq_len,seq_len);
 
       // context = attn @ V -> [seq_len, head_dim]
       std::vector<float> ctx(seq_len*head_dim);
-      CpuMatMul(scores.data(),v_head.data(),ctx.data(),
+      CAIF_CpuMatMul::Apply(scores.data(),v_head.data(),ctx.data(),
                  seq_len,seq_len,head_dim);
 
       // Write to concat
@@ -240,16 +157,16 @@ static void CpuMHAWithRoPE(const float *input,
   }
 
   // Output projection
-  CpuMatMul(concat.data(),w_o,output,bs,qk_dim,dim);
+  CAIF_CpuMatMul::Apply(concat.data(),w_o,output,bs,qk_dim,dim);
 }
 
 //------------------------------------------------------------------------------
 // Helper: create RoPE MHA config
 //------------------------------------------------------------------------------
-static CAIF_DeviceMultiHeadAttention::AttentionConfig_t MakeRoPEConfig(
+static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeRoPEConfig(
   uint32_t dim,uint32_t num_heads,bool causal,bool use_rope)
 {
-  CAIF_DeviceMultiHeadAttention::AttentionConfig_t config;
+  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
   config.dim=dim;
   config.num_heads=num_heads;
   config.num_kv_heads=num_heads;
@@ -274,14 +191,18 @@ static void TestRoPEForwardShape()
     const uint32_t num_heads=2;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeRoPEConfig(dim,num_heads,false,true);
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor output=mha.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mha.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     bool passed=true;
@@ -294,11 +215,7 @@ static void TestRoPEForwardShape()
 
     ReportResult("RoPE::ForwardShape",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::ForwardShape",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("RoPE::ForwardShape")
 }
 
 //------------------------------------------------------------------------------
@@ -314,12 +231,14 @@ static void TestRoPEForwardDifference()
     const uint32_t num_heads=2;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
 
     // Create two MHA layers with same weights but different RoPE setting
     auto config_rope=MakeRoPEConfig(dim,num_heads,false,true);
     auto config_norope=MakeRoPEConfig(dim,num_heads,false,false);
-    CAIF_DeviceMultiHeadAttention mha_rope(config_rope,stream);
-    CAIF_DeviceMultiHeadAttention mha_norope(config_norope,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha_rope(config_rope,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha_norope(config_norope,stream);
 
     // Copy weights from rope to norope
     for(size_t p=0;p<mha_rope.ParameterTensorCount();++p)
@@ -338,8 +257,10 @@ static void TestRoPEForwardDifference()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor out_rope=mha_rope.Forward(input,false);
-    CAIF_DeviceTensor out_norope=mha_norope.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor out_rope=mha_rope.Forward(input,ctx);
+    CAIF_DeviceTensor out_norope=mha_norope.Forward(input,ctx);
 
     CAIF_HostTensor h_rope=out_rope.ToHost();
     CAIF_HostTensor h_norope=out_norope.ToHost();
@@ -357,11 +278,7 @@ static void TestRoPEForwardDifference()
 
     ReportResult("RoPE::ForwardDifference",any_diff);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::ForwardDifference",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("RoPE::ForwardDifference")
 }
 
 //------------------------------------------------------------------------------
@@ -378,8 +295,10 @@ static void TestRoPEForwardVsCPU()
     const uint32_t head_dim=dim/num_heads;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeRoPEConfig(dim,num_heads,false,true);
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
@@ -394,7 +313,9 @@ static void TestRoPEForwardVsCPU()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=mha.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mha.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // CPU reference
@@ -420,11 +341,7 @@ static void TestRoPEForwardVsCPU()
 
     ReportResult("RoPE::ForwardVsCPU",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::ForwardVsCPU",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("RoPE::ForwardVsCPU")
 }
 
 //------------------------------------------------------------------------------
@@ -441,8 +358,10 @@ static void TestRoPEForwardCausal()
     const uint32_t head_dim=dim/num_heads;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeRoPEConfig(dim,num_heads,true,true);
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
@@ -457,7 +376,9 @@ static void TestRoPEForwardCausal()
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor output=mha.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output=mha.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     std::vector<float> expected(batch*seq_len*dim);
@@ -482,28 +403,30 @@ static void TestRoPEForwardCausal()
 
     ReportResult("RoPE::ForwardCausal",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::ForwardCausal",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("RoPE::ForwardCausal")
 }
 
 //------------------------------------------------------------------------------
 // Test 5: RoPE backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestRoPEBackwardInputGrad()
+static void TestRoPEBackwardInputGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("RoPE::BackwardInputGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=3;
     const uint32_t dim=8;
     const uint32_t num_heads=2;
     const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeRoPEConfig(dim,num_heads,false,true);
 
     std::vector<float> host_input(batch*seq_len*dim);
@@ -512,21 +435,29 @@ static void TestRoPEBackwardInputGrad()
       host_input[i]=static_cast<float>(i)*0.1f-0.2f;
     }
 
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
     CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
     CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
-    mha.Forward(input,true);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mha.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor grad_input=mha.Backward(grad_out);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,dim},stream);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=mha.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
+
+    // FD reference must be numerically accurate regardless of the outer mode
+    // (TF32 FD is catastrophic cancellation). Force high-precision with
+    // pass=Backward_e so ComputeTypeFor selects CUBLAS_COMPUTE_32F for the
+    // perturbation forwards.
+    const bool fd_prev_precise=CAIF_Settings::PreciseGradients();
+    CAIF_Settings::SetPreciseGradients(true);
 
     bool passed=true;
 
@@ -538,15 +469,15 @@ static void TestRoPEBackwardInputGrad()
       input_minus[i]-=h;
 
       // Forward with +h
-      CAIF_DeviceMultiHeadAttention mha_p(config,stream);
+      CAIF_DeviceMultiHeadAttention<float,float> mha_p(config,stream);
       mha_p.ParameterTensor(0).CopyFromHost(h_wq.Data(),h_wq.TotalElements());
       mha_p.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
       mha_p.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_p.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               input_plus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,false);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(input_plus.data(),{batch,seq_len,dim},stream);
+      ctx.SetTraining(false);
+      CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -555,15 +486,14 @@ static void TestRoPEBackwardInputGrad()
       }
 
       // Forward with -h
-      CAIF_DeviceMultiHeadAttention mha_m(config,stream);
+      CAIF_DeviceMultiHeadAttention<float,float> mha_m(config,stream);
       mha_m.ParameterTensor(0).CopyFromHost(h_wq.Data(),h_wq.TotalElements());
       mha_m.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
       mha_m.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_m.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               input_minus.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,false);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(input_minus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -574,7 +504,7 @@ static void TestRoPEBackwardInputGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -582,31 +512,35 @@ static void TestRoPEBackwardInputGrad()
         passed=false;
       }
     }
+    CAIF_Settings::SetPreciseGradients(fd_prev_precise);
 
-    ReportResult("RoPE::BackwardInputGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::BackwardInputGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 6: RoPE backward weight gradient (finite difference on W_q)
 //------------------------------------------------------------------------------
-static void TestRoPEBackwardWeightGrad()
+static void TestRoPEBackwardWeightGrad(const GradMode_t &mode)
 {
+  const std::string test_name=std::string("RoPE::BackwardWeightGrad::")+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
     const uint32_t batch=1;
     const uint32_t seq_len=3;
     const uint32_t dim=8;
     const uint32_t num_heads=2;
     const float h=1e-3f;
-    const float grad_tol=5e-2f;
+    const float grad_tol=mode.tol;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config=MakeRoPEConfig(dim,num_heads,false,true);
 
     std::vector<float> host_input(batch*seq_len*dim);
@@ -615,21 +549,26 @@ static void TestRoPEBackwardWeightGrad()
       host_input[i]=static_cast<float>(i)*0.1f-0.2f;
     }
 
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
     CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
     CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
-    mha.Forward(input,true);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mha.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
-    mha.Backward(grad_out);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,dim},stream);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    mha.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_wq=mha.GradientTensor(0).ToHost();
+
+    // High-precision FD reference (see TestRoPEBackwardInputGrad comment).
+    const bool fd_prev_precise=CAIF_Settings::PreciseGradients();
+    CAIF_Settings::SetPreciseGradients(true);
 
     bool passed=true;
     const size_t check_count=4;
@@ -642,15 +581,15 @@ static void TestRoPEBackwardWeightGrad()
       wq_plus[i]+=h;
       wq_minus[i]-=h;
 
-      CAIF_DeviceMultiHeadAttention mha_p(config,stream);
+      CAIF_DeviceMultiHeadAttention<float,float> mha_p(config,stream);
       mha_p.ParameterTensor(0).CopyFromHost(wq_plus.data(),wq_plus.size());
       mha_p.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
       mha_p.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_p.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,false);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
+      ctx.SetTraining(false);
+      CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -658,15 +597,14 @@ static void TestRoPEBackwardWeightGrad()
         sum_plus+=hout_p.Data()[j];
       }
 
-      CAIF_DeviceMultiHeadAttention mha_m(config,stream);
+      CAIF_DeviceMultiHeadAttention<float,float> mha_m(config,stream);
       mha_m.ParameterTensor(0).CopyFromHost(wq_minus.data(),wq_minus.size());
       mha_m.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
       mha_m.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_m.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               host_input.data(),{batch,seq_len,dim},stream);
-      CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,false);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
       for(size_t j=0;j<batch*seq_len*dim;++j)
@@ -677,7 +615,7 @@ static void TestRoPEBackwardWeightGrad()
       const float numerical=(sum_plus-sum_minus)/(2.0f*h);
       const float analytical=host_grad_wq.Data()[i];
 
-      if(std::fabs(numerical-analytical)>grad_tol)
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
         std::cout<<"  dW_q mismatch at "<<i<<": analytical="<<analytical
                  <<" numerical="<<numerical
@@ -685,14 +623,12 @@ static void TestRoPEBackwardWeightGrad()
         passed=false;
       }
     }
+    CAIF_Settings::SetPreciseGradients(fd_prev_precise);
 
-    ReportResult("RoPE::BackwardWeightGrad",passed);
+    ReportResult(test_name.c_str(),passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::BackwardWeightGrad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
 }
 
 //------------------------------------------------------------------------------
@@ -711,11 +647,13 @@ static void TestRoPEPositionEquivariance()
     const uint32_t num_heads=2;
 
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     auto config_rope=MakeRoPEConfig(dim,num_heads,false,true);
     auto config_norope=MakeRoPEConfig(dim,num_heads,false,false);
 
-    CAIF_DeviceMultiHeadAttention mha_rope(config_rope,stream);
-    CAIF_DeviceMultiHeadAttention mha_norope(config_norope,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha_rope(config_rope,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha_norope(config_norope,stream);
 
     // Copy same weights to both
     for(size_t p=0;p<mha_rope.ParameterTensorCount();++p)
@@ -734,10 +672,12 @@ static void TestRoPEPositionEquivariance()
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
                              host_input.data(),{batch,seq_len,dim},stream);
 
-    CAIF_DeviceTensor out_rope=mha_rope.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor out_rope=mha_rope.Forward(input,ctx);
     CAIF_HostTensor h_rope=out_rope.ToHost();
 
-    CAIF_DeviceTensor out_norope=mha_norope.Forward(input,false);
+    CAIF_DeviceTensor out_norope=mha_norope.Forward(input,ctx);
     CAIF_HostTensor h_norope=out_norope.ToHost();
 
     // Compute per-position difference vectors between RoPE and non-RoPE
@@ -764,11 +704,7 @@ static void TestRoPEPositionEquivariance()
 
     ReportResult("RoPE::PositionEquivariance",diffs_vary);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::PositionEquivariance",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("RoPE::PositionEquivariance")
 }
 
 //------------------------------------------------------------------------------
@@ -783,7 +719,7 @@ static void TestRoPEDescriptionString()
 
     CAIF_CudaStream stream;
     auto config=MakeRoPEConfig(dim,num_heads,true,true);
-    CAIF_DeviceMultiHeadAttention mha(config,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     const std::string desc=mha.Description();
     const std::string expected=
@@ -796,11 +732,226 @@ static void TestRoPEDescriptionString()
 
     ReportResult("RoPE::DescriptionString",passed);
   }
-  catch(const std::exception &e)
+  CAIF_TEST_CATCH_BLOCK("RoPE::DescriptionString")
+}
+
+//------------------------------------------------------------------------------
+// Step-2 diagnostic: same shape as RoPE::BackwardInputGrad but use_rope=false.
+// If this PASSES and the RoPE version FAILS, bug is rope-chain-specific in
+// MHA Backward. If both fail, layout/FD/shape issue independent of RoPE.
+//------------------------------------------------------------------------------
+static void TestMHANoRoPEBackwardInputGradTiny(const GradMode_t &mode,
+                                               const uint32_t seq_len,
+                                               const uint32_t dim,
+                                               const uint32_t num_heads,
+                                               const char *shape_label)
+{
+  const std::string test_name=std::string("Diag::MHANoRoPE::")+shape_label+"::"+mode.label;
+  const bool _prev_precise=CAIF_Settings::PreciseGradients();
+  try
   {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("RoPE::DescriptionString",false);
+    CAIF_Settings::SetPreciseGradients(mode.precise);
+
+    const uint32_t batch=1;
+    const float h=1e-3f;
+    const float grad_tol=mode.tol;
+
+    CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    auto config=MakeRoPEConfig(dim,num_heads,false,false);
+
+    std::vector<float> host_input(batch*seq_len*dim);
+    for(size_t i=0;i<host_input.size();++i)
+    {
+      host_input[i]=static_cast<float>(i)*0.1f-0.2f;
+    }
+
+    CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
+    CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
+    CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
+    CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
+    CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
+
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
+    ctx.SetTraining(true);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    mha.Forward(input,ctx);
+
+    std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{batch,seq_len,dim},stream);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
+    CAIF_DeviceTensor grad_input=mha.Backward(grad_out,ctx);
+    CAIF_HostTensor host_grad=grad_input.ToHost();
+
+    bool passed=true;
+    for(size_t i=0;i<host_input.size()&&passed==true;++i)
+    {
+      std::vector<float> input_plus(host_input);
+      std::vector<float> input_minus(host_input);
+      input_plus[i]+=h;
+      input_minus[i]-=h;
+
+      CAIF_DeviceMultiHeadAttention<float,float> mha_p(config,stream);
+      mha_p.ParameterTensor(0).CopyFromHost(h_wq.Data(),h_wq.TotalElements());
+      mha_p.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
+      mha_p.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
+      mha_p.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
+
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(input_plus.data(),{batch,seq_len,dim},stream);
+      ctx.SetTraining(false);
+      CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,ctx);
+      CAIF_HostTensor hout_p=out_p.ToHost();
+      double sum_plus=0.0;
+      for(size_t j=0;j<batch*seq_len*dim;++j)
+      {
+        sum_plus+=static_cast<double>(hout_p.Data()[j]);
+      }
+
+      CAIF_DeviceMultiHeadAttention<float,float> mha_m(config,stream);
+      mha_m.ParameterTensor(0).CopyFromHost(h_wq.Data(),h_wq.TotalElements());
+      mha_m.ParameterTensor(1).CopyFromHost(h_wk.Data(),h_wk.TotalElements());
+      mha_m.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
+      mha_m.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
+
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(input_minus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,ctx);
+      CAIF_HostTensor hout_m=out_m.ToHost();
+      double sum_minus=0.0;
+      for(size_t j=0;j<batch*seq_len*dim;++j)
+      {
+        sum_minus+=static_cast<double>(hout_m.Data()[j]);
+      }
+
+      const float numerical=static_cast<float>((sum_plus-sum_minus)/(2.0*h));
+      const float analytical=host_grad.Data()[i];
+
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
+      {
+        std::cout<<"  dx mismatch at "
+                 <<i
+                 <<": analytical="
+                 <<analytical
+                 <<" numerical="
+                 <<numerical
+                 <<" diff="
+                 <<std::fabs(numerical-analytical)
+                 <<"\n";
+        passed=false;
+      }
+    }
+
+    ReportResult(test_name.c_str(),passed);
   }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
+  CAIF_Settings::SetPreciseGradients(_prev_precise);
+}
+
+//------------------------------------------------------------------------------
+// Isolated RoPE kernel gradcheck: verifies launch_rope_forward/backward
+// without any MHA surrounding it. If this passes and RoPE::BackwardInputGrad
+// still fails, the bug is in the MHA chain, not the rope kernel.
+//------------------------------------------------------------------------------
+static void TestRoPEKernelIsolated(const GradMode_t &mode)
+{
+  const std::string test_name=std::string("RoPE::KernelIsolated::")+mode.label;
+  try
+  {
+    const int batch_heads=2;
+    const int seq_len=3;
+    const int head_dim=4;
+    const int total=batch_heads*seq_len*head_dim;
+    const float base=g_caif_rope_default_base;
+    const int style=0;
+    const float h=1e-3f;
+    const float grad_tol=mode.tol;
+
+    CAIF_CudaStream stream;
+
+    std::vector<float> host_x(total);
+    for(int i=0;i<total;++i)
+    {
+      host_x[i]=static_cast<float>(i)*0.1f-0.2f;
+    }
+
+    std::vector<float> host_ones(total,1.0f);
+    const uint32_t total_u=static_cast<uint32_t>(total);
+    CAIF_DeviceTensor d_grad=CAIF_DeviceTensor::FromHostData(host_ones.data(),
+                                                             {total_u},
+                                                             stream);
+    launch_rope_backward<float>(d_grad.DevicePtr<float>(),
+                                batch_heads,
+                                seq_len,
+                                head_dim,
+                                base,
+                                style,
+                                stream.Handle());
+    CAIF_HostTensor h_grad=d_grad.ToHost();
+
+    bool passed=true;
+
+    for(int i=0;i<total&&passed==true;++i)
+    {
+      std::vector<float> x_plus(host_x);
+      std::vector<float> x_minus(host_x);
+      x_plus[i]+=h;
+      x_minus[i]-=h;
+
+      CAIF_DeviceTensor d_plus=CAIF_DeviceTensor::FromHostData(x_plus.data(),
+                                                               {total_u},
+                                                               stream);
+      launch_rope_forward<float>(d_plus.DevicePtr<float>(),
+                                 batch_heads,
+                                 seq_len,
+                                 head_dim,
+                                 base,
+                                 style,
+                                 stream.Handle());
+      CAIF_HostTensor hy_plus=d_plus.ToHost();
+      double sum_plus=0.0;
+      for(int j=0;j<total;++j)
+      {
+        sum_plus+=static_cast<double>(hy_plus.Data()[j]);
+      }
+
+      CAIF_DeviceTensor d_minus=CAIF_DeviceTensor::FromHostData(x_minus.data(),
+                                                                {total_u},
+                                                                stream);
+      launch_rope_forward<float>(d_minus.DevicePtr<float>(),
+                                 batch_heads,
+                                 seq_len,
+                                 head_dim,
+                                 base,
+                                 style,
+                                 stream.Handle());
+      CAIF_HostTensor hy_minus=d_minus.ToHost();
+      double sum_minus=0.0;
+      for(int j=0;j<total;++j)
+      {
+        sum_minus+=static_cast<double>(hy_minus.Data()[j]);
+      }
+
+      const float numerical=static_cast<float>((sum_plus-sum_minus)/(2.0*h));
+      const float analytical=h_grad.Data()[i];
+
+      if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
+      {
+        std::cout<<"  rope-kernel mismatch at "
+                 <<i
+                 <<": analytical="
+                 <<analytical
+                 <<" numerical="
+                 <<numerical
+                 <<" diff="
+                 <<std::fabs(numerical-analytical)
+                 <<"\n";
+        passed=false;
+      }
+    }
+
+    ReportResult(test_name.c_str(),passed);
+  }
+  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
 }
 
 #endif  // USE_CAIF_CUDA
@@ -810,25 +961,27 @@ int main()
   std::cout<<"=== CAIF RoPE Tests ===\n\n";
 
 #ifdef USE_CAIF_CUDA
+  TestRoPEKernelIsolated(kGradModePrecise);
+  TestRoPEKernelIsolated(kGradModeTF32);
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,2,4,2,"s2_hd2_h2");
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,3,4,2,"s3_hd2_h2");
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,2,8,2,"s2_hd4_h2");
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,3,8,2,"s3_hd4_h2");
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,2,4,1,"s2_hd4_h1");
+  TestMHANoRoPEBackwardInputGradTiny(kGradModePrecise,2,2,1,"s2_hd2_h1");
   TestRoPEForwardShape();
   TestRoPEForwardDifference();
   TestRoPEForwardVsCPU();
   TestRoPEForwardCausal();
-  TestRoPEBackwardInputGrad();
-  TestRoPEBackwardWeightGrad();
+  TestRoPEBackwardInputGrad(kGradModePrecise);
+  TestRoPEBackwardInputGrad(kGradModeTF32);
+  TestRoPEBackwardWeightGrad(kGradModePrecise);
+  TestRoPEBackwardWeightGrad(kGradModeTF32);
   TestRoPEPositionEquivariance();
   TestRoPEDescriptionString();
 #else
   std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
-
-  if(g_tests_failed>0)
-  {
-    return 1;
-  }
-  return 0;
+  return CAIF_TestHarness::FinalExitCode();
 }

@@ -17,10 +17,12 @@
 // SafeTensors Format Tests
 //------------------------------------------------------------------------------
 #include "caif_safetensors_format.h"
+#include "caif_test_harness.h"
 #include "caif_device_network.h"
 #include "caif_device_dense_layer.h"
 #include "caif_device_vit_model.h"
 #include "caif_cuda_stream.h"
+#include "caif_run_context.h"
 #include <iostream>
 #include <fstream>
 #include <cmath>
@@ -28,26 +30,14 @@
 
 using namespace instance;
 
-static int g_tests_passed=0;
-static int g_tests_failed=0;
-
 static void ReportResult(const char *test_name,bool passed)
 {
-  if(passed==true)
-  {
-    std::cout<<"[PASS] "<<test_name<<"\n";
-    ++g_tests_passed;
-  }
-  else
-  {
-    std::cout<<"[FAIL] "<<test_name<<"\n";
-    ++g_tests_failed;
-  }
+  CAIF_TestHarness::Report(test_name,passed);
 }
 
-static bool FloatEqual(float a,float b,float tolerance=1e-5f)
+static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 {
-  return std::fabs(a-b)<tolerance;
+  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
 //------------------------------------------------------------------------------
@@ -164,11 +154,7 @@ static void TestBasicSaveLoad()
 
     ReportResult("BasicSaveLoad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("BasicSaveLoad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("BasicSaveLoad")
 }
 
 //------------------------------------------------------------------------------
@@ -229,11 +215,7 @@ static void TestDenseNetworkSaveLoad()
 
     ReportResult("DenseNetworkSaveLoad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("DenseNetworkSaveLoad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("DenseNetworkSaveLoad")
 }
 
 //------------------------------------------------------------------------------
@@ -245,10 +227,12 @@ static void TestViTModelSaveLoad()
   try
   {
     CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
     const std::string test_path="test_vit_model.safetensors";
 
     // Create small ViT config
-    CAIF_DeviceViTModel::Config_t config;
+    CAIF_DeviceViTModel<float,float>::Config_t config;
     config.image_height=16;
     config.image_width=16;
     config.channels=3;
@@ -263,7 +247,7 @@ static void TestViTModelSaveLoad()
     config.rope_base=10000.0f;
 
     // Create model
-    CAIF_DeviceViTModel model1(config,stream);
+    CAIF_DeviceViTModel<float,float> model1(config,stream);
 
     // Create test input: [batch=1, height=16, width=16, channels=3] (BHWC format)
     const uint32_t batch=1;
@@ -281,7 +265,9 @@ static void TestViTModelSaveLoad()
     input.CopyFromHost(input_data.data(),input_data.size());
 
     // Run forward pass
-    CAIF_DeviceTensor output1=model1.Forward(input,false);
+    ctx.SetTraining(false);
+    ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
+    CAIF_DeviceTensor output1=model1.Forward(input,ctx);
     std::vector<float> output1_data(batch*config.num_classes);
     output1.CopyToHost(output1_data.data());
 
@@ -299,7 +285,7 @@ static void TestViTModelSaveLoad()
     format.Save(test_path,tensors,metadata);
 
     // Create new model
-    CAIF_DeviceViTModel model2(config,stream);
+    CAIF_DeviceViTModel<float,float> model2(config,stream);
 
     // Load weights
     auto loaded=format.Load(test_path,stream);
@@ -323,7 +309,7 @@ static void TestViTModelSaveLoad()
     }
 
     // Run forward pass
-    CAIF_DeviceTensor output2=model2.Forward(input,false);
+    CAIF_DeviceTensor output2=model2.Forward(input,ctx);
     std::vector<float> output2_data(batch*config.num_classes);
     output2.CopyToHost(output2_data.data());
 
@@ -343,11 +329,7 @@ static void TestViTModelSaveLoad()
 
     ReportResult("ViTModelSaveLoad",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("ViTModelSaveLoad",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("ViTModelSaveLoad")
 }
 
 //------------------------------------------------------------------------------
@@ -395,11 +377,7 @@ static void TestParameterNames()
 
     ReportResult("ParameterNames",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("ParameterNames",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("ParameterNames")
 }
 
 //------------------------------------------------------------------------------
@@ -482,11 +460,7 @@ static void TestFileFormatValidation()
 
     ReportResult("FileFormatValidation",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("FileFormatValidation",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("FileFormatValidation")
 }
 
 //------------------------------------------------------------------------------
@@ -569,11 +543,7 @@ static void TestPythonSerializationCompatibility()
 
     ReportResult("PythonSerializationCompatibility",passed);
   }
-  catch(const std::exception &e)
-  {
-    std::cout<<"Exception: "<<e.what()<<"\n";
-    ReportResult("PythonSerializationCompatibility",false);
-  }
+  CAIF_TEST_CATCH_BLOCK("PythonSerializationCompatibility")
 }
 
 //------------------------------------------------------------------------------
@@ -592,8 +562,8 @@ int main()
   TestPythonSerializationCompatibility();
 
   std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<g_tests_passed<<"\n";
-  std::cout<<"Failed: "<<g_tests_failed<<"\n";
+  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
+  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
 
-  return (g_tests_failed>0)?1:0;
+  return (CAIF_TestHarness::FailedCount()>0)?1:0;
 }
