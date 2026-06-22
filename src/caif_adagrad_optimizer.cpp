@@ -14,6 +14,7 @@
 
 #include "caif_adagrad_optimizer.h"
 #include "caif_ops.h"
+#include "caif_cuda_kernels_optimizers.cuh"
 #include "caif_exception.h"
 
 namespace instance
@@ -54,6 +55,44 @@ void CAIF_AdaGradOptimizer::UpdateOne(CAIF_DeviceTensor &target,
                             WeightDecay());
   }
   CAIF_CATCH_BLOCK()
+}
+
+bool CAIF_AdaGradOptimizer::BatchedStep(CAIF_DeviceNetwork &network)
+{
+#ifdef USE_CAIF_CUDA
+  try
+  {
+    if(BuildSharedBatch(network)==false)
+    {
+      return false;
+    }
+    const int n=BatchNumTensors();
+    HostAccumPtrsMut().resize(static_cast<size_t>(n));
+    for(int idx=0;idx<n;++idx)
+    {
+      HostAccumPtrsMut()[idx]=AccumsMut()[static_cast<size_t>(idx)].DevicePtr<float>();
+    }
+    UploadScratch(DeviceAccumPtrsMut(),
+                  HostAccumPtrsMut().data(),
+                  n*sizeof(float *),
+                  Stream());
+    launch_multi_tensor_adagrad<float>(BatchTargetsDevice(),
+                                       BatchGradsDevice(),
+                                       reinterpret_cast<float *const *>(DeviceAccumPtrsMut().DeviceDataRaw()),
+                                       BatchOffsetsDevice(),
+                                       n,
+                                       BatchTotalElements(),
+                                       LearningRate(),
+                                       Epsilon(),
+                                       WeightDecay(),
+                                       Stream().Handle());
+    return true;
+  }
+  CAIF_CATCH_BLOCK()
+#else
+  (void)network;
+  return false;
+#endif
 }
 
 }//end instance namespace

@@ -91,6 +91,25 @@ class CAIF_DeviceProperties:public CAIF_Base
     int RegistersPerBlock()const{return _regs_per_block;}
     int MaxBlocksPerSM()const{return _max_blocks_per_sm;}
 
+    // Setters — private to keep the populate-from-cuda path discipline-
+    // compliant without exposing mutation to the world.
+  private:
+    void SetDeviceName(const std::string &n){_name=n;}
+    void SetComputeCapabilityMajor(const int v){_compute_major=v;}
+    void SetComputeCapabilityMinor(const int v){_compute_minor=v;}
+    void SetTotalGlobalMemory(const size_t v){_total_global_mem=v;}
+    void SetSharedMemoryPerBlock(const size_t v){_shared_mem_per_block=v;}
+    void SetSharedMemoryPerBlockOptin(const size_t v){_shared_mem_per_block_optin=v;}
+    void SetSharedMemoryPerSM(const size_t v){_shared_mem_per_sm=v;}
+    void SetMultiprocessorCount(const int v){_sm_count=v;}
+    void SetMaxThreadsPerBlock(const int v){_max_threads_per_block=v;}
+    void SetMaxThreadsPerSM(const int v){_max_threads_per_sm=v;}
+    void SetWarpSize(const int v){_warp_size=v;}
+    void SetRegistersPerSM(const int v){_regs_per_sm=v;}
+    void SetRegistersPerBlock(const int v){_regs_per_block=v;}
+    void SetMaxBlocksPerSM(const int v){_max_blocks_per_sm=v;}
+  public:
+
     /**
      * @brief Get the number of installed CUDA devices
      * @return Device count (0 if no CUDA or no GPUs)
@@ -136,8 +155,12 @@ class CAIF_DeviceProperties:public CAIF_Base
     int _regs_per_block;
     int _max_blocks_per_sm;
 
-    static DevicePropertiesVec_t s_device_cache;
-    static std::mutex s_cache_mutex;
+    // Internal accessors for the static device cache + its guard mutex.
+    static DevicePropertiesVec_t &DeviceCache(){return _device_cache;}
+    static std::mutex &CacheMutex(){return _cache_mutex;}
+
+    static DevicePropertiesVec_t _device_cache;
+    static std::mutex _cache_mutex;
 };
 
 }//end instance namespace

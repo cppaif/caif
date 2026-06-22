@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -24,11 +25,10 @@
 namespace instance
 {
 
-class CAIF_DeviceMoERouterFactory
+class CAIF_DeviceMoERouterFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceMoERouterFactory()=delete;
-    ~CAIF_DeviceMoERouterFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t input_dim,

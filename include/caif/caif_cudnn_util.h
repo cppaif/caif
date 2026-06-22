@@ -57,7 +57,7 @@ class CAIF_CudnnUtil:public CAIF_Base
       THROW_CAIFE("CAIF_CudnnUtil: unsupported storage dtype for cuDNN");
     }
 
-    static void CheckCudnn(cudnnStatus_t status,const char *what)
+    static void CheckCudnn(cudnnStatus_t status,const std::string &what)
     {
       if(status!=CUDNN_STATUS_SUCCESS)
       {

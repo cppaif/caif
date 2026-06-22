@@ -198,6 +198,7 @@ class CAIF_DeviceFrozenLinear:public CAIF_DeviceLayerTyped<ComputeT,StorageT>,
     // path) read/write through these instead of direct `_member` access.
     bool HasWeight()const{return _weight.IsAllocated();}
     const CAIF_DeviceTensor &Weight()const{return _weight;}
+    CAIF_DeviceTensor &WeightMutable(){return _weight;}
     bool HasHostWeight()const{return _host_weight!=nullptr;}
     CAIF_HostPinnedTensor &HostWeight()
     {
@@ -221,8 +222,26 @@ class CAIF_DeviceFrozenLinear:public CAIF_DeviceLayerTyped<ComputeT,StorageT>,
 
     bool HasCachedComputeWeight()const{return _cached_compute_weight.IsAllocated();}
     const CAIF_DeviceTensor &CachedComputeWeight()const{return _cached_compute_weight;}
+    CAIF_DeviceTensor &CachedComputeWeightMutable(){return _cached_compute_weight;}
     void SetCachedComputeWeight(CAIF_DeviceTensor t){_cached_compute_weight=std::move(t);}
     void ClearCachedComputeWeight(){_cached_compute_weight=CAIF_DeviceTensor();}
+
+    void SetInputDim(const uint32_t v){_input_dim=v;}
+    void SetOutputDim(const uint32_t v){_output_dim=v;}
+    void SetInt8Scheme(const CAIF_Ops::QuantScheme_e v){_int8_scheme=v;}
+    uint32_t GroupSize()const{return _group_size;}
+    void SetGroupSize(const uint32_t v){_group_size=v;}
+    const CAIF_DeviceTensor &Scales()const{return _scales;}
+    CAIF_DeviceTensor &ScalesMutable(){return _scales;}
+    void SetScales(CAIF_DeviceTensor t){_scales=std::move(t);}
+    void SetCacheFP32(const bool b){_cache_fp32=b;}
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInputMutable(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor t){_cached_input=std::move(t);}
+    void SetOffloadPolicyMember(const CAIF_OffloadPolicy::CAIF_OffloadPolicy_e p){_offload_policy=p;}
+    void SetHostWeight(std::unique_ptr<CAIF_HostPinnedTensor> p){_host_weight=std::move(p);}
+    void ClearHostWeight(){_host_weight.reset();}
+    std::unique_ptr<CAIF_HostPinnedTensor> ReleaseHostWeight(){return std::move(_host_weight);}
 
     uint32_t _input_dim;
     uint32_t _output_dim;

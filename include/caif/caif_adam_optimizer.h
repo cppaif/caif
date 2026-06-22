@@ -15,6 +15,7 @@
 #pragma once
 
 #include "caif_optimizer.h"
+#include "caif_optimizer_type.h"
 
 #include <vector>
 
@@ -32,9 +33,9 @@ class CAIF_AdamOptimizer:public CAIF_Optimizer
                        CAIF_CudaStream &stream);
     ~CAIF_AdamOptimizer()override=default;
 
-    CAIF_OptimizerType_e Type()const override
+    CAIF_OptimizerType::CAIF_OptimizerType_e Type()const override
     {
-      return CAIF_OptimizerType_e::Adam;
+      return CAIF_OptimizerType::CAIF_OptimizerType_e::Adam;
     }
 
   protected:
@@ -42,6 +43,7 @@ class CAIF_AdamOptimizer:public CAIF_Optimizer
     void UpdateOne(CAIF_DeviceTensor &target,
                    const CAIF_DeviceTensor &grad,
                    const size_t idx)override;
+    bool BatchedStep(CAIF_DeviceNetwork &network)override;
 
   private:
     float Beta1()const{return _beta1;}
@@ -52,6 +54,11 @@ class CAIF_AdamOptimizer:public CAIF_Optimizer
     const std::vector<CAIF_DeviceTensor> &VStates()const{return _v;}
     std::vector<CAIF_DeviceTensor> &VStatesMut(){return _v;}
 
+    std::vector<float *> &HostMPtrsMut(){return _h_m_ptrs;}
+    std::vector<float *> &HostVPtrsMut(){return _h_v_ptrs;}
+    CAIF_DeviceTensor &DeviceMPtrsMut(){return _d_m_ptrs;}
+    CAIF_DeviceTensor &DeviceVPtrsMut(){return _d_v_ptrs;}
+
     float _beta1;
     float _beta2;
     float _epsilon;
@@ -61,6 +68,13 @@ class CAIF_AdamOptimizer:public CAIF_Optimizer
     // master-weight rule in CAIF_Optimizer).
     std::vector<CAIF_DeviceTensor> _m;
     std::vector<CAIF_DeviceTensor> _v;
+
+    // Batched-step scratch: host staging + device buffers of the per-tensor m/v
+    // pointers, in trainable order. Filled by BatchedStep.
+    std::vector<float *> _h_m_ptrs;
+    std::vector<float *> _h_v_ptrs;
+    CAIF_DeviceTensor _d_m_ptrs;
+    CAIF_DeviceTensor _d_v_ptrs;
 };
 
 }//end instance namespace

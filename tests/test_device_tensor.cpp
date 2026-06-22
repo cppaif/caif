@@ -12,23 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Tests for CAIF_HostTensor, CAIF_DeviceTensor, CAIF_CudaStream, CAIF_CudaEvent.
+//------------------------------------------------------------------------------
 #include "caif_device_tensor.h"
 #include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_cuda_event.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
+constexpr float g_caif_tensor_test_fill_val=3.14f;
+constexpr float g_caif_tensor_test_fill_val2=7.0f;
+constexpr float g_caif_tensor_test_fill_val3=5.0f;
+constexpr float g_caif_tensor_test_clone_val=42.0f;
+constexpr float g_caif_tensor_test_tol=1e-4f;
+constexpr float g_caif_tensor_test_roundtrip_denom=256.0f;
+constexpr size_t g_caif_tensor_test_from_host_n=100;
+
+//------------------------------------------------------------------------------
+// CAIF_DeviceTensorTests — host and device tensor test suite.
+//------------------------------------------------------------------------------
+class CAIF_DeviceTensorTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static bool FloatEqual(float a,float b,float tolerance=g_caif_tensor_test_tol);
+
+    static void TestHostTensorZeros();
+    static void TestHostTensorFromData();
+    static void TestHostTensorFill();
+    static void TestHostTensorReshape();
+    static void TestHostTensorMoveSemantics();
+
+#ifdef USE_CAIF_CUDA
+    static void TestCudaStreamCreate();
+    static void TestCudaStreamDefault();
+    static void TestCudaEventCreate();
+    static void TestCudaStreamRecordEvent();
+    static void TestDeviceTensorZeros();
+    static void TestDeviceTensorFromHost();
+    static void TestDeviceTensorRoundTrip();
+    static void TestDeviceTensorMoveSemantics();
+    static void TestDeviceTensorClone();
+    static void TestDeviceTensorFill();
+    static void TestDeviceTensorNoDirtyFlags();
+#endif
+};
+
+bool CAIF_DeviceTensorTests::FloatEqual(const float a,const float b,const float tolerance)
 {
   return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
@@ -37,7 +79,7 @@ static bool FloatEqual(float a,float b,float tolerance=1e-4f)
 // CAIF_HostTensor Tests
 // ============================================================================
 
-static void TestHostTensorZeros()
+void CAIF_DeviceTensorTests::TestHostTensorZeros()
 {
   try
   {
@@ -68,12 +110,12 @@ static void TestHostTensorZeros()
       }
     }
 
-    ReportResult("HostTensor::Zeros",passed);
+    CAIF_TestHarness::Report("HostTensor::Zeros",passed);
   }
   CAIF_TEST_CATCH_BLOCK("HostTensor::Zeros")
 }
 
-static void TestHostTensorFromData()
+void CAIF_DeviceTensorTests::TestHostTensorFromData()
 {
   try
   {
@@ -97,35 +139,35 @@ static void TestHostTensorFromData()
       }
     }
 
-    ReportResult("HostTensor::FromData",passed);
+    CAIF_TestHarness::Report("HostTensor::FromData",passed);
   }
   CAIF_TEST_CATCH_BLOCK("HostTensor::FromData")
 }
 
-static void TestHostTensorFill()
+void CAIF_DeviceTensorTests::TestHostTensorFill()
 {
   try
   {
     CAIF_HostTensor tensor=CAIF_HostTensor::Uninitialized({5,5});
-    tensor.Fill(3.14f);
+    tensor.Fill(g_caif_tensor_test_fill_val);
 
     bool passed=true;
     const float *data=tensor.Data();
     for(size_t i=0;i<tensor.TotalElements();++i)
     {
-      if(FloatEqual(data[i],3.14f)==false)
+      if(FloatEqual(data[i],g_caif_tensor_test_fill_val)==false)
       {
         passed=false;
         break;
       }
     }
 
-    ReportResult("HostTensor::Fill",passed);
+    CAIF_TestHarness::Report("HostTensor::Fill",passed);
   }
   CAIF_TEST_CATCH_BLOCK("HostTensor::Fill")
 }
 
-static void TestHostTensorReshape()
+void CAIF_DeviceTensorTests::TestHostTensorReshape()
 {
   try
   {
@@ -148,17 +190,17 @@ static void TestHostTensorReshape()
       passed=false;
     }
 
-    ReportResult("HostTensor::Reshape",passed);
+    CAIF_TestHarness::Report("HostTensor::Reshape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("HostTensor::Reshape")
 }
 
-static void TestHostTensorMoveSemantics()
+void CAIF_DeviceTensorTests::TestHostTensorMoveSemantics()
 {
   try
   {
     CAIF_HostTensor tensor1=CAIF_HostTensor::Zeros({10,10});
-    tensor1.Fill(5.0f);
+    tensor1.Fill(g_caif_tensor_test_fill_val3);
 
     // Move construct
     CAIF_HostTensor tensor2=std::move(tensor1);
@@ -176,12 +218,12 @@ static void TestHostTensorMoveSemantics()
     {
       passed=false;
     }
-    if(FloatEqual(tensor2.Data()[0],5.0f)==false)
+    if(FloatEqual(tensor2.Data()[0],g_caif_tensor_test_fill_val3)==false)
     {
       passed=false;
     }
 
-    ReportResult("HostTensor::MoveSemantics",passed);
+    CAIF_TestHarness::Report("HostTensor::MoveSemantics",passed);
   }
   CAIF_TEST_CATCH_BLOCK("HostTensor::MoveSemantics")
 }
@@ -192,7 +234,7 @@ static void TestHostTensorMoveSemantics()
 
 #ifdef USE_CAIF_CUDA
 
-static void TestCudaStreamCreate()
+void CAIF_DeviceTensorTests::TestCudaStreamCreate()
 {
   try
   {
@@ -200,12 +242,12 @@ static void TestCudaStreamCreate()
 
     bool passed=stream.IsValid();
 
-    ReportResult("CudaStream::Create",passed);
+    CAIF_TestHarness::Report("CudaStream::Create",passed);
   }
   CAIF_TEST_CATCH_BLOCK("CudaStream::Create")
 }
 
-static void TestCudaStreamDefault()
+void CAIF_DeviceTensorTests::TestCudaStreamDefault()
 {
   try
   {
@@ -213,12 +255,12 @@ static void TestCudaStreamDefault()
 
     bool passed=stream.IsValid();
 
-    ReportResult("CudaStream::Default",passed);
+    CAIF_TestHarness::Report("CudaStream::Default",passed);
   }
   CAIF_TEST_CATCH_BLOCK("CudaStream::Default")
 }
 
-static void TestCudaEventCreate()
+void CAIF_DeviceTensorTests::TestCudaEventCreate()
 {
   try
   {
@@ -226,12 +268,12 @@ static void TestCudaEventCreate()
 
     bool passed=event.IsValid();
 
-    ReportResult("CudaEvent::Create",passed);
+    CAIF_TestHarness::Report("CudaEvent::Create",passed);
   }
   CAIF_TEST_CATCH_BLOCK("CudaEvent::Create")
 }
 
-static void TestCudaStreamRecordEvent()
+void CAIF_DeviceTensorTests::TestCudaStreamRecordEvent()
 {
   try
   {
@@ -247,7 +289,7 @@ static void TestCudaStreamRecordEvent()
       passed=false;
     }
 
-    ReportResult("CudaStream::RecordEvent",passed);
+    CAIF_TestHarness::Report("CudaStream::RecordEvent",passed);
   }
   CAIF_TEST_CATCH_BLOCK("CudaStream::RecordEvent")
 }
@@ -256,7 +298,7 @@ static void TestCudaStreamRecordEvent()
 // CAIF_DeviceTensor Tests (only run with CUDA)
 // ============================================================================
 
-static void TestDeviceTensorZeros()
+void CAIF_DeviceTensorTests::TestDeviceTensorZeros()
 {
   try
   {
@@ -293,18 +335,18 @@ static void TestDeviceTensorZeros()
       }
     }
 
-    ReportResult("DeviceTensor::Zeros",passed);
+    CAIF_TestHarness::Report("DeviceTensor::Zeros",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::Zeros")
 }
 
-static void TestDeviceTensorFromHost()
+void CAIF_DeviceTensorTests::TestDeviceTensorFromHost()
 {
   try
   {
     // Create host tensor with data
-    std::vector<float> source_data(100);
-    for(size_t i=0;i<100;++i)
+    std::vector<float> source_data(g_caif_tensor_test_from_host_n);
+    for(size_t i=0;i<g_caif_tensor_test_from_host_n;++i)
     {
       source_data[i]=static_cast<float>(i)*0.1f;
     }
@@ -315,7 +357,7 @@ static void TestDeviceTensorFromHost()
     CAIF_DeviceTensor device=CAIF_DeviceTensor::FromHost(host,stream);
 
     bool passed=true;
-    if(device.TotalElements()!=100)
+    if(device.TotalElements()!=g_caif_tensor_test_from_host_n)
     {
       passed=false;
     }
@@ -323,22 +365,28 @@ static void TestDeviceTensorFromHost()
     // Download and verify
     CAIF_HostTensor downloaded=device.ToHost();
     const float *data=downloaded.Data();
-    for(size_t i=0;i<100;++i)
+    for(size_t i=0;i<g_caif_tensor_test_from_host_n;++i)
     {
       if(FloatEqual(data[i],source_data[i])==false)
       {
         passed=false;
-        std::cout<<"Mismatch at index "<<i<<": got "<<data[i]<<" expected "<<source_data[i]<<"\n";
+        ISE_Out::Out()<<"Mismatch at index "
+                      <<i
+                      <<": got "
+                      <<data[i]
+                      <<" expected "
+                      <<source_data[i]
+                      <<"\n";
         break;
       }
     }
 
-    ReportResult("DeviceTensor::FromHost",passed);
+    CAIF_TestHarness::Report("DeviceTensor::FromHost",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::FromHost")
 }
 
-static void TestDeviceTensorRoundTrip()
+void CAIF_DeviceTensorTests::TestDeviceTensorRoundTrip()
 {
   try
   {
@@ -347,7 +395,7 @@ static void TestDeviceTensorRoundTrip()
     float *data=original.Data();
     for(size_t i=0;i<original.TotalElements();++i)
     {
-      data[i]=static_cast<float>(i%256)/256.0f;
+      data[i]=static_cast<float>(i%256)/g_caif_tensor_test_roundtrip_denom;
     }
 
     // Upload to device
@@ -369,12 +417,12 @@ static void TestDeviceTensorRoundTrip()
       }
     }
 
-    ReportResult("DeviceTensor::RoundTrip",passed);
+    CAIF_TestHarness::Report("DeviceTensor::RoundTrip",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::RoundTrip")
 }
 
-static void TestDeviceTensorMoveSemantics()
+void CAIF_DeviceTensorTests::TestDeviceTensorMoveSemantics()
 {
   try
   {
@@ -383,7 +431,7 @@ static void TestDeviceTensorMoveSemantics()
 
     // Fill with non-zero values by uploading
     CAIF_HostTensor host=CAIF_HostTensor::Uninitialized({10,10});
-    host.Fill(7.0f);
+    host.Fill(g_caif_tensor_test_fill_val2);
     tensor1.CopyFromHost(host.Data(),host.TotalElements());
 
     // Move construct
@@ -405,23 +453,23 @@ static void TestDeviceTensorMoveSemantics()
 
     // Verify data survived the move
     CAIF_HostTensor downloaded=tensor2.ToHost();
-    if(FloatEqual(downloaded.Data()[0],7.0f)==false)
+    if(FloatEqual(downloaded.Data()[0],g_caif_tensor_test_fill_val2)==false)
     {
       passed=false;
     }
 
-    ReportResult("DeviceTensor::MoveSemantics",passed);
+    CAIF_TestHarness::Report("DeviceTensor::MoveSemantics",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::MoveSemantics")
 }
 
-static void TestDeviceTensorClone()
+void CAIF_DeviceTensorTests::TestDeviceTensorClone()
 {
   try
   {
     // Create source tensor with data
     CAIF_HostTensor host=CAIF_HostTensor::Uninitialized({16,16});
-    host.Fill(42.0f);
+    host.Fill(g_caif_tensor_test_clone_val);
 
     CAIF_CudaStream stream;
     CAIF_DeviceTensor original=host.ToDevice(stream);
@@ -445,17 +493,17 @@ static void TestDeviceTensorClone()
 
     // Cloned should have same data
     CAIF_HostTensor downloaded=cloned.ToHost();
-    if(FloatEqual(downloaded.Data()[0],42.0f)==false)
+    if(FloatEqual(downloaded.Data()[0],g_caif_tensor_test_clone_val)==false)
     {
       passed=false;
     }
 
-    ReportResult("DeviceTensor::Clone",passed);
+    CAIF_TestHarness::Report("DeviceTensor::Clone",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::Clone")
 }
 
-static void TestDeviceTensorFill()
+void CAIF_DeviceTensorTests::TestDeviceTensorFill()
 {
   try
   {
@@ -477,15 +525,15 @@ static void TestDeviceTensorFill()
       }
     }
 
-    ReportResult("DeviceTensor::Fill",passed);
+    CAIF_TestHarness::Report("DeviceTensor::Fill",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::Fill")
 }
 
-static void TestDeviceTensorNoDirtyFlags()
+void CAIF_DeviceTensorTests::TestDeviceTensorNoDirtyFlags()
 {
-  // This test verifies the design principle: no implicit synchronization
-  // The device tensor has NO dirty flags - what you see is what you get
+  // This test verifies the design principle: no implicit synchronization.
+  // The device tensor has NO dirty flags - what you see is what you get.
   try
   {
     CAIF_CudaStream stream;
@@ -503,22 +551,18 @@ static void TestDeviceTensorNoDirtyFlags()
       passed=false;
     }
 
-    ReportResult("DeviceTensor::NoDirtyFlags",passed);
+    CAIF_TestHarness::Report("DeviceTensor::NoDirtyFlags",passed);
   }
   CAIF_TEST_CATCH_BLOCK("DeviceTensor::NoDirtyFlags")
 }
 
 #endif  // USE_CAIF_CUDA
 
-// ============================================================================
-// Main
-// ============================================================================
-
-int main()
+void CAIF_DeviceTensorTests::RunAll()
 {
-  std::cout<<"=== Device-Resident Tensor Architecture Tests ===\n\n";
+  ISE_Out::Out()<<"=== Device-Resident Tensor Architecture Tests ===\n\n";
 
-  std::cout<<"--- Host Tensor Tests ---\n";
+  ISE_Out::Out()<<"--- Host Tensor Tests ---\n";
   TestHostTensorZeros();
   TestHostTensorFromData();
   TestHostTensorFill();
@@ -526,13 +570,13 @@ int main()
   TestHostTensorMoveSemantics();
 
 #ifdef USE_CAIF_CUDA
-  std::cout<<"\n--- CUDA Stream/Event Tests ---\n";
+  ISE_Out::Out()<<"\n--- CUDA Stream/Event Tests ---\n";
   TestCudaStreamCreate();
   TestCudaStreamDefault();
   TestCudaEventCreate();
   TestCudaStreamRecordEvent();
 
-  std::cout<<"\n--- Device Tensor Tests ---\n";
+  ISE_Out::Out()<<"\n--- Device Tensor Tests ---\n";
   TestDeviceTensorZeros();
   TestDeviceTensorFromHost();
   TestDeviceTensorRoundTrip();
@@ -541,8 +585,14 @@ int main()
   TestDeviceTensorFill();
   TestDeviceTensorNoDirtyFlags();
 #else
-  std::cout<<"\n[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  ISE_Out::Out()<<"\n[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
 #endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+}//end instance namespace
+
+int main()
+{
+  instance::CAIF_DeviceTensorTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 }

@@ -40,17 +40,117 @@
 #include <random>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
 
 #ifdef USE_CAIF_CUDA
 
-constexpr float g_fp16_tol=5e-3f;
-constexpr float g_bf16_tol=2e-2f;
+constexpr float g_caif_matmul_dtype_test_fp16_tol=5e-3f;
+constexpr float g_caif_matmul_dtype_test_bf16_tol=2e-2f;
+constexpr size_t g_caif_matmul_dtype_test_num_cases=4;
 
-static const CAIF_DataType::CAIF_DataType_e g_case_storage[]=
+//------------------------------------------------------------------------------
+// MatMul dtype + compute-precision parity test suite.
+//------------------------------------------------------------------------------
+class CAIF_MatMulDtypeTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static std::vector<float> MakeRandom(const size_t n,const uint32_t seed);
+    static bool RelClose(const std::vector<float> &ref,
+                         const std::vector<float> &got,
+                         const float tol);
+    static void ReportOne(const char *variant,const char *label,const bool ok);
+
+    static std::vector<float> RunMatMul(const std::vector<float> &a_host,
+                                        const std::vector<float> &b_host,
+                                        const uint32_t m,
+                                        const uint32_t k,
+                                        const uint32_t n,
+                                        const CAIF_DataType::CAIF_DataType_e storage,
+                                        const CAIF_DataType::CAIF_DataType_e compute,
+                                        CAIF_CudaStream &stream);
+
+    static std::vector<float> RunMatMulTA(const std::vector<float> &a_host,
+                                          const std::vector<float> &b_host,
+                                          const uint32_t k,
+                                          const uint32_t m,
+                                          const uint32_t n,
+                                          const CAIF_DataType::CAIF_DataType_e storage,
+                                          const CAIF_DataType::CAIF_DataType_e compute,
+                                          CAIF_CudaStream &stream);
+
+    static std::vector<float> RunMatMulTB(const std::vector<float> &a_host,
+                                          const std::vector<float> &b_host,
+                                          const uint32_t m,
+                                          const uint32_t k,
+                                          const uint32_t n,
+                                          const CAIF_DataType::CAIF_DataType_e storage,
+                                          const CAIF_DataType::CAIF_DataType_e compute,
+                                          CAIF_CudaStream &stream);
+
+    static std::vector<float> RunMatMulBias(const std::vector<float> &a_host,
+                                            const std::vector<float> &b_host,
+                                            const std::vector<float> &bias_host,
+                                            const uint32_t m,
+                                            const uint32_t k,
+                                            const uint32_t n,
+                                            const CAIF_DataType::CAIF_DataType_e storage,
+                                            const CAIF_DataType::CAIF_DataType_e compute,
+                                            CAIF_CudaStream &stream);
+
+    static std::vector<float> RunBatchedMatMul(const std::vector<float> &a_host,
+                                               const std::vector<float> &b_host,
+                                               const uint32_t batch,
+                                               const uint32_t m,
+                                               const uint32_t k,
+                                               const uint32_t n,
+                                               const CAIF_DataType::CAIF_DataType_e storage,
+                                               const CAIF_DataType::CAIF_DataType_e compute,
+                                               CAIF_CudaStream &stream);
+
+    static std::vector<float> RunBatchedMatMulTA(const std::vector<float> &a_host,
+                                                 const std::vector<float> &b_host,
+                                                 const uint32_t batch,
+                                                 const uint32_t k,
+                                                 const uint32_t m,
+                                                 const uint32_t n,
+                                                 const CAIF_DataType::CAIF_DataType_e storage,
+                                                 const CAIF_DataType::CAIF_DataType_e compute,
+                                                 CAIF_CudaStream &stream);
+
+    static std::vector<float> RunBatchedMatMulTB(const std::vector<float> &a_host,
+                                                 const std::vector<float> &b_host,
+                                                 const uint32_t batch,
+                                                 const uint32_t m,
+                                                 const uint32_t k,
+                                                 const uint32_t n,
+                                                 const CAIF_DataType::CAIF_DataType_e storage,
+                                                 const CAIF_DataType::CAIF_DataType_e compute,
+                                                 CAIF_CudaStream &stream);
+
+    static void TestMatMulAll();
+    static void TestMatMulTransposeAAll();
+    static void TestMatMulTransposeBAll();
+    static void TestMatMulBiasAll();
+    static void TestBatchedMatMulAll();
+    static void TestBatchedMatMulTransposeAAll();
+    static void TestBatchedMatMulTransposeBAll();
+
+    static const CAIF_DataType::CAIF_DataType_e s_case_storage[g_caif_matmul_dtype_test_num_cases];
+    static const CAIF_DataType::CAIF_DataType_e s_case_compute[g_caif_matmul_dtype_test_num_cases];
+    static const float s_case_tol[g_caif_matmul_dtype_test_num_cases];
+    static const char *const s_case_label[g_caif_matmul_dtype_test_num_cases];
+    static const CAIF_DataType::CAIF_DataType_e s_ref_storage;
+    static const CAIF_DataType::CAIF_DataType_e s_ref_compute;
+};
+
+const CAIF_DataType::CAIF_DataType_e
+CAIF_MatMulDtypeTests::s_case_storage[g_caif_matmul_dtype_test_num_cases]=
 {
   CAIF_DataType::CAIF_DataType_e::Float16,
   CAIF_DataType::CAIF_DataType_e::BFloat16,
@@ -58,7 +158,8 @@ static const CAIF_DataType::CAIF_DataType_e g_case_storage[]=
   CAIF_DataType::CAIF_DataType_e::Float32
 };
 
-static const CAIF_DataType::CAIF_DataType_e g_case_compute[]=
+const CAIF_DataType::CAIF_DataType_e
+CAIF_MatMulDtypeTests::s_case_compute[g_caif_matmul_dtype_test_num_cases]=
 {
   CAIF_DataType::CAIF_DataType_e::Float32,
   CAIF_DataType::CAIF_DataType_e::Float32,
@@ -66,9 +167,15 @@ static const CAIF_DataType::CAIF_DataType_e g_case_compute[]=
   CAIF_DataType::CAIF_DataType_e::Float16
 };
 
-static const float g_case_tol[]={g_fp16_tol,g_bf16_tol,g_bf16_tol,g_fp16_tol};
+const float CAIF_MatMulDtypeTests::s_case_tol[g_caif_matmul_dtype_test_num_cases]=
+{
+  g_caif_matmul_dtype_test_fp16_tol,
+  g_caif_matmul_dtype_test_bf16_tol,
+  g_caif_matmul_dtype_test_bf16_tol,
+  g_caif_matmul_dtype_test_fp16_tol
+};
 
-static const char *const g_case_label[]=
+const char *const CAIF_MatMulDtypeTests::s_case_label[g_caif_matmul_dtype_test_num_cases]=
 {
   "FP16storage",
   "BF16storage",
@@ -76,12 +183,13 @@ static const char *const g_case_label[]=
   "FP32s_FP16c"
 };
 
-constexpr size_t g_num_cases=4;
+const CAIF_DataType::CAIF_DataType_e
+CAIF_MatMulDtypeTests::s_ref_storage=CAIF_DataType::CAIF_DataType_e::Float32;
 
-static const CAIF_DataType::CAIF_DataType_e g_ref_storage=CAIF_DataType::CAIF_DataType_e::Float32;
-static const CAIF_DataType::CAIF_DataType_e g_ref_compute=CAIF_DataType::CAIF_DataType_e::Float32;
+const CAIF_DataType::CAIF_DataType_e
+CAIF_MatMulDtypeTests::s_ref_compute=CAIF_DataType::CAIF_DataType_e::Float32;
 
-std::vector<float> MakeRandom(const size_t n,const uint32_t seed)
+std::vector<float> CAIF_MatMulDtypeTests::MakeRandom(const size_t n,const uint32_t seed)
 {
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-0.5f,0.5f);
@@ -93,9 +201,9 @@ std::vector<float> MakeRandom(const size_t n,const uint32_t seed)
   return v;
 }
 
-bool RelClose(const std::vector<float> &ref,
-              const std::vector<float> &got,
-              const float tol)
+bool CAIF_MatMulDtypeTests::RelClose(const std::vector<float> &ref,
+                                     const std::vector<float> &got,
+                                     const float tol)
 {
   if(ref.size()!=got.size())
   {
@@ -130,7 +238,7 @@ bool RelClose(const std::vector<float> &ref,
   return true;
 }
 
-void ReportOne(const char *variant,const char *label,const bool ok)
+void CAIF_MatMulDtypeTests::ReportOne(const char *variant,const char *label,const bool ok)
 {
   char buf[128];
   std::snprintf(buf,sizeof(buf),"%s::%s",variant,label);
@@ -143,14 +251,14 @@ void ReportOne(const char *variant,const char *label,const bool ok)
 // storage+compute dtype).
 //------------------------------------------------------------------------------
 
-std::vector<float> RunMatMul(const std::vector<float> &a_host,
-                             const std::vector<float> &b_host,
-                             const uint32_t m,
-                             const uint32_t k,
-                             const uint32_t n,
-                             const CAIF_DataType::CAIF_DataType_e storage,
-                             const CAIF_DataType::CAIF_DataType_e compute,
-                             CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunMatMul(const std::vector<float> &a_host,
+                                                     const std::vector<float> &b_host,
+                                                     const uint32_t m,
+                                                     const uint32_t k,
+                                                     const uint32_t n,
+                                                     const CAIF_DataType::CAIF_DataType_e storage,
+                                                     const CAIF_DataType::CAIF_DataType_e compute,
+                                                     CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -166,14 +274,14 @@ std::vector<float> RunMatMul(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunMatMulTA(const std::vector<float> &a_host,
-                               const std::vector<float> &b_host,
-                               const uint32_t k,
-                               const uint32_t m,
-                               const uint32_t n,
-                               const CAIF_DataType::CAIF_DataType_e storage,
-                               const CAIF_DataType::CAIF_DataType_e compute,
-                               CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunMatMulTA(const std::vector<float> &a_host,
+                                                       const std::vector<float> &b_host,
+                                                       const uint32_t k,
+                                                       const uint32_t m,
+                                                       const uint32_t n,
+                                                       const CAIF_DataType::CAIF_DataType_e storage,
+                                                       const CAIF_DataType::CAIF_DataType_e compute,
+                                                       CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -189,14 +297,14 @@ std::vector<float> RunMatMulTA(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunMatMulTB(const std::vector<float> &a_host,
-                               const std::vector<float> &b_host,
-                               const uint32_t m,
-                               const uint32_t k,
-                               const uint32_t n,
-                               const CAIF_DataType::CAIF_DataType_e storage,
-                               const CAIF_DataType::CAIF_DataType_e compute,
-                               CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunMatMulTB(const std::vector<float> &a_host,
+                                                       const std::vector<float> &b_host,
+                                                       const uint32_t m,
+                                                       const uint32_t k,
+                                                       const uint32_t n,
+                                                       const CAIF_DataType::CAIF_DataType_e storage,
+                                                       const CAIF_DataType::CAIF_DataType_e compute,
+                                                       CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -212,15 +320,15 @@ std::vector<float> RunMatMulTB(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunMatMulBias(const std::vector<float> &a_host,
-                                 const std::vector<float> &b_host,
-                                 const std::vector<float> &bias_host,
-                                 const uint32_t m,
-                                 const uint32_t k,
-                                 const uint32_t n,
-                                 const CAIF_DataType::CAIF_DataType_e storage,
-                                 const CAIF_DataType::CAIF_DataType_e compute,
-                                 CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunMatMulBias(const std::vector<float> &a_host,
+                                                         const std::vector<float> &b_host,
+                                                         const std::vector<float> &bias_host,
+                                                         const uint32_t m,
+                                                         const uint32_t k,
+                                                         const uint32_t n,
+                                                         const CAIF_DataType::CAIF_DataType_e storage,
+                                                         const CAIF_DataType::CAIF_DataType_e compute,
+                                                         CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -238,15 +346,15 @@ std::vector<float> RunMatMulBias(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunBatchedMatMul(const std::vector<float> &a_host,
-                                    const std::vector<float> &b_host,
-                                    const uint32_t batch,
-                                    const uint32_t m,
-                                    const uint32_t k,
-                                    const uint32_t n,
-                                    const CAIF_DataType::CAIF_DataType_e storage,
-                                    const CAIF_DataType::CAIF_DataType_e compute,
-                                    CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunBatchedMatMul(const std::vector<float> &a_host,
+                                                            const std::vector<float> &b_host,
+                                                            const uint32_t batch,
+                                                            const uint32_t m,
+                                                            const uint32_t k,
+                                                            const uint32_t n,
+                                                            const CAIF_DataType::CAIF_DataType_e storage,
+                                                            const CAIF_DataType::CAIF_DataType_e compute,
+                                                            CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -270,15 +378,15 @@ std::vector<float> RunBatchedMatMul(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunBatchedMatMulTA(const std::vector<float> &a_host,
-                                      const std::vector<float> &b_host,
-                                      const uint32_t batch,
-                                      const uint32_t k,
-                                      const uint32_t m,
-                                      const uint32_t n,
-                                      const CAIF_DataType::CAIF_DataType_e storage,
-                                      const CAIF_DataType::CAIF_DataType_e compute,
-                                      CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunBatchedMatMulTA(const std::vector<float> &a_host,
+                                                              const std::vector<float> &b_host,
+                                                              const uint32_t batch,
+                                                              const uint32_t k,
+                                                              const uint32_t m,
+                                                              const uint32_t n,
+                                                              const CAIF_DataType::CAIF_DataType_e storage,
+                                                              const CAIF_DataType::CAIF_DataType_e compute,
+                                                              CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -302,15 +410,15 @@ std::vector<float> RunBatchedMatMulTA(const std::vector<float> &a_host,
   return got;
 }
 
-std::vector<float> RunBatchedMatMulTB(const std::vector<float> &a_host,
-                                      const std::vector<float> &b_host,
-                                      const uint32_t batch,
-                                      const uint32_t m,
-                                      const uint32_t k,
-                                      const uint32_t n,
-                                      const CAIF_DataType::CAIF_DataType_e storage,
-                                      const CAIF_DataType::CAIF_DataType_e compute,
-                                      CAIF_CudaStream &stream)
+std::vector<float> CAIF_MatMulDtypeTests::RunBatchedMatMulTB(const std::vector<float> &a_host,
+                                                              const std::vector<float> &b_host,
+                                                              const uint32_t batch,
+                                                              const uint32_t m,
+                                                              const uint32_t k,
+                                                              const uint32_t n,
+                                                              const CAIF_DataType::CAIF_DataType_e storage,
+                                                              const CAIF_DataType::CAIF_DataType_e compute,
+                                                              CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -339,7 +447,7 @@ std::vector<float> RunBatchedMatMulTB(const std::vector<float> &a_host,
 // against all four (storage,compute) configurations at the case's tolerance.
 //------------------------------------------------------------------------------
 
-void TestMatMulAll()
+void CAIF_MatMulDtypeTests::TestMatMulAll()
 {
   const uint32_t m=16;
   const uint32_t k=32;
@@ -347,28 +455,36 @@ void TestMatMulAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(m)*k,11);
   std::vector<float> b=MakeRandom(static_cast<size_t>(k)*n,22);
-  std::vector<float> ref=RunMatMul(a,b,m,k,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunMatMul(a,b,m,k,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
-      std::vector<float> got=RunMatMul(a,b,m,k,n,g_case_storage[i],g_case_compute[i],stream);
-      ReportOne("MatMul",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      std::vector<float> got=RunMatMul(a,b,m,k,n,s_case_storage[i],s_case_compute[i],stream);
+      ReportOne("MatMul",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
-      ISE_Out::Out()<<"MatMul::"<<g_case_label[i]<<" threw: "<<e<<"\n";
-      ReportOne("MatMul",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMul::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e
+                    <<"\n";
+      ReportOne("MatMul",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
-      ISE_Out::Out()<<"MatMul::"<<g_case_label[i]<<" threw: "<<e.what()<<"\n";
-      ReportOne("MatMul",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMul::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e.what()
+                    <<"\n";
+      ReportOne("MatMul",s_case_label[i],false);
     }
   }
 }
 
-void TestMatMulTransposeAAll()
+void CAIF_MatMulDtypeTests::TestMatMulTransposeAAll()
 {
   const uint32_t k=20;
   const uint32_t m=12;
@@ -376,28 +492,36 @@ void TestMatMulTransposeAAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(k)*m,55);
   std::vector<float> b=MakeRandom(static_cast<size_t>(k)*n,66);
-  std::vector<float> ref=RunMatMulTA(a,b,k,m,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunMatMulTA(a,b,k,m,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
-      std::vector<float> got=RunMatMulTA(a,b,k,m,n,g_case_storage[i],g_case_compute[i],stream);
-      ReportOne("MatMulTransposeA",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      std::vector<float> got=RunMatMulTA(a,b,k,m,n,s_case_storage[i],s_case_compute[i],stream);
+      ReportOne("MatMulTransposeA",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
-      ISE_Out::Out()<<"MatMulTransposeA::"<<g_case_label[i]<<" threw: "<<e<<"\n";
-      ReportOne("MatMulTransposeA",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulTransposeA::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e
+                    <<"\n";
+      ReportOne("MatMulTransposeA",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
-      ISE_Out::Out()<<"MatMulTransposeA::"<<g_case_label[i]<<" threw: "<<e.what()<<"\n";
-      ReportOne("MatMulTransposeA",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulTransposeA::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e.what()
+                    <<"\n";
+      ReportOne("MatMulTransposeA",s_case_label[i],false);
     }
   }
 }
 
-void TestMatMulTransposeBAll()
+void CAIF_MatMulDtypeTests::TestMatMulTransposeBAll()
 {
   const uint32_t m=10;
   const uint32_t k=28;
@@ -405,28 +529,36 @@ void TestMatMulTransposeBAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(m)*k,77);
   std::vector<float> b=MakeRandom(static_cast<size_t>(n)*k,88);
-  std::vector<float> ref=RunMatMulTB(a,b,m,k,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunMatMulTB(a,b,m,k,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
-      std::vector<float> got=RunMatMulTB(a,b,m,k,n,g_case_storage[i],g_case_compute[i],stream);
-      ReportOne("MatMulTransposeB",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      std::vector<float> got=RunMatMulTB(a,b,m,k,n,s_case_storage[i],s_case_compute[i],stream);
+      ReportOne("MatMulTransposeB",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
-      ISE_Out::Out()<<"MatMulTransposeB::"<<g_case_label[i]<<" threw: "<<e<<"\n";
-      ReportOne("MatMulTransposeB",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulTransposeB::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e
+                    <<"\n";
+      ReportOne("MatMulTransposeB",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
-      ISE_Out::Out()<<"MatMulTransposeB::"<<g_case_label[i]<<" threw: "<<e.what()<<"\n";
-      ReportOne("MatMulTransposeB",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulTransposeB::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e.what()
+                    <<"\n";
+      ReportOne("MatMulTransposeB",s_case_label[i],false);
     }
   }
 }
 
-void TestMatMulBiasAll()
+void CAIF_MatMulDtypeTests::TestMatMulBiasAll()
 {
   const uint32_t m=12;
   const uint32_t k=20;
@@ -435,8 +567,8 @@ void TestMatMulBiasAll()
   std::vector<float> a=MakeRandom(static_cast<size_t>(m)*k,101);
   std::vector<float> b=MakeRandom(static_cast<size_t>(k)*n,102);
   std::vector<float> bias=MakeRandom(n,103);
-  std::vector<float> ref=RunMatMulBias(a,b,bias,m,k,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunMatMulBias(a,b,bias,m,k,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
@@ -446,25 +578,33 @@ void TestMatMulBiasAll()
                                            m,
                                            k,
                                            n,
-                                           g_case_storage[i],
-                                           g_case_compute[i],
+                                           s_case_storage[i],
+                                           s_case_compute[i],
                                            stream);
-      ReportOne("MatMulBias",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      ReportOne("MatMulBias",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
-      ISE_Out::Out()<<"MatMulBias::"<<g_case_label[i]<<" threw: "<<e<<"\n";
-      ReportOne("MatMulBias",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulBias::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e
+                    <<"\n";
+      ReportOne("MatMulBias",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
-      ISE_Out::Out()<<"MatMulBias::"<<g_case_label[i]<<" threw: "<<e.what()<<"\n";
-      ReportOne("MatMulBias",g_case_label[i],false);
+      ISE_Out::Out()<<"MatMulBias::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e.what()
+                    <<"\n";
+      ReportOne("MatMulBias",s_case_label[i],false);
     }
   }
 }
 
-void TestBatchedMatMulAll()
+void CAIF_MatMulDtypeTests::TestBatchedMatMulAll()
 {
   const uint32_t batch=4;
   const uint32_t m=8;
@@ -473,8 +613,8 @@ void TestBatchedMatMulAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(batch)*m*k,91);
   std::vector<float> b=MakeRandom(static_cast<size_t>(batch)*k*n,92);
-  std::vector<float> ref=RunBatchedMatMul(a,b,batch,m,k,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunBatchedMatMul(a,b,batch,m,k,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
@@ -484,25 +624,33 @@ void TestBatchedMatMulAll()
                                               m,
                                               k,
                                               n,
-                                              g_case_storage[i],
-                                              g_case_compute[i],
+                                              s_case_storage[i],
+                                              s_case_compute[i],
                                               stream);
-      ReportOne("BatchedMatMul",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      ReportOne("BatchedMatMul",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
-      ISE_Out::Out()<<"BatchedMatMul::"<<g_case_label[i]<<" threw: "<<e<<"\n";
-      ReportOne("BatchedMatMul",g_case_label[i],false);
+      ISE_Out::Out()<<"BatchedMatMul::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e
+                    <<"\n";
+      ReportOne("BatchedMatMul",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
-      ISE_Out::Out()<<"BatchedMatMul::"<<g_case_label[i]<<" threw: "<<e.what()<<"\n";
-      ReportOne("BatchedMatMul",g_case_label[i],false);
+      ISE_Out::Out()<<"BatchedMatMul::"
+                    <<s_case_label[i]
+                    <<" threw: "
+                    <<e.what()
+                    <<"\n";
+      ReportOne("BatchedMatMul",s_case_label[i],false);
     }
   }
 }
 
-void TestBatchedMatMulTransposeAAll()
+void CAIF_MatMulDtypeTests::TestBatchedMatMulTransposeAAll()
 {
   const uint32_t batch=4;
   const uint32_t k=20;
@@ -511,8 +659,8 @@ void TestBatchedMatMulTransposeAAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(batch)*k*m,201);
   std::vector<float> b=MakeRandom(static_cast<size_t>(batch)*k*n,202);
-  std::vector<float> ref=RunBatchedMatMulTA(a,b,batch,k,m,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunBatchedMatMulTA(a,b,batch,k,m,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
@@ -522,33 +670,33 @@ void TestBatchedMatMulTransposeAAll()
                                                 k,
                                                 m,
                                                 n,
-                                                g_case_storage[i],
-                                                g_case_compute[i],
+                                                s_case_storage[i],
+                                                s_case_compute[i],
                                                 stream);
-      ReportOne("BatchedMatMulTransposeA",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      ReportOne("BatchedMatMulTransposeA",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
       ISE_Out::Out()<<"BatchedMatMulTransposeA::"
-                    <<g_case_label[i]
+                    <<s_case_label[i]
                     <<" threw: "
                     <<e
                     <<"\n";
-      ReportOne("BatchedMatMulTransposeA",g_case_label[i],false);
+      ReportOne("BatchedMatMulTransposeA",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
       ISE_Out::Out()<<"BatchedMatMulTransposeA::"
-                    <<g_case_label[i]
+                    <<s_case_label[i]
                     <<" threw: "
                     <<e.what()
                     <<"\n";
-      ReportOne("BatchedMatMulTransposeA",g_case_label[i],false);
+      ReportOne("BatchedMatMulTransposeA",s_case_label[i],false);
     }
   }
 }
 
-void TestBatchedMatMulTransposeBAll()
+void CAIF_MatMulDtypeTests::TestBatchedMatMulTransposeBAll()
 {
   const uint32_t batch=4;
   const uint32_t m=10;
@@ -557,8 +705,8 @@ void TestBatchedMatMulTransposeBAll()
   CAIF_CudaStream stream;
   std::vector<float> a=MakeRandom(static_cast<size_t>(batch)*m*k,301);
   std::vector<float> b=MakeRandom(static_cast<size_t>(batch)*n*k,302);
-  std::vector<float> ref=RunBatchedMatMulTB(a,b,batch,m,k,n,g_ref_storage,g_ref_compute,stream);
-  for(size_t i=0;i<g_num_cases;++i)
+  std::vector<float> ref=RunBatchedMatMulTB(a,b,batch,m,k,n,s_ref_storage,s_ref_compute,stream);
+  for(size_t i=0;i<g_caif_matmul_dtype_test_num_cases;++i)
   {
     try
     {
@@ -568,41 +716,35 @@ void TestBatchedMatMulTransposeBAll()
                                                 m,
                                                 k,
                                                 n,
-                                                g_case_storage[i],
-                                                g_case_compute[i],
+                                                s_case_storage[i],
+                                                s_case_compute[i],
                                                 stream);
-      ReportOne("BatchedMatMulTransposeB",g_case_label[i],RelClose(ref,got,g_case_tol[i]));
+      ReportOne("BatchedMatMulTransposeB",s_case_label[i],RelClose(ref,got,s_case_tol[i]));
     }
     catch(const CAIF_Exception &e)
     {
       ISE_Out::Out()<<"BatchedMatMulTransposeB::"
-                    <<g_case_label[i]
+                    <<s_case_label[i]
                     <<" threw: "
                     <<e
                     <<"\n";
-      ReportOne("BatchedMatMulTransposeB",g_case_label[i],false);
+      ReportOne("BatchedMatMulTransposeB",s_case_label[i],false);
     }
     catch(const std::exception &e)
     {
       ISE_Out::Out()<<"BatchedMatMulTransposeB::"
-                    <<g_case_label[i]
+                    <<s_case_label[i]
                     <<" threw: "
                     <<e.what()
                     <<"\n";
-      ReportOne("BatchedMatMulTransposeB",g_case_label[i],false);
+      ReportOne("BatchedMatMulTransposeB",s_case_label[i],false);
     }
   }
 }
 
-#endif// USE_CAIF_CUDA
-
-}// anon
-
-int main()
+void CAIF_MatMulDtypeTests::RunAll()
 {
   ISE_Out::Out()<<"=== MatMul Dtype + Compute-Precision Parity Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
   TestMatMulAll();
   TestMatMulTransposeAAll();
   TestMatMulTransposeBAll();
@@ -610,10 +752,6 @@ int main()
   TestBatchedMatMulAll();
   TestBatchedMatMulTransposeAAll();
   TestBatchedMatMulTransposeBAll();
-#else
-  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
-
   ISE_Out::Out()<<"\n=== Summary ===\n"
                 <<"Passed: "
                 <<CAIF_TestHarness::PassedCount()
@@ -621,5 +759,19 @@ int main()
                 <<"Failed: "
                 <<CAIF_TestHarness::FailedCount()
                 <<"\n";
-  return CAIF_TestHarness::FinalExitCode();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_MatMulDtypeTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

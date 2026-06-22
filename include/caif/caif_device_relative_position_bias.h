@@ -25,6 +25,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_relative_position_bias_config.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_constants.h"
@@ -41,15 +42,8 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceRelativePositionBias:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t num_heads;
-      uint32_t num_buckets;
-      uint32_t max_distance;
-      bool bidirectional;
-    };
 
-    CAIF_DeviceRelativePositionBias(const Config_t &config,
+    CAIF_DeviceRelativePositionBias(const CAIF_DeviceRelativePositionBiasConfig &config,
                                     CAIF_CudaStream &stream);
     ~CAIF_DeviceRelativePositionBias()override=default;
 
@@ -76,7 +70,18 @@ class CAIF_DeviceRelativePositionBias:public CAIF_DeviceLayerTyped<ComputeT,Stor
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const Config_t &Config()const{return _config;}
+    const CAIF_DeviceRelativePositionBiasConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceRelativePositionBiasConfig &c){_config=c;}
+
+    // Embedding accessors — single point of access used by ctor body and
+    // every method that touches the tables.
+    const CAIF_DeviceTensor &Embedding()const{return _embedding;}
+    CAIF_DeviceTensor &Embedding(){return _embedding;}
+    void SetEmbedding(CAIF_DeviceTensor &&t){_embedding=std::move(t);}
+
+    const CAIF_DeviceTensor &GradEmbedding()const{return _grad_embedding;}
+    CAIF_DeviceTensor &GradEmbedding(){return _grad_embedding;}
+    void SetGradEmbedding(CAIF_DeviceTensor &&t){_grad_embedding=std::move(t);}
 
   public:
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
@@ -90,7 +95,7 @@ class CAIF_DeviceRelativePositionBias:public CAIF_DeviceLayerTyped<ComputeT,Stor
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
-    Config_t _config;
+    CAIF_DeviceRelativePositionBiasConfig _config;
 
     // Embedding stays fp32 by design — atomicAdd safety, also low-rank
     // (num_heads * num_buckets) so dtype savings are negligible.

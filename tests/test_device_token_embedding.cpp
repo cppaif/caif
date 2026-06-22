@@ -12,78 +12,107 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Test: CAIF_DeviceTokenEmbedding<float,float> forward/backward correctness.
+//
+// Tests cover forward shape, CPU reference parity, ForwardFromIds parity,
+// bounds check, finite-difference weight gradient, parameter count,
+// gradient zeroing, and description string.
+//------------------------------------------------------------------------------
 #include "caif_device_token_embedding.h"
 #include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_cpu_reference/caif_cpu_embedding.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
+
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
-
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
-{
-  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
-}
 
 #ifdef USE_CAIF_CUDA
+
+constexpr uint32_t g_caif_tokemb_test_vocab=16;
+constexpr uint32_t g_caif_tokemb_test_dim=8;
+constexpr uint32_t g_caif_tokemb_test_batch=2;
+constexpr uint32_t g_caif_tokemb_test_seq=3;
+constexpr uint32_t g_caif_tokemb_test_seq_bounds=4;
+constexpr float g_caif_tokemb_test_fd_h=1e-3f;
+constexpr float g_caif_tokemb_test_grad_tol=5e-2f;
+constexpr float g_caif_tokemb_test_float_tol=1e-4f;
+
+//------------------------------------------------------------------------------
+// Token embedding tests.
+//------------------------------------------------------------------------------
+class CAIF_TokenEmbeddingTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void TestForwardShape();
+    static void TestForwardValues();
+    static void TestForwardFromIds();
+    static void TestForwardBoundsCheck();
+    static void TestBackwardWeightGrad();
+    static void TestParameterCount();
+    static void TestZeroGradients();
+    static void TestDescription();
+};
 
 //------------------------------------------------------------------------------
 // Test 1: Forward output shape
 //------------------------------------------------------------------------------
-static void TestForwardShape()
+void CAIF_TokenEmbeddingTests::TestForwardShape()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=3;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
-    // Create float token IDs
+    const uint32_t num_tokens=g_caif_tokemb_test_batch*g_caif_tokemb_test_seq;
     std::vector<float> float_ids={0,1,2,3,4,5};
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             float_ids.data(),{batch,seq_len},stream);
+      float_ids.data(),
+      {g_caif_tokemb_test_batch,g_caif_tokemb_test_seq},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=emb.Forward(input,ctx);
     const auto &shape=output.Shape();
 
-    bool passed=(shape.size()==3&&
-                 shape[0]==batch&&
-                 shape[1]==seq_len&&
-                 shape[2]==dim);
+    bool passed=(shape.size()==3 &&
+                 shape[0]==g_caif_tokemb_test_batch &&
+                 shape[1]==g_caif_tokemb_test_seq &&
+                 shape[2]==g_caif_tokemb_test_dim);
     if(passed==false)
     {
-      std::cout<<"  Expected shape [2,3,8], got [";
+      ISE_Out::Out()<<"  Expected shape [2,3,8], got [";
       for(size_t i=0;i<shape.size();++i)
       {
         if(i>0)
         {
-          std::cout<<",";
+          ISE_Out::Out()<<",";
         }
-        std::cout<<shape[i];
+        ISE_Out::Out()<<shape[i];
       }
-      std::cout<<"]\n";
+      ISE_Out::Out()<<"]\n";
     }
+    // suppress unused variable warning
+    (void)num_tokens;
 
-    ReportResult("TokenEmbedding::ForwardShape",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ForwardShape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ForwardShape")
 }
@@ -91,20 +120,16 @@ static void TestForwardShape()
 //------------------------------------------------------------------------------
 // Test 2: Forward values match CPU reference
 //------------------------------------------------------------------------------
-static void TestForwardValues()
+void CAIF_TokenEmbeddingTests::TestForwardValues()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=3;
-    constexpr uint32_t num_tokens=batch*seq_len;
+    const uint32_t num_tokens=g_caif_tokemb_test_batch*g_caif_tokemb_test_seq;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     // Read embedding table
@@ -119,30 +144,37 @@ static void TestForwardValues()
     }
 
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             float_ids.data(),{batch,seq_len},stream);
+      float_ids.data(),
+      {g_caif_tokemb_test_batch,g_caif_tokemb_test_seq},
+      stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=emb.Forward(input,ctx);
     CAIF_HostTensor host_output=output.ToHost();
 
     // CPU reference
-    std::vector<float> expected(num_tokens*dim);
+    std::vector<float> expected(num_tokens*g_caif_tokemb_test_dim);
     CAIF_CpuEmbedding::Lookup(host_table.Data(),ids.data(),expected.data(),
-                        num_tokens,dim);
+                              num_tokens,g_caif_tokemb_test_dim);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(host_output.Data()[i],expected[i])==false)
+      if(CAIF_TestHarness::FloatEqual(host_output.Data()[i],expected[i],g_caif_tokemb_test_float_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                     <<i
+                     <<": got "
+                     <<host_output.Data()[i]
+                     <<" expected "
+                     <<expected[i]
+                     <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("TokenEmbedding::ForwardValues",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ForwardValues",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ForwardValues")
 }
@@ -150,20 +182,16 @@ static void TestForwardValues()
 //------------------------------------------------------------------------------
 // Test 3: ForwardFromIds matches Forward float path
 //------------------------------------------------------------------------------
-static void TestForwardFromIds()
+void CAIF_TokenEmbeddingTests::TestForwardFromIds()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=3;
-    constexpr uint32_t num_tokens=batch*seq_len;
+    const uint32_t num_tokens=g_caif_tokemb_test_batch*g_caif_tokemb_test_seq;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     std::vector<uint32_t> ids={0,5,10,3,7,15};
@@ -175,29 +203,39 @@ static void TestForwardFromIds()
 
     // Float path
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             float_ids.data(),{batch,seq_len},stream);
+      float_ids.data(),
+      {g_caif_tokemb_test_batch,g_caif_tokemb_test_seq},
+      stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor out_float=emb.Forward(input,ctx);
     CAIF_HostTensor host_float=out_float.ToHost();
 
     // uint32 path
-    CAIF_DeviceTensor out_ids=emb.ForwardFromIds(ids.data(),batch,seq_len,false);
+    CAIF_DeviceTensor out_ids=emb.ForwardFromIds(ids.data(),
+                                                  g_caif_tokemb_test_batch,
+                                                  g_caif_tokemb_test_seq,
+                                                  false);
     CAIF_HostTensor host_ids=out_ids.ToHost();
 
     bool passed=true;
-    for(size_t i=0;i<num_tokens*dim;++i)
+    for(size_t i=0;i<num_tokens*g_caif_tokemb_test_dim;++i)
     {
-      if(FloatEqual(host_float.Data()[i],host_ids.Data()[i])==false)
+      if(CAIF_TestHarness::FloatEqual(host_float.Data()[i],host_ids.Data()[i],g_caif_tokemb_test_float_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": float="<<host_float.Data()[i]
-                 <<" ids="<<host_ids.Data()[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                     <<i
+                     <<": float="
+                     <<host_float.Data()[i]
+                     <<" ids="
+                     <<host_ids.Data()[i]
+                     <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("TokenEmbedding::ForwardFromIds",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ForwardFromIds",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ForwardFromIds")
 }
@@ -205,36 +243,40 @@ static void TestForwardFromIds()
 //------------------------------------------------------------------------------
 // Test 4: Forward bounds check (valid IDs produce correct output)
 //------------------------------------------------------------------------------
-static void TestForwardBoundsCheck()
+void CAIF_TokenEmbeddingTests::TestForwardBoundsCheck()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
     constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     // Use first and last valid IDs
     std::vector<uint32_t> ids={0,1,14,15};
-    CAIF_DeviceTensor output=emb.ForwardFromIds(ids.data(),batch,seq_len,false);
+    CAIF_DeviceTensor output=emb.ForwardFromIds(ids.data(),batch,g_caif_tokemb_test_seq_bounds,false);
     CAIF_HostTensor host_output=output.ToHost();
     CAIF_HostTensor host_table=emb.ParameterTensor(0).ToHost();
 
     bool passed=true;
-    for(uint32_t t=0;t<seq_len;++t)
+    for(uint32_t t=0;t<g_caif_tokemb_test_seq_bounds;++t)
     {
-      for(uint32_t d=0;d<dim;++d)
+      for(uint32_t d=0;d<g_caif_tokemb_test_dim;++d)
       {
-        const float expected=host_table.Data()[ids[t]*dim+d];
-        const float actual=host_output.Data()[t*dim+d];
-        if(FloatEqual(actual,expected)==false)
+        const float expected=host_table.Data()[ids[t]*g_caif_tokemb_test_dim+d];
+        const float actual=host_output.Data()[t*g_caif_tokemb_test_dim+d];
+        if(CAIF_TestHarness::FloatEqual(actual,expected,g_caif_tokemb_test_float_tol)==false)
         {
-          std::cout<<"  Mismatch at token "<<t<<" dim "<<d
-                   <<": got "<<actual<<" expected "<<expected<<"\n";
+          ISE_Out::Out()<<"  Mismatch at token "
+                       <<t
+                       <<" dim "
+                       <<d
+                       <<": got "
+                       <<actual
+                       <<" expected "
+                       <<expected
+                       <<"\n";
           passed=false;
           break;
         }
@@ -245,7 +287,7 @@ static void TestForwardBoundsCheck()
       }
     }
 
-    ReportResult("TokenEmbedding::ForwardBoundsCheck",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ForwardBoundsCheck",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ForwardBoundsCheck")
 }
@@ -253,37 +295,35 @@ static void TestForwardBoundsCheck()
 //------------------------------------------------------------------------------
 // Test 5: Backward weight gradient (finite-difference)
 //------------------------------------------------------------------------------
-static void TestBackwardWeightGrad()
+void CAIF_TokenEmbeddingTests::TestBackwardWeightGrad()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=3;
-    constexpr uint32_t num_tokens=batch*seq_len;
-    constexpr float h=1e-3f;
-    constexpr float grad_tol=5e-2f;
+    const uint32_t num_tokens=g_caif_tokemb_test_batch*g_caif_tokemb_test_seq;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
     // Read initial embedding table
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
     CAIF_HostTensor host_table=emb.ParameterTensor(0).ToHost();
     std::vector<float> table_data(host_table.Data(),
-                                  host_table.Data()+vocab_size*dim);
+                                  host_table.Data()+g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim);
 
     std::vector<uint32_t> ids={0,5,10,3,7,15};
 
     // Analytical backward
-    CAIF_DeviceTensor out=emb.ForwardFromIds(ids.data(),batch,seq_len,true);
-    std::vector<float> grad_ones(num_tokens*dim,1.0f);
+    CAIF_DeviceTensor out=emb.ForwardFromIds(ids.data(),
+                                              g_caif_tokemb_test_batch,
+                                              g_caif_tokemb_test_seq,
+                                              true);
+    std::vector<float> grad_ones(num_tokens*g_caif_tokemb_test_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),
-                                {batch,seq_len,dim},stream);
+      grad_ones.data(),
+      {g_caif_tokemb_test_batch,g_caif_tokemb_test_seq,g_caif_tokemb_test_dim},
+      stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     emb.Backward(grad_out,ctx);
@@ -291,55 +331,67 @@ static void TestBackwardWeightGrad()
 
     // Finite-difference for a subset of table entries
     bool passed=true;
-    for(uint32_t token_idx=0;token_idx<num_tokens&&passed==true;++token_idx)
+    for(uint32_t token_idx=0;token_idx<num_tokens && passed==true;++token_idx)
     {
       const uint32_t id=ids[token_idx];
-      for(uint32_t d=0;d<dim&&passed==true;++d)
+      for(uint32_t d=0;d<g_caif_tokemb_test_dim && passed==true;++d)
       {
-        const size_t idx=id*dim+d;
+        const size_t idx=id*g_caif_tokemb_test_dim+d;
 
         // f(x+h)
         std::vector<float> table_plus(table_data);
-        table_plus[idx]+=h;
+        table_plus[idx]+=g_caif_tokemb_test_fd_h;
         CAIF_DeviceTokenEmbedding<float,float> emb_p(config,stream);
-        emb_p.ParameterTensor(0).CopyFromHost(table_plus.data(),vocab_size*dim);
-        CAIF_DeviceTensor out_p=emb_p.ForwardFromIds(
-                                 ids.data(),batch,seq_len,false);
+        emb_p.ParameterTensor(0).CopyFromHost(table_plus.data(),
+                                               g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim);
+        CAIF_DeviceTensor out_p=emb_p.ForwardFromIds(ids.data(),
+                                                      g_caif_tokemb_test_batch,
+                                                      g_caif_tokemb_test_seq,
+                                                      false);
         CAIF_HostTensor hout_p=out_p.ToHost();
         float sum_plus=0.0f;
-        for(size_t j=0;j<num_tokens*dim;++j)
+        for(size_t j=0;j<num_tokens*g_caif_tokemb_test_dim;++j)
         {
           sum_plus+=hout_p.Data()[j];
         }
 
         // f(x-h)
         std::vector<float> table_minus(table_data);
-        table_minus[idx]-=h;
+        table_minus[idx]-=g_caif_tokemb_test_fd_h;
         CAIF_DeviceTokenEmbedding<float,float> emb_m(config,stream);
-        emb_m.ParameterTensor(0).CopyFromHost(table_minus.data(),vocab_size*dim);
-        CAIF_DeviceTensor out_m=emb_m.ForwardFromIds(
-                                 ids.data(),batch,seq_len,false);
+        emb_m.ParameterTensor(0).CopyFromHost(table_minus.data(),
+                                               g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim);
+        CAIF_DeviceTensor out_m=emb_m.ForwardFromIds(ids.data(),
+                                                      g_caif_tokemb_test_batch,
+                                                      g_caif_tokemb_test_seq,
+                                                      false);
         CAIF_HostTensor hout_m=out_m.ToHost();
         float sum_minus=0.0f;
-        for(size_t j=0;j<num_tokens*dim;++j)
+        for(size_t j=0;j<num_tokens*g_caif_tokemb_test_dim;++j)
         {
           sum_minus+=hout_m.Data()[j];
         }
 
-        const float numerical=(sum_plus-sum_minus)/(2.0f*h);
+        const float numerical=(sum_plus-sum_minus)/(2.0f*g_caif_tokemb_test_fd_h);
         const float analytical=host_grad.Data()[idx];
 
-        if(std::fabs(numerical-analytical)>grad_tol)
+        if(std::fabs(numerical-analytical)>g_caif_tokemb_test_grad_tol)
         {
-          std::cout<<"  Grad mismatch at table["<<id<<"]["<<d
-                   <<"]: analytical="<<analytical
-                   <<" numerical="<<numerical<<"\n";
+          ISE_Out::Out()<<"  Grad mismatch at table["
+                       <<id
+                       <<"]["
+                       <<d
+                       <<"]: analytical="
+                       <<analytical
+                       <<" numerical="
+                       <<numerical
+                       <<"\n";
           passed=false;
         }
       }
     }
 
-    ReportResult("TokenEmbedding::BackwardWeightGrad",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::BackwardWeightGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::BackwardWeightGrad")
 }
@@ -347,32 +399,33 @@ static void TestBackwardWeightGrad()
 //------------------------------------------------------------------------------
 // Test 6: Parameter count
 //------------------------------------------------------------------------------
-static void TestParameterCount()
+void CAIF_TokenEmbeddingTests::TestParameterCount()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-
     CAIF_CudaStream stream;
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     bool passed=true;
     if(emb.ParameterTensorCount()!=1)
     {
-      std::cout<<"  ParameterTensorCount expected 1, got "
-               <<emb.ParameterTensorCount()<<"\n";
+      ISE_Out::Out()<<"  ParameterTensorCount expected 1, got "
+                   <<emb.ParameterTensorCount()
+                   <<"\n";
       passed=false;
     }
-    if(emb.TotalParameterCount()!=vocab_size*dim)
+    if(emb.TotalParameterCount()!=g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim)
     {
-      std::cout<<"  TotalParameterCount expected "<<vocab_size*dim
-               <<", got "<<emb.TotalParameterCount()<<"\n";
+      ISE_Out::Out()<<"  TotalParameterCount expected "
+                   <<g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim
+                   <<", got "
+                   <<emb.TotalParameterCount()
+                   <<"\n";
       passed=false;
     }
 
-    ReportResult("TokenEmbedding::ParameterCount",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ParameterCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ParameterCount")
 }
@@ -380,27 +433,26 @@ static void TestParameterCount()
 //------------------------------------------------------------------------------
 // Test 7: ZeroGradients
 //------------------------------------------------------------------------------
-static void TestZeroGradients()
+void CAIF_TokenEmbeddingTests::TestZeroGradients()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
     constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=3;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     // Run forward+backward to produce non-zero gradients
     std::vector<uint32_t> ids={0,1,2};
-    CAIF_DeviceTensor out=emb.ForwardFromIds(ids.data(),batch,seq_len,true);
-    std::vector<float> grad_ones(seq_len*dim,1.0f);
+    CAIF_DeviceTensor out=emb.ForwardFromIds(ids.data(),batch,g_caif_tokemb_test_seq,true);
+    std::vector<float> grad_ones(g_caif_tokemb_test_seq*g_caif_tokemb_test_dim,1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+      grad_ones.data(),
+      {batch,g_caif_tokemb_test_seq,g_caif_tokemb_test_dim},
+      stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     emb.Backward(grad_out,ctx);
@@ -410,18 +462,21 @@ static void TestZeroGradients()
 
     CAIF_HostTensor host_grad=emb.GradientTensor(0).ToHost();
     bool passed=true;
-    for(size_t i=0;i<vocab_size*dim;++i)
+    for(size_t i=0;i<g_caif_tokemb_test_vocab*g_caif_tokemb_test_dim;++i)
     {
       if(host_grad.Data()[i]!=0.0f)
       {
-        std::cout<<"  Gradient not zeroed at "<<i<<": "
-                 <<host_grad.Data()[i]<<"\n";
+        ISE_Out::Out()<<"  Gradient not zeroed at "
+                     <<i
+                     <<": "
+                     <<host_grad.Data()[i]
+                     <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("TokenEmbedding::ZeroGradients",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::ZeroGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::ZeroGradients")
 }
@@ -429,15 +484,12 @@ static void TestZeroGradients()
 //------------------------------------------------------------------------------
 // Test 8: Description string
 //------------------------------------------------------------------------------
-static void TestDescription()
+void CAIF_TokenEmbeddingTests::TestDescription()
 {
   try
   {
-    constexpr uint32_t vocab_size=16;
-    constexpr uint32_t dim=8;
-
     CAIF_CudaStream stream;
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t config{vocab_size,dim};
+    const CAIF_DeviceTokenEmbeddingConfig config{g_caif_tokemb_test_vocab,g_caif_tokemb_test_dim};
     CAIF_DeviceTokenEmbedding<float,float> emb(config,stream);
 
     const std::string desc=emb.Description();
@@ -445,21 +497,22 @@ static void TestDescription()
     bool passed=(desc==expected);
     if(passed==false)
     {
-      std::cout<<"  Expected '"<<expected<<"', got '"<<desc<<"'\n";
+      ISE_Out::Out()<<"  Expected '"
+                   <<expected
+                   <<"', got '"
+                   <<desc
+                   <<"'\n";
     }
 
-    ReportResult("TokenEmbedding::Description",passed);
+    CAIF_TestHarness::Report("TokenEmbedding::Description",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TokenEmbedding::Description")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_TokenEmbeddingTests::RunAll()
 {
-  std::cout<<"=== CAIF_DeviceTokenEmbedding<float,float> Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF_DeviceTokenEmbedding<float,float> Tests ==="
+               <<"\n\n";
   TestForwardShape();
   TestForwardValues();
   TestForwardFromIds();
@@ -468,9 +521,20 @@ int main()
   TestParameterCount();
   TestZeroGradients();
   TestDescription();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_TokenEmbeddingTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+               <<"\n";
+  return 0;
+#endif
 }

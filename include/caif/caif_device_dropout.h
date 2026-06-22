@@ -58,6 +58,14 @@ class CAIF_DeviceDropout:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
     float Rate()const{return _rate;}
+    void SetRate(float rate){_rate=rate;}
+
+    CAIF_DeviceTensor &CachedMask(){return _cached_mask;}
+    const CAIF_DeviceTensor &CachedMask()const{return _cached_mask;}
+    void SetCachedMask(CAIF_DeviceTensor &&mask){_cached_mask=std::move(mask);}
+
+    bool CachedMaskActive()const{return _cached_mask_active;}
+    void SetCachedMaskActive(bool active){_cached_mask_active=active;}
 
   public:
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;

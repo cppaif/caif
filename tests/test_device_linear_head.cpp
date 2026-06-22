@@ -12,64 +12,110 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Test: CAIF_DeviceLinearHead<float,float> forward/backward correctness.
+//
+// Tests cover forward shape (with/without bias), CPU reference parity,
+// weight-tied forward, finite-difference input/weight gradients,
+// weight-tied backward, and parameter count.
+//------------------------------------------------------------------------------
 #include "caif_device_linear_head.h"
 #include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_cpu_reference/caif_cpu_linear.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
+
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
-
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
-{
-  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
-}
 
 #ifdef USE_CAIF_CUDA
+
+constexpr uint32_t g_caif_linhead_test_batch_seq=2;
+constexpr uint32_t g_caif_linhead_test_seq_len=4;
+constexpr uint32_t g_caif_linhead_test_input_dim_shape=64;
+constexpr uint32_t g_caif_linhead_test_output_dim_shape=128;
+constexpr uint32_t g_caif_linhead_test_small_input=4;
+constexpr uint32_t g_caif_linhead_test_small_output=3;
+constexpr uint32_t g_caif_linhead_test_tied_input=4;
+constexpr uint32_t g_caif_linhead_test_tied_output=6;
+constexpr uint32_t g_caif_linhead_test_nobias_input=32;
+constexpr uint32_t g_caif_linhead_test_nobias_output=16;
+constexpr uint32_t g_caif_linhead_test_param_input=8;
+constexpr uint32_t g_caif_linhead_test_param_output=16;
+constexpr float g_caif_linhead_test_fill=0.5f;
+constexpr float g_caif_linhead_test_input_scale=0.1f;
+constexpr float g_caif_linhead_test_tied_scale=0.05f;
+constexpr float g_caif_linhead_test_tied_offset=0.1f;
+constexpr float g_caif_linhead_test_fd_h=1e-3f;
+constexpr float g_caif_linhead_test_fd_tol=5e-2f;
+constexpr float g_caif_linhead_test_fwd_tol=1e-3f;
+constexpr float g_caif_linhead_test_tied_fill=0.1f;
+constexpr float g_caif_linhead_test_sum_min=0.01f;
+constexpr int g_caif_linhead_test_fd_count=4;
+
+//------------------------------------------------------------------------------
+// Linear head tests.
+//------------------------------------------------------------------------------
+class CAIF_LinearHeadTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void TestForwardShape();
+    static void TestForwardShapeNoBias();
+    static void TestForwardValues();
+    static void TestWeightTiedForward();
+    static void TestBackwardInputGrad();
+    static void TestBackwardWeightGrad();
+    static void TestWeightTiedBackwardGrad();
+    static void TestParameterCount();
+};
 
 //------------------------------------------------------------------------------
 // Test 1: Forward output shape
 //------------------------------------------------------------------------------
-static void TestForwardShape()
+void CAIF_LinearHeadTests::TestForwardShape()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=4;
-    constexpr uint32_t input_dim=64;
-    constexpr uint32_t output_dim=128;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_input_dim_shape,
+                                             g_caif_linhead_test_output_dim_shape,
+                                             true};
     CAIF_DeviceLinearHead<float,float> head(config,stream);
 
-    std::vector<float> input_data(batch*seq_len*input_dim,0.5f);
+    const size_t n_input=g_caif_linhead_test_batch_seq*
+                         g_caif_linhead_test_seq_len*
+                         g_caif_linhead_test_input_dim_shape;
+    std::vector<float> input_data(n_input,g_caif_linhead_test_fill);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,seq_len,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_seq_len,g_caif_linhead_test_input_dim_shape},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=head.Forward(input,ctx);
     const auto &shape=output.Shape();
 
-    bool passed=(shape.size()==3&&
-                 shape[0]==batch&&
-                 shape[1]==seq_len&&
-                 shape[2]==output_dim);
+    bool passed=(shape.size()==3 &&
+                 shape[0]==g_caif_linhead_test_batch_seq &&
+                 shape[1]==g_caif_linhead_test_seq_len &&
+                 shape[2]==g_caif_linhead_test_output_dim_shape);
 
-    ReportResult("LinearHead::ForwardShape",passed);
+    CAIF_TestHarness::Report("LinearHead::ForwardShape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::ForwardShape")
 }
@@ -77,34 +123,35 @@ static void TestForwardShape()
 //------------------------------------------------------------------------------
 // Test 2: Forward shape no bias
 //------------------------------------------------------------------------------
-static void TestForwardShapeNoBias()
+void CAIF_LinearHeadTests::TestForwardShapeNoBias()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t input_dim=32;
-    constexpr uint32_t output_dim=16;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,false};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_nobias_input,
+                                             g_caif_linhead_test_nobias_output,
+                                             false};
     CAIF_DeviceLinearHead<float,float> head(config,stream);
 
-    std::vector<float> input_data(batch*input_dim,0.5f);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_nobias_input;
+    std::vector<float> input_data(n_input,g_caif_linhead_test_fill);
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_nobias_input},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=head.Forward(input,ctx);
     const auto &shape=output.Shape();
 
-    bool passed=(shape.size()==2&&
-                 shape[0]==batch&&
-                 shape[1]==output_dim);
+    bool passed=(shape.size()==2 &&
+                 shape[0]==g_caif_linhead_test_batch_seq &&
+                 shape[1]==g_caif_linhead_test_nobias_output);
 
-    ReportResult("LinearHead::ForwardShapeNoBias",passed);
+    CAIF_TestHarness::Report("LinearHead::ForwardShapeNoBias",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::ForwardShapeNoBias")
 }
@@ -112,23 +159,21 @@ static void TestForwardShapeNoBias()
 //------------------------------------------------------------------------------
 // Test 3: Forward values vs CPU reference
 //------------------------------------------------------------------------------
-static void TestForwardValues()
+void CAIF_LinearHeadTests::TestForwardValues()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t input_dim=4;
-    constexpr uint32_t output_dim=3;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_small_input,
+                                             g_caif_linhead_test_small_output,
+                                             true};
     CAIF_DeviceLinearHead<float,float> head(config,stream);
 
     // Get weight and bias
-    std::vector<float> weight_data(input_dim*output_dim);
-    std::vector<float> bias_data(output_dim);
+    std::vector<float> weight_data(g_caif_linhead_test_small_input*g_caif_linhead_test_small_output);
+    std::vector<float> bias_data(g_caif_linhead_test_small_output);
     head.ParameterTensor(0).CopyToHost(weight_data.data());
 
     // Get bias from second parameter
@@ -138,38 +183,51 @@ static void TestForwardValues()
     }
 
     // Create input
-    std::vector<float> input_data(batch*input_dim);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_input;
+    std::vector<float> input_data(n_input);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i)*0.1f;
+      input_data[i]=static_cast<float>(i)*g_caif_linhead_test_input_scale;
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_input},
+      stream);
 
     // GPU forward
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=head.Forward(input,ctx);
-    std::vector<float> gpu_output(batch*output_dim);
+    std::vector<float> gpu_output(g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_output);
     output.CopyToHost(gpu_output.data());
 
     // CPU reference
-    std::vector<float> cpu_output(batch*output_dim);
+    std::vector<float> cpu_output(g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_output);
     CAIF_CpuLinear::Apply(input_data.data(),weight_data.data(),bias_data.data(),
-              cpu_output.data(),batch,input_dim,output_dim,true);
+                          cpu_output.data(),
+                          g_caif_linhead_test_batch_seq,
+                          g_caif_linhead_test_small_input,
+                          g_caif_linhead_test_small_output,
+                          true);
 
     bool passed=true;
     for(size_t i=0;i<cpu_output.size();++i)
     {
-      if(FloatEqual(gpu_output[i],cpu_output[i],1e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(gpu_output[i],cpu_output[i],g_caif_linhead_test_fwd_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": GPU="<<gpu_output[i]<<", CPU="<<cpu_output[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                     <<i
+                     <<": GPU="
+                     <<gpu_output[i]
+                     <<", CPU="
+                     <<cpu_output[i]
+                     <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("LinearHead::ForwardValues",passed);
+    CAIF_TestHarness::Report("LinearHead::ForwardValues",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::ForwardValues")
 }
@@ -177,43 +235,49 @@ static void TestForwardValues()
 //------------------------------------------------------------------------------
 // Test 4: Weight-tied forward
 //------------------------------------------------------------------------------
-static void TestWeightTiedForward()
+void CAIF_LinearHeadTests::TestWeightTiedForward()
 {
   try
   {
-    constexpr uint32_t input_dim=4;
-    constexpr uint32_t output_dim=6;
-    constexpr uint32_t batch=2;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
     // Create "embedding table" - shape [output_dim, input_dim]
-    std::vector<float> emb_data(output_dim*input_dim);
+    const size_t n_emb=g_caif_linhead_test_tied_output*g_caif_linhead_test_tied_input;
+    std::vector<float> emb_data(n_emb);
     for(size_t i=0;i<emb_data.size();++i)
     {
-      emb_data[i]=static_cast<float>(i)*0.05f;
+      emb_data[i]=static_cast<float>(i)*g_caif_linhead_test_tied_scale;
     }
     CAIF_DeviceTensor embedding=CAIF_DeviceTensor::FromHostData(
-                                 emb_data.data(),{output_dim,input_dim},stream);
-    CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros({output_dim,input_dim},stream);
+      emb_data.data(),
+      {g_caif_linhead_test_tied_output,g_caif_linhead_test_tied_input},
+      stream);
+    CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros(
+      {g_caif_linhead_test_tied_output,g_caif_linhead_test_tied_input},
+      stream);
 
     // Create tied linear head
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_tied_input,
+                                             g_caif_linhead_test_tied_output,
+                                             true};
     CAIF_DeviceLinearHead<float,float> head(config,embedding,embedding_grad,stream);
 
     // Create input
-    std::vector<float> input_data(batch*input_dim);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_tied_input;
+    std::vector<float> input_data(n_input);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i)*0.1f+0.1f;
+      input_data[i]=static_cast<float>(i)*g_caif_linhead_test_input_scale+g_caif_linhead_test_tied_offset;
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_tied_input},
+      stream);
 
     // Get bias
-    std::vector<float> bias_data(output_dim,0.0f);
+    std::vector<float> bias_data(g_caif_linhead_test_tied_output,0.0f);
     if(head.ParameterTensorCount()>0)
     {
       head.ParameterTensor(0).CopyToHost(bias_data.data());
@@ -223,26 +287,36 @@ static void TestWeightTiedForward()
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=head.Forward(input,ctx);
-    std::vector<float> gpu_output(batch*output_dim);
+    std::vector<float> gpu_output(g_caif_linhead_test_batch_seq*g_caif_linhead_test_tied_output);
     output.CopyToHost(gpu_output.data());
 
     // CPU reference with transposed weight
-    std::vector<float> cpu_output(batch*output_dim);
+    std::vector<float> cpu_output(g_caif_linhead_test_batch_seq*g_caif_linhead_test_tied_output);
     CAIF_CpuLinear::ApplyTranspose(input_data.data(),emb_data.data(),bias_data.data(),
-                       cpu_output.data(),batch,input_dim,output_dim,true);
+                                   cpu_output.data(),
+                                   g_caif_linhead_test_batch_seq,
+                                   g_caif_linhead_test_tied_input,
+                                   g_caif_linhead_test_tied_output,
+                                   true);
 
     bool passed=true;
     for(size_t i=0;i<cpu_output.size();++i)
     {
-      if(FloatEqual(gpu_output[i],cpu_output[i],1e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(gpu_output[i],cpu_output[i],g_caif_linhead_test_fwd_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": GPU="<<gpu_output[i]<<", CPU="<<cpu_output[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                     <<i
+                     <<": GPU="
+                     <<gpu_output[i]
+                     <<", CPU="
+                     <<cpu_output[i]
+                     <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("LinearHead::WeightTiedForward",passed);
+    CAIF_TestHarness::Report("LinearHead::WeightTiedForward",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::WeightTiedForward")
 }
@@ -250,92 +324,105 @@ static void TestWeightTiedForward()
 //------------------------------------------------------------------------------
 // Test 5: Backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestBackwardInputGrad()
+void CAIF_LinearHeadTests::TestBackwardInputGrad()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t input_dim=4;
-    constexpr uint32_t output_dim=3;
-    constexpr float h=1e-3f;
-    constexpr float tolerance=5e-2f;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_small_input,
+                                             g_caif_linhead_test_small_output,
+                                             true};
     CAIF_DeviceLinearHead<float,float> head(config,stream);
 
     // Create input
-    std::vector<float> input_data(batch*input_dim);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_input;
+    std::vector<float> input_data(n_input);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i)*0.1f+0.1f;
+      input_data[i]=static_cast<float>(i)*g_caif_linhead_test_input_scale+g_caif_linhead_test_tied_offset;
     }
 
     // Forward and backward
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_input},
+      stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
-    CAIF_DeviceTensor output=head.Forward(input,ctx);
+    head.Forward(input,ctx);
 
     // Create grad_output (all ones for sum reduction)
-    std::vector<float> grad_out_data(batch*output_dim,1.0f);
+    const size_t n_out=g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_output;
+    std::vector<float> grad_out_data(n_out,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_out_data.data(),{batch,output_dim},stream);
+      grad_out_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_output},
+      stream);
 
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     CAIF_DeviceTensor grad_input=head.Backward(grad_output,ctx);
-    std::vector<float> analytical_grad(batch*input_dim);
+    std::vector<float> analytical_grad(n_input);
     grad_input.CopyToHost(analytical_grad.data());
 
     // Finite difference for a few elements
     bool passed=true;
-    for(int idx=0;idx<4;++idx)
+    for(int idx=0;idx<g_caif_linhead_test_fd_count;++idx)
     {
       // f(x+h)
       std::vector<float> input_plus=input_data;
-      input_plus[idx]+=h;
+      input_plus[idx]+=g_caif_linhead_test_fd_h;
       CAIF_DeviceTensor inp_plus=CAIF_DeviceTensor::FromHostData(
-                                  input_plus.data(),{batch,input_dim},stream);
+        input_plus.data(),
+        {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_input},
+        stream);
       ctx.SetTraining(false);
       ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
       CAIF_DeviceTensor out_plus=head.Forward(inp_plus,ctx);
-      std::vector<float> out_plus_data(batch*output_dim);
+      std::vector<float> out_plus_data(n_out);
       out_plus.CopyToHost(out_plus_data.data());
       float sum_plus=0.0f;
-      for(auto v:out_plus_data)
+      for(size_t k=0;k<out_plus_data.size();++k)
       {
-        sum_plus+=v;
+        sum_plus+=out_plus_data[k];
       }
 
       // f(x-h)
       std::vector<float> input_minus=input_data;
-      input_minus[idx]-=h;
+      input_minus[idx]-=g_caif_linhead_test_fd_h;
       CAIF_DeviceTensor inp_minus=CAIF_DeviceTensor::FromHostData(
-                                   input_minus.data(),{batch,input_dim},stream);
+        input_minus.data(),
+        {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_input},
+        stream);
       CAIF_DeviceTensor out_minus=head.Forward(inp_minus,ctx);
-      std::vector<float> out_minus_data(batch*output_dim);
+      std::vector<float> out_minus_data(n_out);
       out_minus.CopyToHost(out_minus_data.data());
       float sum_minus=0.0f;
-      for(auto v:out_minus_data)
+      for(size_t k=0;k<out_minus_data.size();++k)
       {
-        sum_minus+=v;
+        sum_minus+=out_minus_data[k];
       }
 
-      float numerical_grad=(sum_plus-sum_minus)/(2.0f*h);
-      float diff=std::fabs(analytical_grad[idx]-numerical_grad);
+      const float numerical_grad=(sum_plus-sum_minus)/(2.0f*g_caif_linhead_test_fd_h);
+      const float diff=std::fabs(analytical_grad[idx]-numerical_grad);
 
-      if(diff>tolerance)
+      if(diff>g_caif_linhead_test_fd_tol)
       {
-        std::cout<<"  idx="<<idx<<": analytical="<<analytical_grad[idx]
-                 <<", numerical="<<numerical_grad<<", diff="<<diff<<"\n";
+        ISE_Out::Out()<<"  idx="
+                     <<idx
+                     <<": analytical="
+                     <<analytical_grad[idx]
+                     <<", numerical="
+                     <<numerical_grad
+                     <<", diff="
+                     <<diff
+                     <<"\n";
         passed=false;
       }
     }
 
-    ReportResult("LinearHead::BackwardInputGrad",passed);
+    CAIF_TestHarness::Report("LinearHead::BackwardInputGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::BackwardInputGrad")
 }
@@ -343,34 +430,36 @@ static void TestBackwardInputGrad()
 //------------------------------------------------------------------------------
 // Test 6: Backward weight gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestBackwardWeightGrad()
+void CAIF_LinearHeadTests::TestBackwardWeightGrad()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t input_dim=4;
-    constexpr uint32_t output_dim=3;
-    constexpr float h=1e-3f;
-    constexpr float tolerance=5e-2f;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_small_input,
+                                             g_caif_linhead_test_small_output,
+                                             true};
 
     // Create input
-    std::vector<float> input_data(batch*input_dim);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_input;
+    std::vector<float> input_data(n_input);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i)*0.1f+0.1f;
+      input_data[i]=static_cast<float>(i)*g_caif_linhead_test_input_scale+g_caif_linhead_test_tied_offset;
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_input},
+      stream);
 
     // Create grad_output
-    std::vector<float> grad_out_data(batch*output_dim,1.0f);
+    const size_t n_out=g_caif_linhead_test_batch_seq*g_caif_linhead_test_small_output;
+    std::vector<float> grad_out_data(n_out,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_out_data.data(),{batch,output_dim},stream);
+      grad_out_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_small_output},
+      stream);
 
     // Get analytical gradient
     CAIF_DeviceLinearHead<float,float> head(config,stream);
@@ -381,59 +470,67 @@ static void TestBackwardWeightGrad()
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     head.Backward(grad_output,ctx);
 
-    std::vector<float> analytical_grad(input_dim*output_dim);
+    const size_t n_weight=g_caif_linhead_test_small_input*g_caif_linhead_test_small_output;
+    std::vector<float> analytical_grad(n_weight);
     head.GradientTensor(0).CopyToHost(analytical_grad.data());
 
     // Finite difference for a few weight elements
     bool passed=true;
-    for(int idx=0;idx<4;++idx)
+    for(int idx=0;idx<g_caif_linhead_test_fd_count;++idx)
     {
       // Get current weight
-      std::vector<float> weight_data(input_dim*output_dim);
+      std::vector<float> weight_data(n_weight);
       head.ParameterTensor(0).CopyToHost(weight_data.data());
 
       // f(w+h)
-      weight_data[idx]+=h;
+      weight_data[idx]+=g_caif_linhead_test_fd_h;
       head.ParameterTensor(0).CopyFromHost(weight_data.data(),weight_data.size());
       ctx.SetTraining(false);
       ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
       CAIF_DeviceTensor out_plus=head.Forward(input,ctx);
-      std::vector<float> out_plus_data(batch*output_dim);
+      std::vector<float> out_plus_data(n_out);
       out_plus.CopyToHost(out_plus_data.data());
       float sum_plus=0.0f;
-      for(auto v:out_plus_data)
+      for(size_t k=0;k<out_plus_data.size();++k)
       {
-        sum_plus+=v;
+        sum_plus+=out_plus_data[k];
       }
 
       // f(w-h)
-      weight_data[idx]-=2.0f*h;
+      weight_data[idx]-=2.0f*g_caif_linhead_test_fd_h;
       head.ParameterTensor(0).CopyFromHost(weight_data.data(),weight_data.size());
       CAIF_DeviceTensor out_minus=head.Forward(input,ctx);
-      std::vector<float> out_minus_data(batch*output_dim);
+      std::vector<float> out_minus_data(n_out);
       out_minus.CopyToHost(out_minus_data.data());
       float sum_minus=0.0f;
-      for(auto v:out_minus_data)
+      for(size_t k=0;k<out_minus_data.size();++k)
       {
-        sum_minus+=v;
+        sum_minus+=out_minus_data[k];
       }
 
       // Restore weight
-      weight_data[idx]+=h;
+      weight_data[idx]+=g_caif_linhead_test_fd_h;
       head.ParameterTensor(0).CopyFromHost(weight_data.data(),weight_data.size());
 
-      float numerical_grad=(sum_plus-sum_minus)/(2.0f*h);
-      float diff=std::fabs(analytical_grad[idx]-numerical_grad);
+      const float numerical_grad=(sum_plus-sum_minus)/(2.0f*g_caif_linhead_test_fd_h);
+      const float diff=std::fabs(analytical_grad[idx]-numerical_grad);
 
-      if(diff>tolerance)
+      if(diff>g_caif_linhead_test_fd_tol)
       {
-        std::cout<<"  idx="<<idx<<": analytical="<<analytical_grad[idx]
-                 <<", numerical="<<numerical_grad<<", diff="<<diff<<"\n";
+        ISE_Out::Out()<<"  idx="
+                     <<idx
+                     <<": analytical="
+                     <<analytical_grad[idx]
+                     <<", numerical="
+                     <<numerical_grad
+                     <<", diff="
+                     <<diff
+                     <<"\n";
         passed=false;
       }
     }
 
-    ReportResult("LinearHead::BackwardWeightGrad",passed);
+    CAIF_TestHarness::Report("LinearHead::BackwardWeightGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::BackwardWeightGrad")
 }
@@ -441,45 +538,54 @@ static void TestBackwardWeightGrad()
 //------------------------------------------------------------------------------
 // Test 7: Weight-tied backward gradient
 //------------------------------------------------------------------------------
-static void TestWeightTiedBackwardGrad()
+void CAIF_LinearHeadTests::TestWeightTiedBackwardGrad()
 {
   try
   {
-    constexpr uint32_t input_dim=4;
-    constexpr uint32_t output_dim=6;
-    constexpr uint32_t batch=2;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
     // Create "embedding table"
-    std::vector<float> emb_data(output_dim*input_dim);
+    const size_t n_emb=g_caif_linhead_test_tied_output*g_caif_linhead_test_tied_input;
+    std::vector<float> emb_data(n_emb);
     for(size_t i=0;i<emb_data.size();++i)
     {
-      emb_data[i]=static_cast<float>(i)*0.05f;
+      emb_data[i]=static_cast<float>(i)*g_caif_linhead_test_tied_scale;
     }
     CAIF_DeviceTensor embedding=CAIF_DeviceTensor::FromHostData(
-                                 emb_data.data(),{output_dim,input_dim},stream);
-    CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros({output_dim,input_dim},stream);
+      emb_data.data(),
+      {g_caif_linhead_test_tied_output,g_caif_linhead_test_tied_input},
+      stream);
+    CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros(
+      {g_caif_linhead_test_tied_output,g_caif_linhead_test_tied_input},
+      stream);
 
     // Create tied linear head
-    CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,false};
+    const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_tied_input,
+                                             g_caif_linhead_test_tied_output,
+                                             false};
     CAIF_DeviceLinearHead<float,float> head(config,embedding,embedding_grad,stream);
 
     // Create input
-    std::vector<float> input_data(batch*input_dim);
+    const size_t n_input=g_caif_linhead_test_batch_seq*g_caif_linhead_test_tied_input;
+    std::vector<float> input_data(n_input);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i)*0.1f+0.1f;
+      input_data[i]=static_cast<float>(i)*g_caif_linhead_test_input_scale+g_caif_linhead_test_tied_offset;
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             input_data.data(),{batch,input_dim},stream);
+      input_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_tied_input},
+      stream);
 
     // Create grad_output
-    std::vector<float> grad_out_data(batch*output_dim,1.0f);
+    const size_t n_out=g_caif_linhead_test_batch_seq*g_caif_linhead_test_tied_output;
+    std::vector<float> grad_out_data(n_out,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_out_data.data(),{batch,output_dim},stream);
+      grad_out_data.data(),
+      {g_caif_linhead_test_batch_seq,g_caif_linhead_test_tied_output},
+      stream);
 
     // Forward and backward
     embedding_grad.Fill(0.0f);
@@ -490,22 +596,24 @@ static void TestWeightTiedBackwardGrad()
     head.Backward(grad_output,ctx);
 
     // Check that embedding_grad is non-zero
-    std::vector<float> emb_grad_data(output_dim*input_dim);
+    std::vector<float> emb_grad_data(n_emb);
     embedding_grad.CopyToHost(emb_grad_data.data());
 
     float sum=0.0f;
-    for(auto v:emb_grad_data)
+    for(size_t k=0;k<emb_grad_data.size();++k)
     {
-      sum+=std::fabs(v);
+      sum+=std::fabs(emb_grad_data[k]);
     }
 
-    bool passed=(sum>0.01f);
+    bool passed=(sum>g_caif_linhead_test_sum_min);
     if(passed==false)
     {
-      std::cout<<"  Tied weight gradient sum is too small: "<<sum<<"\n";
+      ISE_Out::Out()<<"  Tied weight gradient sum is too small: "
+                   <<sum
+                   <<"\n";
     }
 
-    ReportResult("LinearHead::WeightTiedBackwardGrad",passed);
+    CAIF_TestHarness::Report("LinearHead::WeightTiedBackwardGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::WeightTiedBackwardGrad")
 }
@@ -513,85 +621,105 @@ static void TestWeightTiedBackwardGrad()
 //------------------------------------------------------------------------------
 // Test 8: Parameter count
 //------------------------------------------------------------------------------
-static void TestParameterCount()
+void CAIF_LinearHeadTests::TestParameterCount()
 {
   try
   {
-    constexpr uint32_t input_dim=8;
-    constexpr uint32_t output_dim=16;
-
     CAIF_CudaStream stream;
 
     // Untied with bias: 2 params (W + b)
     {
-      CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+      const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_param_input,
+                                               g_caif_linhead_test_param_output,
+                                               true};
       CAIF_DeviceLinearHead<float,float> head(config,stream);
       if(head.ParameterTensorCount()!=2)
       {
-        std::cout<<"  Untied+bias: expected 2, got "<<head.ParameterTensorCount()<<"\n";
-        ReportResult("LinearHead::ParameterCount",false);
+        ISE_Out::Out()<<"  Untied+bias: expected 2, got "
+                     <<head.ParameterTensorCount()
+                     <<"\n";
+        CAIF_TestHarness::Report("LinearHead::ParameterCount",false);
         return;
       }
     }
 
     // Untied no bias: 1 param (W)
     {
-      CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,false};
+      const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_param_input,
+                                               g_caif_linhead_test_param_output,
+                                               false};
       CAIF_DeviceLinearHead<float,float> head(config,stream);
       if(head.ParameterTensorCount()!=1)
       {
-        std::cout<<"  Untied no bias: expected 1, got "<<head.ParameterTensorCount()<<"\n";
-        ReportResult("LinearHead::ParameterCount",false);
+        ISE_Out::Out()<<"  Untied no bias: expected 1, got "
+                     <<head.ParameterTensorCount()
+                     <<"\n";
+        CAIF_TestHarness::Report("LinearHead::ParameterCount",false);
         return;
       }
     }
 
     // Tied with bias: 1 param (b only)
     {
-      std::vector<float> emb_data(output_dim*input_dim,0.1f);
+      const size_t n_emb=g_caif_linhead_test_param_output*g_caif_linhead_test_param_input;
+      std::vector<float> emb_data(n_emb,g_caif_linhead_test_tied_fill);
       CAIF_DeviceTensor embedding=CAIF_DeviceTensor::FromHostData(
-                                   emb_data.data(),{output_dim,input_dim},stream);
-      CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros({output_dim,input_dim},stream);
+        emb_data.data(),
+        {g_caif_linhead_test_param_output,g_caif_linhead_test_param_input},
+        stream);
+      CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros(
+        {g_caif_linhead_test_param_output,g_caif_linhead_test_param_input},
+        stream);
 
-      CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,true};
+      const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_param_input,
+                                               g_caif_linhead_test_param_output,
+                                               true};
       CAIF_DeviceLinearHead<float,float> head(config,embedding,embedding_grad,stream);
       if(head.ParameterTensorCount()!=1)
       {
-        std::cout<<"  Tied+bias: expected 1, got "<<head.ParameterTensorCount()<<"\n";
-        ReportResult("LinearHead::ParameterCount",false);
+        ISE_Out::Out()<<"  Tied+bias: expected 1, got "
+                     <<head.ParameterTensorCount()
+                     <<"\n";
+        CAIF_TestHarness::Report("LinearHead::ParameterCount",false);
         return;
       }
     }
 
     // Tied no bias: 0 params
     {
-      std::vector<float> emb_data(output_dim*input_dim,0.1f);
+      const size_t n_emb=g_caif_linhead_test_param_output*g_caif_linhead_test_param_input;
+      std::vector<float> emb_data(n_emb,g_caif_linhead_test_tied_fill);
       CAIF_DeviceTensor embedding=CAIF_DeviceTensor::FromHostData(
-                                   emb_data.data(),{output_dim,input_dim},stream);
-      CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros({output_dim,input_dim},stream);
+        emb_data.data(),
+        {g_caif_linhead_test_param_output,g_caif_linhead_test_param_input},
+        stream);
+      CAIF_DeviceTensor embedding_grad=CAIF_DeviceTensor::Zeros(
+        {g_caif_linhead_test_param_output,g_caif_linhead_test_param_input},
+        stream);
 
-      CAIF_DeviceLinearHead<float,float>::Config_t config{input_dim,output_dim,false};
+      const CAIF_DeviceLinearHeadConfig config{g_caif_linhead_test_param_input,
+                                               g_caif_linhead_test_param_output,
+                                               false};
       CAIF_DeviceLinearHead<float,float> head(config,embedding,embedding_grad,stream);
       if(head.ParameterTensorCount()!=0)
       {
-        std::cout<<"  Tied no bias: expected 0, got "<<head.ParameterTensorCount()<<"\n";
-        ReportResult("LinearHead::ParameterCount",false);
+        ISE_Out::Out()<<"  Tied no bias: expected 0, got "
+                     <<head.ParameterTensorCount()
+                     <<"\n";
+        CAIF_TestHarness::Report("LinearHead::ParameterCount",false);
         return;
       }
     }
 
-    ReportResult("LinearHead::ParameterCount",true);
+    CAIF_TestHarness::Report("LinearHead::ParameterCount",true);
   }
   CAIF_TEST_CATCH_BLOCK("LinearHead::ParameterCount")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_LinearHeadTests::RunAll()
 {
-  std::cout<<"=== CAIF DeviceLinearHead Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF DeviceLinearHead Tests ==="
+               <<"\n\n";
   TestForwardShape();
   TestForwardShapeNoBias();
   TestForwardValues();
@@ -600,13 +728,20 @@ int main()
   TestBackwardWeightGrad();
   TestWeightTiedBackwardGrad();
   TestParameterCount();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_LinearHeadTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 #else
-  std::cout<<"CUDA not enabled, skipping GPU tests\n";
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+               <<"\n";
+  return 0;
 #endif
-
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
-  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
-
-  return (CAIF_TestHarness::FailedCount()==0)?0:1;
 }

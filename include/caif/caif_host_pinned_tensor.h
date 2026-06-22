@@ -91,9 +91,24 @@ class CAIF_HostPinnedTensor:public CAIF_Base
     // then cudaMemcpy device->host) — fine for the optimizer-step boundary.
     void CopyFromDevice(const CAIF_DeviceTensor &src);
 
+    // Async writeback: DMA `_bytes` from `src` (device) into this pinned host
+    // buffer via cudaMemcpyAsync on `stream`, with NO stream sync. Correct for
+    // the offloaded-optimizer step loop — the next step's PrefetchToDevice H2D
+    // is ordered after this copy on the same stream, so the per-parameter
+    // stalls of the synchronizing CopyFromDevice are removed. A host-side read
+    // of HostPtr() (e.g. a checkpoint save) must sync `stream` first.
+    void CopyFromDeviceAsync(const CAIF_DeviceTensor &src,CAIF_CudaStream &stream);
+
   protected:
 
   private:
+    // Internal setters — method bodies route through these per
+    // CODING_GUIDELINES.md §Member Access.
+    void SetShape(std::vector<uint32_t> &&v){_shape=std::move(v);}
+    void SetDtype(const CAIF_DataType::CAIF_DataType_e v){_dtype=v;}
+    void SetHostPtr(void *p){_host_ptr=p;}
+    void SetBytes(const size_t v){_bytes=v;}
+
     std::vector<uint32_t> _shape;
     CAIF_DataType::CAIF_DataType_e _dtype;
     void *_host_ptr;

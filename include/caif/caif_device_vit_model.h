@@ -20,6 +20,7 @@
 #pragma once
 
 #include "caif_device_container.h"
+#include "caif_device_vit_model_config.h"
 #include "caif_device_layer_typed.h"
 #include "caif_run_context.h"
 #include "caif_device_patch_embedding.h"
@@ -74,31 +75,8 @@ class CAIF_DeviceViTModel:public CAIF_DeviceContainer
   public:
     typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
 
-    struct Config_t
-    {
-      // Image config
-      uint32_t image_height;
-      uint32_t image_width;
-      uint32_t channels;
-      uint32_t patch_size;
 
-      // Transformer config
-      uint32_t dim;
-      uint32_t num_layers;
-      uint32_t num_heads;
-      uint32_t ffn_hidden_dim;
-      float dropout_rate;
-
-      // Classification config
-      uint32_t num_classes;
-
-      // Optional
-      bool use_rope;
-      float rope_base;
-      int rope_style=0;
-    };
-
-    CAIF_DeviceViTModel(const Config_t &config,CAIF_CudaStream &stream);
+    CAIF_DeviceViTModel(const CAIF_DeviceViTModelConfig &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceViTModel()override=default;
 
     // Move
@@ -118,7 +96,13 @@ class CAIF_DeviceViTModel:public CAIF_DeviceContainer
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
     // Accessors
-    const Config_t &GetConfig()const{return _config;}
+    const CAIF_DeviceViTModelConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceViTModelConfig &c){_config=c;}
+    const CAIF_DeviceTensor &CachedClsOutput()const{return _cached_cls_output;}
+    CAIF_DeviceTensor &CachedClsOutputMutable(){return _cached_cls_output;}
+    void SetCachedClsOutput(CAIF_DeviceTensor t){_cached_cls_output=std::move(t);}
+    uint32_t CachedBatch()const{return _cached_batch;}
+    void SetCachedBatch(const uint32_t b){_cached_batch=b;}
     uint32_t NumPatches()const;
     uint32_t SequenceLength()const;  // num_patches + 1 (CLS)
 
@@ -144,7 +128,7 @@ class CAIF_DeviceViTModel:public CAIF_DeviceContainer
   protected:
 
   private:
-    Config_t _config;
+    CAIF_DeviceViTModelConfig _config;
 
     // Cached for backward — the CLS-only output fed into the classification
     // head during forward. Cached only while training so that backward can
@@ -156,8 +140,8 @@ class CAIF_DeviceViTModel:public CAIF_DeviceContainer
     size_t PatchEmbeddingSlot()const{return 0;}
     size_t PositionalEncodingSlot()const{return 1;}
     size_t FirstBlockSlot()const{return 2;}
-    size_t FinalNormSlot()const{return 2+_config.num_layers;}
-    size_t ClassificationHeadSlot()const{return 3+_config.num_layers;}
+    size_t FinalNormSlot()const{return 2+Config().NumLayers();}
+    size_t ClassificationHeadSlot()const{return 3+Config().NumLayers();}
 };
 
 #ifdef USE_CAIF_CUDA

@@ -12,30 +12,90 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Directory-walk test runner: discovers every built test_* executable in the
+// current directory that has a matching source file, runs each under a
+// timeout, and prints a pass/fail/timeout summary.
+//------------------------------------------------------------------------------
+#include "ise_lib/ise_out.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
-#include <iostream>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
 
-constexpr int g_default_test_timeout_seconds=30;
-
-struct TestResult
+namespace instance
 {
-  std::string test_name;
-  bool passed;
-  bool timed_out;
-  int exit_code;
-  double execution_time;
+
+constexpr int g_caif_runner_default_timeout_seconds=30;
+constexpr int g_caif_runner_timeout_exit_code=124;
+constexpr int g_caif_runner_exit_status_shift=8;
+constexpr int g_caif_runner_exit_status_mask=0xFF;
+constexpr double g_caif_runner_ms_per_second=1000.0;
+constexpr double g_caif_runner_percent_scale=100.0;
+
+//------------------------------------------------------------------------------
+// One test executable's outcome.
+//------------------------------------------------------------------------------
+class CAIF_TestResult
+{
+  public:
+    typedef std::vector<CAIF_TestResult> CAIF_TestResultVec_t;
+
+    const std::string &TestName()const{return _test_name;}
+    void SetTestName(const std::string &test_name){_test_name=test_name;}
+    bool Passed()const{return _passed;}
+    void SetPassed(const bool passed){_passed=passed;}
+    bool TimedOut()const{return _timed_out;}
+    void SetTimedOut(const bool timed_out){_timed_out=timed_out;}
+    int ExitCode()const{return _exit_code;}
+    void SetExitCode(const int exit_code){_exit_code=exit_code;}
+    double ExecutionTime()const{return _execution_time;}
+    void SetExecutionTime(const double execution_time){_execution_time=execution_time;}
+
+  protected:
+
+  private:
+    std::string _test_name;
+    bool _passed=false;
+    bool _timed_out=false;
+    int _exit_code=0;
+    double _execution_time=0.0;
 };
 
-static int g_timeout_seconds=g_default_test_timeout_seconds;
+//------------------------------------------------------------------------------
+// Discovers and runs the test executables.
+//------------------------------------------------------------------------------
+class CAIF_TestRunner
+{
+  public:
+    static int Run(const int argc,char *argv[]);
 
-static bool IsExecutable(const std::string &path)
+  protected:
+
+  private:
+    static int TimeoutSeconds(){return _timeout_seconds;}
+    static void SetTimeoutSeconds(const int timeout_seconds){_timeout_seconds=timeout_seconds;}
+
+    static bool IsExecutable(const std::string &path);
+    static bool HasBinaryExtension(const std::string &name);
+    static bool IsTestBinaryCandidate(const std::string &name);
+    static std::vector<std::string> DiscoverTestBinaries();
+    static CAIF_TestResult RunOne(const std::string &executable_path);
+    static void ConfigureFromArgs(const int argc,char *argv[]);
+    static void PrintTestSummary(const CAIF_TestResult::CAIF_TestResultVec_t &results);
+
+    static int _timeout_seconds;
+};
+
+int CAIF_TestRunner::_timeout_seconds=g_caif_runner_default_timeout_seconds;
+
+bool CAIF_TestRunner::IsExecutable(const std::string &path)
 {
   struct stat st;
   if(stat(path.c_str(),&st)!=0)
@@ -54,13 +114,12 @@ static bool IsExecutable(const std::string &path)
   return (st.st_mode&(S_IXUSR|S_IXGRP|S_IXOTH))!=0;
 }
 
-static bool HasBinaryExtension(const std::string &name)
+bool CAIF_TestRunner::HasBinaryExtension(const std::string &name)
 {
-  const char *const skip_suffixes[]={".o",".d",".bin",".json",".cpp",".h",".py"};
-  const size_t count=sizeof(skip_suffixes)/sizeof(skip_suffixes[0]);
-  for(size_t i=0;i<count;++i)
+  const std::vector<std::string> skip_suffixes={".o",".d",".bin",".json",".cpp",".h",".py"};
+  for(size_t i=0;i<skip_suffixes.size();++i)
   {
-    const std::string suffix(skip_suffixes[i]);
+    const std::string &suffix=skip_suffixes[i];
     if(name.size()>=suffix.size() &&
        name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
     {
@@ -70,14 +129,7 @@ static bool HasBinaryExtension(const std::string &name)
   return false;
 }
 
-static bool HasSourceFile(const std::string &binary_name)
-{
-  const std::string src=binary_name+".cpp";
-  struct stat st;
-  return stat(src.c_str(),&st)==0;
-}
-
-static bool IsTestBinaryCandidate(const std::string &name)
+bool CAIF_TestRunner::IsTestBinaryCandidate(const std::string &name)
 {
   const bool starts_with_test=(name.rfind("test_",0)==0);
   const bool is_model_dir=(name=="test_network_models" ||
@@ -87,7 +139,7 @@ static bool IsTestBinaryCandidate(const std::string &name)
          HasBinaryExtension(name)==false;
 }
 
-static std::vector<std::string> DiscoverTestBinaries()
+std::vector<std::string> CAIF_TestRunner::DiscoverTestBinaries()
 {
   std::vector<std::string> out;
   DIR *dir=opendir(".");
@@ -101,8 +153,7 @@ static std::vector<std::string> DiscoverTestBinaries()
     const std::string name(entry->d_name);
     const std::string path="./"+name;
     if(IsTestBinaryCandidate(name)==true &&
-       IsExecutable(path)==true &&
-       HasSourceFile(name)==true)
+       IsExecutable(path)==true)
     {
       out.push_back(path);
     }
@@ -112,58 +163,57 @@ static std::vector<std::string> DiscoverTestBinaries()
   return out;
 }
 
-static TestResult RunTest(const std::string &executable_path)
+CAIF_TestResult CAIF_TestRunner::RunOne(const std::string &executable_path)
 {
-  TestResult result;
-  result.test_name=executable_path;
-  result.timed_out=false;
+  CAIF_TestResult result;
+  result.SetTestName(executable_path);
+  result.SetTimedOut(false);
 
-  std::cout<<"=== Running "
-           <<executable_path
-           <<" ===\n";
+  ISE_Out::Out()<<"=== Running "
+                <<executable_path
+                <<" ===\n";
 
   const auto start_time=std::chrono::high_resolution_clock::now();
-  const std::string cmd="timeout "+std::to_string(g_timeout_seconds)+" "+
-                        executable_path;
+  const std::string cmd="timeout "+std::to_string(TimeoutSeconds())+" "+executable_path;
   const int raw_status=std::system(cmd.c_str());
-  const int actual_exit_code=(raw_status>>8)&0xFF;
+  const int actual_exit_code=(raw_status>>g_caif_runner_exit_status_shift)&
+                             g_caif_runner_exit_status_mask;
   const auto end_time=std::chrono::high_resolution_clock::now();
   const auto duration=std::chrono::duration_cast<std::chrono::milliseconds>(
                         end_time-start_time);
 
-  result.exit_code=actual_exit_code;
-  result.execution_time=duration.count()/1000.0;
+  result.SetExitCode(actual_exit_code);
+  result.SetExecutionTime(duration.count()/g_caif_runner_ms_per_second);
 
-  if(actual_exit_code==124)
+  if(actual_exit_code==g_caif_runner_timeout_exit_code)
   {
-    result.timed_out=true;
-    result.passed=false;
-    std::cout<<"Result: TIMEOUT (exceeded "
-             <<g_timeout_seconds
-             <<"s)\n\n";
+    result.SetTimedOut(true);
+    result.SetPassed(false);
+    ISE_Out::Out()<<"Result: TIMEOUT (exceeded "
+                  <<TimeoutSeconds()
+                  <<"s)\n\n";
+    return result;
+  }
+
+  result.SetPassed(actual_exit_code==0);
+  if(result.Passed()==true)
+  {
+    ISE_Out::Out()<<"Result: PASSED ("
+                  <<result.ExecutionTime()
+                  <<"s)\n\n";
   }
   else
   {
-    result.passed=(actual_exit_code==0);
-    if(result.passed==true)
-    {
-      std::cout<<"Result: PASSED ("
-               <<result.execution_time
-               <<"s)\n\n";
-    }
-    else
-    {
-      std::cout<<"Result: FAILED (exit="
-               <<actual_exit_code
-               <<", "
-               <<result.execution_time
-               <<"s)\n\n";
-    }
+    ISE_Out::Out()<<"Result: FAILED (exit="
+                  <<actual_exit_code
+                  <<", "
+                  <<result.ExecutionTime()
+                  <<"s)\n\n";
   }
   return result;
 }
 
-static void ConfigureFromArgs(int argc,char *argv[])
+void CAIF_TestRunner::ConfigureFromArgs(const int argc,char *argv[])
 {
   for(int i=1;i<argc;++i)
   {
@@ -172,19 +222,19 @@ static void ConfigureFromArgs(int argc,char *argv[])
     if(arg.rfind(timeout_prefix,0)==0)
     {
       const std::string value=arg.substr(timeout_prefix.size());
-      g_timeout_seconds=std::stoi(value);
-      std::cout<<"Timeout set to "
-               <<g_timeout_seconds
-               <<" seconds\n";
+      SetTimeoutSeconds(std::stoi(value));
+      ISE_Out::Out()<<"Timeout set to "
+                    <<TimeoutSeconds()
+                    <<" seconds\n";
     }
   }
 }
 
-static void PrintTestSummary(const std::vector<TestResult> &results)
+void CAIF_TestRunner::PrintTestSummary(const CAIF_TestResult::CAIF_TestResultVec_t &results)
 {
-  std::cout<<"========================================\n"
-           <<"          TEST SUMMARY                  \n"
-           <<"========================================\n\n";
+  ISE_Out::Out()<<"========================================\n"
+                <<"          TEST SUMMARY                  \n"
+                <<"========================================\n\n";
 
   int passed_count=0;
   int failed_count=0;
@@ -193,99 +243,106 @@ static void PrintTestSummary(const std::vector<TestResult> &results)
 
   for(size_t i=0;i<results.size();++i)
   {
-    const TestResult &result=results[i];
-    std::cout<<result.test_name
-             <<": ";
-    if(result.passed==true)
+    const CAIF_TestResult &result=results[i];
+    ISE_Out::Out()<<result.TestName()
+                  <<": ";
+    if(result.Passed()==true)
     {
-      std::cout<<"PASSED";
+      ISE_Out::Out()<<"PASSED";
       ++passed_count;
     }
-    else if(result.timed_out==true)
+    else if(result.TimedOut()==true)
     {
-      std::cout<<"TIMEOUT";
+      ISE_Out::Out()<<"TIMEOUT";
       ++timeout_count;
       ++failed_count;
     }
     else
     {
-      std::cout<<"FAILED (exit="
-               <<result.exit_code
-               <<")";
+      ISE_Out::Out()<<"FAILED (exit="
+                    <<result.ExitCode()
+                    <<")";
       ++failed_count;
     }
-    std::cout<<" ("
-             <<result.execution_time
-             <<"s)\n";
-    total_time+=result.execution_time;
+    ISE_Out::Out()<<" ("
+                  <<result.ExecutionTime()
+                  <<"s)\n";
+    total_time+=result.ExecutionTime();
   }
 
-  std::cout<<"\n========================================\n"
-           <<"Total Tests: "
-           <<results.size()
-           <<"\n"
-           <<"Passed: "
-           <<passed_count
-           <<"\n"
-           <<"Failed: "
-           <<failed_count;
+  ISE_Out::Out()<<"\n========================================\n"
+                <<"Total Tests: "
+                <<results.size()
+                <<"\n"
+                <<"Passed: "
+                <<passed_count
+                <<"\n"
+                <<"Failed: "
+                <<failed_count;
   if(timeout_count>0)
   {
-    std::cout<<" ("
-             <<timeout_count
-             <<" timed out)";
+    ISE_Out::Out()<<" ("
+                  <<timeout_count
+                  <<" timed out)";
   }
-  std::cout<<"\n";
+  ISE_Out::Out()<<"\n";
   if(results.empty()==false)
   {
-    std::cout<<"Success Rate: "
-             <<(static_cast<double>(passed_count)/
-                static_cast<double>(results.size())*100.0)
-             <<"%\n";
+    ISE_Out::Out()<<"Success Rate: "
+                  <<(static_cast<double>(passed_count)/
+                     static_cast<double>(results.size())*g_caif_runner_percent_scale)
+                  <<"%\n";
   }
-  std::cout<<"Total Execution Time: "
-           <<total_time
-           <<"s\n"
-           <<"Timeout per test: "
-           <<g_timeout_seconds
-           <<"s\n"
-           <<"========================================\n";
+  ISE_Out::Out()<<"Total Execution Time: "
+                <<total_time
+                <<"s\n"
+                <<"Timeout per test: "
+                <<TimeoutSeconds()
+                <<"s\n"
+                <<"========================================\n";
 }
 
-int main(int argc,char *argv[])
+int CAIF_TestRunner::Run(const int argc,char *argv[])
 {
-  std::cout<<"===========================================\n"
-           <<"  CAIF Test Suite (directory-walk runner)  \n"
-           <<"===========================================\n\n"
-           <<"Usage: ./run_all_tests [--timeout=SECONDS]\n\n";
+  ISE_Out::Out()<<"===========================================\n"
+                <<"  CAIF Test Suite (directory-walk runner)  \n"
+                <<"===========================================\n\n"
+                <<"Usage: ./run_all_tests [--timeout=SECONDS]\n\n";
 
   ConfigureFromArgs(argc,argv);
 
   std::vector<std::string> paths=DiscoverTestBinaries();
   if(paths.empty()==true)
   {
-    std::cout<<"No test_* executables found in current directory.\n";
+    ISE_Out::Out()<<"No test_* executables found in current directory.\n";
     return 1;
   }
 
-  std::cout<<"Discovered "
-           <<paths.size()
-           <<" test executable(s).\n\n";
+  ISE_Out::Out()<<"Discovered "
+                <<paths.size()
+                <<" test executable(s).\n\n";
 
-  std::vector<TestResult> results;
+  CAIF_TestResult::CAIF_TestResultVec_t results;
   for(size_t i=0;i<paths.size();++i)
   {
-    results.push_back(RunTest(paths[i]));
+    results.push_back(RunOne(paths[i]));
   }
 
   PrintTestSummary(results);
 
   for(size_t i=0;i<results.size();++i)
   {
-    if(results[i].passed==false)
+    if(results[i].Passed()==false)
     {
       return 1;
     }
   }
   return 0;
+}
+
+}//end instance namespace
+
+int main(int argc,char *argv[])
+{
+  return instance::CAIF_TestRunner::Run(argc,argv);
 }

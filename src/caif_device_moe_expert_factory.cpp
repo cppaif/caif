@@ -27,8 +27,7 @@ std::unique_ptr<CAIF_DeviceLayer> MakeExpert(uint32_t input_dim,
                                               bool use_bias,
                                               CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceMoEExpert<ComputeT,StorageT>::Config_t cfg{
-      input_dim,hidden_dim,use_gated,use_bias};
+  CAIF_DeviceMoEExpertConfig cfg{input_dim,hidden_dim,use_gated,use_bias};
   return std::make_unique<CAIF_DeviceMoEExpert<ComputeT,StorageT>>(cfg,stream);
 }
 

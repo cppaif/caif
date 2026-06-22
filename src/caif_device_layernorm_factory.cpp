@@ -29,22 +29,50 @@ CAIF_DeviceLayerNormFactory::Create(uint32_t dim,
   try
   {
     typedef CAIF_DataType::CAIF_DataType_e Dtype_e;
-    (void)compute_dtype;
-    if(storage_dtype==Dtype_e::Float32)
+    // LayerNorm — see the matching comment in
+    // caif_device_rmsnorm_factory.cpp: ComputeT has no semantic effect
+    // on the kernel but the factory dispatches on both so the built
+    // layer's RuntimeStorageDtype() / RuntimeComputeDtype() introspect
+    // the same (compute, storage) pair the caller asked for.
+    if(storage_dtype==Dtype_e::Float32 && compute_dtype==Dtype_e::Float32)
     {
       return std::make_unique<CAIF_DeviceLayerNorm<float,float>>(dim,stream,epsilon);
     }
 #ifdef USE_CAIF_CUDA
-    if(storage_dtype==Dtype_e::Float16)
+    if(storage_dtype==Dtype_e::Float16 && compute_dtype==Dtype_e::Float32)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<float,__half>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::BFloat16 && compute_dtype==Dtype_e::Float32)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<float,__nv_bfloat16>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::Float32 && compute_dtype==Dtype_e::Float16)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<__half,float>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::Float16 && compute_dtype==Dtype_e::Float16)
     {
       return std::make_unique<CAIF_DeviceLayerNorm<__half,__half>>(dim,stream,epsilon);
     }
-    if(storage_dtype==Dtype_e::BFloat16)
+    if(storage_dtype==Dtype_e::BFloat16 && compute_dtype==Dtype_e::Float16)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<__half,__nv_bfloat16>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::Float32 && compute_dtype==Dtype_e::BFloat16)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<__nv_bfloat16,float>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::Float16 && compute_dtype==Dtype_e::BFloat16)
+    {
+      return std::make_unique<CAIF_DeviceLayerNorm<__nv_bfloat16,__half>>(dim,stream,epsilon);
+    }
+    if(storage_dtype==Dtype_e::BFloat16 && compute_dtype==Dtype_e::BFloat16)
     {
       return std::make_unique<CAIF_DeviceLayerNorm<__nv_bfloat16,__nv_bfloat16>>(dim,stream,epsilon);
     }
 #endif
-    THROW_CAIFE("CAIF_DeviceLayerNormFactory::Create: unsupported storage_dtype");
+    THROW_CAIFE("CAIF_DeviceLayerNormFactory::Create: unsupported (compute, storage) dtype pair");
   }
   CAIF_CATCH_BLOCK()
   return nullptr;

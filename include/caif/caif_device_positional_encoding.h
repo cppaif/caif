@@ -26,6 +26,8 @@
 #include "caif_device_layer_typed.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
+#include "caif_positional_encoding_mode.h"
+#include "caif_device_positional_encoding_config.h"
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -34,26 +36,15 @@
 namespace instance
 {
 
-enum class PositionalEncodingMode_e:uint8_t
-{
-  Learned,
-  Sinusoidal,
-  None
-};
+// enum moved to include/caif/caif_positional_encoding_mode.h
+// (class-scoped: CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e).
+// Moved 2026-05-13.
 
 template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t max_seq_len;
-      uint32_t dim;
-      PositionalEncodingMode_e mode;
-    };
-
-    CAIF_DevicePositionalEncoding(const Config_t &config,
-                                  CAIF_CudaStream &stream);
+    CAIF_DevicePositionalEncoding(const CAIF_DevicePositionalEncodingConfig &config,CAIF_CudaStream &stream);
     ~CAIF_DevicePositionalEncoding()override=default;
 
     // Move
@@ -77,9 +68,9 @@ class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayerTyped<ComputeT,Storag
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    uint32_t MaxSeqLen()const{return _config.max_seq_len;}
-    uint32_t Dim()const{return _config.dim;}
-    PositionalEncodingMode_e Mode()const{return _config.mode;}
+    uint32_t MaxSeqLen()const{return Config().MaxSeqLen();}
+    uint32_t Dim()const{return Config().Dim();}
+    CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e Mode()const{return Config().Mode();}
 
     /**
      * @brief Replace the learned positional-embedding table with a tensor of
@@ -99,12 +90,27 @@ class CAIF_DevicePositionalEncoding:public CAIF_DeviceLayerTyped<ComputeT,Storag
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    const CAIF_DevicePositionalEncodingConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DevicePositionalEncodingConfig &c){_config=c;}
+
+    const CAIF_DeviceTensor &PETable()const{return _pe_table;}
     CAIF_DeviceTensor &PETableMut(){return _pe_table;}
-    CAIF_DeviceTensor &SinusoidalTableMut(){return _sinusoidal_table;}
     void SetPETable(CAIF_DeviceTensor &&t){_pe_table=std::move(t);}
+
+    const CAIF_DeviceTensor &PETableGrad()const{return _pe_table_grad;}
+    CAIF_DeviceTensor &PETableGrad(){return _pe_table_grad;}
+    void SetPETableGrad(CAIF_DeviceTensor &&t){_pe_table_grad=std::move(t);}
+
+    const CAIF_DeviceTensor &SinusoidalTable()const{return _sinusoidal_table;}
+    CAIF_DeviceTensor &SinusoidalTableMut(){return _sinusoidal_table;}
     void SetSinusoidalTable(CAIF_DeviceTensor &&t){_sinusoidal_table=std::move(t);}
 
-    Config_t _config;
+    uint32_t CachedBatch()const{return _cached_batch;}
+    void SetCachedBatch(const uint32_t v){_cached_batch=v;}
+    uint32_t CachedSeqLen()const{return _cached_seq_len;}
+    void SetCachedSeqLen(const uint32_t v){_cached_seq_len=v;}
+
+    CAIF_DevicePositionalEncodingConfig _config;
 
     CAIF_DeviceTensor _pe_table;          // [max_seq_len, dim] at StorageT
     CAIF_DeviceTensor _pe_table_grad;     // [max_seq_len, dim] at StorageT

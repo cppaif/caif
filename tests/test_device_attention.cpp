@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Tests for CAIF_DeviceMultiHeadAttention<float,float>.
+//------------------------------------------------------------------------------
 #include "caif_device_multi_head_attention.h"
 #include "caif_test_harness.h"
 #include "caif_device_network.h"
@@ -21,57 +25,92 @@
 #include "caif_cuda_stream.h"
 #include "caif_cpu_reference/caif_cpu_softmax.h"
 #include "caif_cpu_reference/caif_cpu_matmul.h"
-#include <iostream>
+#include "caif_grad_mode.h"
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-struct GradMode_t
+namespace instance
 {
-  bool precise;
-  float tol;
-  const char *label;
-};
-
-static const GradMode_t kGradModePrecise={true, 8e-2f, "Precise"};
-static const GradMode_t kGradModeTF32=   {false,1.5e-1f,"TF32"};
-
-static void ReportResult(const char *test_name,bool passed)
-{
-  CAIF_TestHarness::Report(test_name,passed);
-}
-
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
-{
-  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
-}
 
 #ifdef USE_CAIF_CUDA
 
-//------------------------------------------------------------------------------
-// CPU reference MHA for verification (composite; uses shared primitives)
-//------------------------------------------------------------------------------
+constexpr uint32_t g_caif_attn_test_batch_fwd=2;
+constexpr uint32_t g_caif_attn_test_seq_fwd=4;
+constexpr uint32_t g_caif_attn_test_dim_fwd=8;
+constexpr uint32_t g_caif_attn_test_heads_fwd=2;
+constexpr uint32_t g_caif_attn_test_batch_nc=1;
+constexpr uint32_t g_caif_attn_test_seq_nc=3;
+constexpr uint32_t g_caif_attn_test_dim_nc=8;
+constexpr uint32_t g_caif_attn_test_heads_nc=2;
+constexpr uint32_t g_caif_attn_test_batch_bwd=1;
+constexpr uint32_t g_caif_attn_test_seq_bwd=2;
+constexpr uint32_t g_caif_attn_test_dim_bwd=4;
+constexpr uint32_t g_caif_attn_test_heads_bwd=2;
+constexpr uint32_t g_caif_attn_test_dim_param=8;
+constexpr uint32_t g_caif_attn_test_heads_param=2;
+constexpr size_t g_caif_attn_test_wgrad_spot=4;
+constexpr float g_caif_attn_test_nc_tol=1e-3f;
+constexpr float g_caif_attn_test_fd_h=1e-3f;
 
-/**
- * CPU reference for full MHA forward.
- * input: [batch, seq_len, dim]
- * weights: w_q, w_k, w_v [dim, num_heads*head_dim], w_o [num_heads*head_dim, dim]
- * output: [batch, seq_len, dim]
- */
-static void CpuMHA(const float *input,
-                    const float *w_q,
-                    const float *w_k,
-                    const float *w_v,
-                    const float *w_o,
-                    float *output,
-                    int batch,
-                    int seq_len,
-                    int dim,
-                    int num_heads,
-                    int head_dim,
-                    bool causal)
+//------------------------------------------------------------------------------
+// Multi-head attention forward and backward correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_AttentionTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    typedef CAIF_DeviceMultiHeadAttentionConfig AttentionConfig_t;
+
+    //--------------------------------------------------------------------------
+    // CPU reference MHA for verification (composite; uses shared primitives).
+    // input: [batch, seq_len, dim]
+    // weights: w_q, w_k, w_v [dim, num_heads*head_dim], w_o [num_heads*head_dim, dim]
+    // output: [batch, seq_len, dim]
+    //--------------------------------------------------------------------------
+    static void CpuMHA(const float *input,
+                       const float *w_q,
+                       const float *w_k,
+                       const float *w_v,
+                       const float *w_o,
+                       float *output,
+                       int batch,
+                       int seq_len,
+                       int dim,
+                       int num_heads,
+                       int head_dim,
+                       bool causal);
+
+    // Helper: create MHA config with known parameters.
+    static AttentionConfig_t MakeConfig(uint32_t dim,uint32_t num_heads,bool causal);
+
+    static void TestForwardShape();
+    static void TestForwardNonCausal();
+    static void TestForwardCausal();
+    static void TestBackwardInputGrad(const GradMode_t &mode);
+    static void TestBackwardWeightGrad(const GradMode_t &mode);
+    static void TestParameterCount();
+    static void TestZeroGradients();
+    static void TestDescription();
+};
+
+void CAIF_AttentionTests::CpuMHA(const float *input,
+                                  const float *w_q,
+                                  const float *w_k,
+                                  const float *w_v,
+                                  const float *w_o,
+                                  float *output,
+                                  const int batch,
+                                  const int seq_len,
+                                  const int dim,
+                                  const int num_heads,
+                                  const int head_dim,
+                                  const bool causal)
 {
   const int bs=batch*seq_len;
   const int qk_dim=num_heads*head_dim;
@@ -110,7 +149,7 @@ static void CpuMHA(const float *input,
       // scores = Q @ K^T -> [seq_len, seq_len]
       std::vector<float> scores(seq_len*seq_len);
       CAIF_CpuMatMul::TransposeB(q_head.data(),k_head.data(),scores.data(),
-                           seq_len,head_dim,seq_len);
+                                  seq_len,head_dim,seq_len);
 
       // Scale
       const float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
@@ -137,7 +176,7 @@ static void CpuMHA(const float *input,
       // context = attn @ V -> [seq_len, head_dim]
       std::vector<float> ctx(seq_len*head_dim);
       CAIF_CpuMatMul::Apply(scores.data(),v_head.data(),ctx.data(),
-                 seq_len,seq_len,head_dim);
+                             seq_len,seq_len,head_dim);
 
       // Write to concat: [batch*seq_len, qk_dim]
       for(int s=0;s<seq_len;++s)
@@ -154,45 +193,35 @@ static void CpuMHA(const float *input,
   CAIF_CpuMatMul::Apply(concat.data(),w_o,output,bs,qk_dim,dim);
 }
 
-//------------------------------------------------------------------------------
-// Helper: create MHA with known weights and return config
-//------------------------------------------------------------------------------
-static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeConfig(
-  uint32_t dim,uint32_t num_heads,bool causal)
+CAIF_AttentionTests::AttentionConfig_t CAIF_AttentionTests::MakeConfig(
+  const uint32_t dim,const uint32_t num_heads,const bool causal)
 {
-  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
-  config.dim=dim;
-  config.num_heads=num_heads;
-  config.num_kv_heads=num_heads;
-  config.head_dim=dim/num_heads;
-  config.causal=causal;
-  config.use_rope=false;
-  config.rope_base=g_caif_rope_default_base;
-  config.dropout_rate=0.0f;
+  AttentionConfig_t config(dim,num_heads,num_heads,dim/num_heads,causal,false,g_caif_rope_default_base,0.0f);
   return config;
 }
 
 //------------------------------------------------------------------------------
 // Test 1: Forward shape correctness
 //------------------------------------------------------------------------------
-static void TestForwardShape()
+void CAIF_AttentionTests::TestForwardShape()
 {
   try
   {
-    const uint32_t batch=2;
-    const uint32_t seq_len=4;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t batch=g_caif_attn_test_batch_fwd;
+    const uint32_t seq_len=g_caif_attn_test_seq_fwd;
+    const uint32_t dim=g_caif_attn_test_dim_fwd;
+    const uint32_t num_heads=g_caif_attn_test_heads_fwd;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -203,20 +232,20 @@ static void TestForwardShape()
     const auto &shape=host_output.Shape();
     if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=dim)
     {
-      std::cout<<"  Shape mismatch: expected [2,4,8], got [";
+      ISE_Out::Out()<<"  Shape mismatch: expected [2,4,8], got [";
       for(size_t i=0;i<shape.size();++i)
       {
         if(i>0)
         {
-          std::cout<<",";
+          ISE_Out::Out()<<",";
         }
-        std::cout<<shape[i];
+        ISE_Out::Out()<<shape[i];
       }
-      std::cout<<"]\n";
+      ISE_Out::Out()<<"]\n";
       passed=false;
     }
 
-    ReportResult("MHA::ForwardShape",passed);
+    CAIF_TestHarness::Report("MHA::ForwardShape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::ForwardShape")
 }
@@ -224,20 +253,20 @@ static void TestForwardShape()
 //------------------------------------------------------------------------------
 // Test 2: Forward non-causal vs CPU reference
 //------------------------------------------------------------------------------
-static void TestForwardNonCausal()
+void CAIF_AttentionTests::TestForwardNonCausal()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=3;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t batch=g_caif_attn_test_batch_nc;
+    const uint32_t seq_len=g_caif_attn_test_seq_nc;
+    const uint32_t dim=g_caif_attn_test_dim_nc;
+    const uint32_t num_heads=g_caif_attn_test_heads_nc;
     const uint32_t head_dim=dim/num_heads;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     // Get the weight data from the GPU for CPU reference
@@ -253,8 +282,9 @@ static void TestForwardNonCausal()
       host_input[i]=static_cast<float>(i)*0.05f-0.3f;
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     // GPU forward
     ctx.SetTraining(false);
@@ -265,24 +295,32 @@ static void TestForwardNonCausal()
     // CPU reference
     std::vector<float> expected(batch*seq_len*dim);
     CpuMHA(host_input.data(),
-            h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
-            expected.data(),
-            batch,seq_len,dim,num_heads,head_dim,false);
+           h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
+           expected.data(),
+           static_cast<int>(batch),static_cast<int>(seq_len),
+           static_cast<int>(dim),static_cast<int>(num_heads),
+           static_cast<int>(head_dim),false);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(host_output.Data()[i],expected[i],1e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(host_output.Data()[i],expected[i],g_caif_attn_test_nc_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]
-                 <<" diff="<<std::fabs(host_output.Data()[i]-expected[i])<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": got "
+                      <<host_output.Data()[i]
+                      <<" expected "
+                      <<expected[i]
+                      <<" diff="
+                      <<std::fabs(host_output.Data()[i]-expected[i])
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("MHA::ForwardNonCausal",passed);
+    CAIF_TestHarness::Report("MHA::ForwardNonCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::ForwardNonCausal")
 }
@@ -290,20 +328,20 @@ static void TestForwardNonCausal()
 //------------------------------------------------------------------------------
 // Test 3: Forward causal masking
 //------------------------------------------------------------------------------
-static void TestForwardCausal()
+void CAIF_AttentionTests::TestForwardCausal()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=3;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t batch=g_caif_attn_test_batch_nc;
+    const uint32_t seq_len=g_caif_attn_test_seq_nc;
+    const uint32_t dim=g_caif_attn_test_dim_nc;
+    const uint32_t num_heads=g_caif_attn_test_heads_nc;
     const uint32_t head_dim=dim/num_heads;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,true);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,true);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
@@ -317,8 +355,9 @@ static void TestForwardCausal()
       host_input[i]=static_cast<float>(i)*0.05f-0.3f;
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -328,24 +367,32 @@ static void TestForwardCausal()
     // CPU reference with causal=true
     std::vector<float> expected(batch*seq_len*dim);
     CpuMHA(host_input.data(),
-            h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
-            expected.data(),
-            batch,seq_len,dim,num_heads,head_dim,true);
+           h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
+           expected.data(),
+           static_cast<int>(batch),static_cast<int>(seq_len),
+           static_cast<int>(dim),static_cast<int>(num_heads),
+           static_cast<int>(head_dim),true);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(host_output.Data()[i],expected[i],1e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(host_output.Data()[i],expected[i],g_caif_attn_test_nc_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]
-                 <<" diff="<<std::fabs(host_output.Data()[i]-expected[i])<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": got "
+                      <<host_output.Data()[i]
+                      <<" expected "
+                      <<expected[i]
+                      <<" diff="
+                      <<std::fabs(host_output.Data()[i]-expected[i])
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("MHA::ForwardCausal",passed);
+    CAIF_TestHarness::Report("MHA::ForwardCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::ForwardCausal")
 }
@@ -353,25 +400,25 @@ static void TestForwardCausal()
 //------------------------------------------------------------------------------
 // Test 4: Backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestBackwardInputGrad(const GradMode_t &mode)
+void CAIF_AttentionTests::TestBackwardInputGrad(const GradMode_t &mode)
 {
-  const std::string test_name=std::string("MHA::BackwardInputGrad::")+mode.label;
-  const bool _prev_precise=CAIF_Settings::PreciseGradients();
+  const std::string test_name=std::string("MHA::BackwardInputGrad::")+mode.Label();
+  const bool prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
-    CAIF_Settings::SetPreciseGradients(mode.precise);
+    CAIF_Settings::SetPreciseGradients(mode.Precise());
 
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=4;
-    const uint32_t num_heads=2;
-    const float h=1e-3f;
-    const float grad_tol=mode.tol;
+    const uint32_t batch=g_caif_attn_test_batch_bwd;
+    const uint32_t seq_len=g_caif_attn_test_seq_bwd;
+    const uint32_t dim=g_caif_attn_test_dim_bwd;
+    const uint32_t num_heads=g_caif_attn_test_heads_bwd;
+    const float h=g_caif_attn_test_fd_h;
+    const float grad_tol=mode.Tol();
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
 
     // Create base input
     std::vector<float> host_input(batch*seq_len*dim);
@@ -388,18 +435,30 @@ static void TestBackwardInputGrad(const GradMode_t &mode)
     CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
     CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     mha.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     CAIF_DeviceTensor grad_input=mha.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
+
+    // The analytical gradient above was computed in the mode under test. The
+    // finite-difference REFERENCE, however, must always run in full FP32:
+    // CAIF_Settings documents that FD gradient checks do not converge under
+    // TF32 (Performance_e) — the ~1e-3 forward rounding error is amplified by
+    // the 1/(2h) factor into a noise-dominated numerical gradient. Taking the
+    // reference in Accuracy_e keeps it convergent, so the TF32 check actually
+    // validates the TF32 backward against the true gradient instead of against
+    // its own forward noise.
+    CAIF_Settings::SetPreciseGradients(true);
 
     bool passed=true;
 
@@ -418,8 +477,9 @@ static void TestBackwardInputGrad(const GradMode_t &mode)
       mha_p.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_p.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               input_plus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(input_plus.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       ctx.SetTraining(false);
       ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
       CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,ctx);
@@ -437,8 +497,9 @@ static void TestBackwardInputGrad(const GradMode_t &mode)
       mha_m.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_m.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               input_minus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(input_minus.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
@@ -452,41 +513,47 @@ static void TestBackwardInputGrad(const GradMode_t &mode)
 
       if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
-        std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
-                 <<" numerical="<<numerical
-                 <<" diff="<<std::fabs(numerical-analytical)<<"\n";
+        ISE_Out::Out()<<"  dx mismatch at "
+                      <<i
+                      <<": analytical="
+                      <<analytical
+                      <<" numerical="
+                      <<numerical
+                      <<" diff="
+                      <<std::fabs(numerical-analytical)
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult(test_name.c_str(),passed);
+    CAIF_TestHarness::Report(test_name.c_str(),passed);
   }
   CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
-  CAIF_Settings::SetPreciseGradients(_prev_precise);
+  CAIF_Settings::SetPreciseGradients(prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 5: Backward weight gradient (finite difference, W_q spot check)
 //------------------------------------------------------------------------------
-static void TestBackwardWeightGrad(const GradMode_t &mode)
+void CAIF_AttentionTests::TestBackwardWeightGrad(const GradMode_t &mode)
 {
-  const std::string test_name=std::string("MHA::BackwardWeightGrad::")+mode.label;
-  const bool _prev_precise=CAIF_Settings::PreciseGradients();
+  const std::string test_name=std::string("MHA::BackwardWeightGrad::")+mode.Label();
+  const bool prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
-    CAIF_Settings::SetPreciseGradients(mode.precise);
+    CAIF_Settings::SetPreciseGradients(mode.Precise());
 
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=4;
-    const uint32_t num_heads=2;
-    const float h=1e-3f;
-    const float grad_tol=mode.tol;
+    const uint32_t batch=g_caif_attn_test_batch_bwd;
+    const uint32_t seq_len=g_caif_attn_test_seq_bwd;
+    const uint32_t dim=g_caif_attn_test_dim_bwd;
+    const uint32_t num_heads=g_caif_attn_test_heads_bwd;
+    const float h=g_caif_attn_test_fd_h;
+    const float grad_tol=mode.Tol();
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
 
     std::vector<float> host_input(batch*seq_len*dim);
     for(size_t i=0;i<host_input.size();++i)
@@ -501,26 +568,33 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
     CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
     CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     mha.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     mha.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad_wq=mha.GradientTensor(0).ToHost();
 
+    // The FD reference must run in full FP32 (see TestBackwardInputGrad): FD
+    // gradient checks do not converge under TF32, so the numerical reference is
+    // always taken in Accuracy_e while the analytical grad above stays in the
+    // mode under test.
+    CAIF_Settings::SetPreciseGradients(true);
+
     bool passed=true;
 
-    // Spot check first 4 elements of W_q gradient
-    const size_t check_count=4;
+    // Spot check first g_caif_attn_test_wgrad_spot elements of W_q gradient
     std::vector<float> wq_data(h_wq.Data(),h_wq.Data()+h_wq.TotalElements());
 
-    for(size_t i=0;i<check_count&&passed==true;++i)
+    for(size_t i=0;i<g_caif_attn_test_wgrad_spot&&passed==true;++i)
     {
       std::vector<float> wq_plus(wq_data);
       std::vector<float> wq_minus(wq_data);
@@ -534,8 +608,9 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
       mha_p.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_p.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               host_input.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       ctx.SetTraining(false);
       ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
       CAIF_DeviceTensor out_p=mha_p.Forward(inp_p,ctx);
@@ -553,8 +628,9 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
       mha_m.ParameterTensor(2).CopyFromHost(h_wv.Data(),h_wv.TotalElements());
       mha_m.ParameterTensor(3).CopyFromHost(h_wo.Data(),h_wo.TotalElements());
 
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               host_input.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       CAIF_DeviceTensor out_m=mha_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
@@ -568,38 +644,47 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
 
       if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
-        std::cout<<"  dW_q mismatch at "<<i<<": analytical="<<analytical
-                 <<" numerical="<<numerical
-                 <<" diff="<<std::fabs(numerical-analytical)<<"\n";
+        ISE_Out::Out()<<"  dW_q mismatch at "
+                      <<i
+                      <<": analytical="
+                      <<analytical
+                      <<" numerical="
+                      <<numerical
+                      <<" diff="
+                      <<std::fabs(numerical-analytical)
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult(test_name.c_str(),passed);
+    CAIF_TestHarness::Report(test_name.c_str(),passed);
   }
   CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
-  CAIF_Settings::SetPreciseGradients(_prev_precise);
+  CAIF_Settings::SetPreciseGradients(prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 6: Parameter count
 //------------------------------------------------------------------------------
-static void TestParameterCount()
+void CAIF_AttentionTests::TestParameterCount()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t dim=g_caif_attn_test_dim_param;
+    const uint32_t num_heads=g_caif_attn_test_heads_param;
 
     CAIF_CudaStream stream;
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     bool passed=true;
     if(mha.ParameterTensorCount()!=g_caif_attention_weight_count)
     {
-      std::cout<<"  ParameterTensorCount expected "<<g_caif_attention_weight_count
-               <<", got "<<mha.ParameterTensorCount()<<"\n";
+      ISE_Out::Out()<<"  ParameterTensorCount expected "
+                    <<g_caif_attention_weight_count
+                    <<", got "
+                    <<mha.ParameterTensorCount()
+                    <<"\n";
       passed=false;
     }
 
@@ -607,12 +692,15 @@ static void TestParameterCount()
     const size_t expected_total=4*dim*dim;
     if(mha.TotalParameterCount()!=expected_total)
     {
-      std::cout<<"  TotalParameterCount expected "<<expected_total
-               <<", got "<<mha.TotalParameterCount()<<"\n";
+      ISE_Out::Out()<<"  TotalParameterCount expected "
+                    <<expected_total
+                    <<", got "
+                    <<mha.TotalParameterCount()
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("MHA::ParameterCount",passed);
+    CAIF_TestHarness::Report("MHA::ParameterCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::ParameterCount")
 }
@@ -620,32 +708,34 @@ static void TestParameterCount()
 //------------------------------------------------------------------------------
 // Test 7: ZeroGradients
 //------------------------------------------------------------------------------
-static void TestZeroGradients()
+void CAIF_AttentionTests::TestZeroGradients()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=4;
-    const uint32_t num_heads=2;
+    const uint32_t batch=g_caif_attn_test_batch_bwd;
+    const uint32_t seq_len=g_caif_attn_test_seq_bwd;
+    const uint32_t dim=g_caif_attn_test_dim_bwd;
+    const uint32_t num_heads=g_caif_attn_test_heads_bwd;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=MakeConfig(dim,num_heads,false);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,false);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     mha.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     mha.Backward(grad_out,ctx);
 
@@ -660,8 +750,13 @@ static void TestZeroGradients()
       {
         if(host_grad.Data()[i]!=0.0f)
         {
-          std::cout<<"  Gradient["<<p<<"] not zeroed at "<<i<<": "
-                   <<host_grad.Data()[i]<<"\n";
+          ISE_Out::Out()<<"  Gradient["
+                        <<p
+                        <<"] not zeroed at "
+                        <<i
+                        <<": "
+                        <<host_grad.Data()[i]
+                        <<"\n";
           passed=false;
           break;
         }
@@ -672,7 +767,7 @@ static void TestZeroGradients()
       }
     }
 
-    ReportResult("MHA::ZeroGradients",passed);
+    CAIF_TestHarness::Report("MHA::ZeroGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::ZeroGradients")
 }
@@ -680,15 +775,15 @@ static void TestZeroGradients()
 //------------------------------------------------------------------------------
 // Test 8: Description string
 //------------------------------------------------------------------------------
-static void TestDescription()
+void CAIF_AttentionTests::TestDescription()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t dim=g_caif_attn_test_dim_param;
+    const uint32_t num_heads=g_caif_attn_test_heads_param;
 
     CAIF_CudaStream stream;
-    auto config=MakeConfig(dim,num_heads,true);
+    AttentionConfig_t config=MakeConfig(dim,num_heads,true);
     CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
     const std::string desc=mha.Description();
@@ -696,34 +791,44 @@ static void TestDescription()
     bool passed=(desc==expected);
     if(passed==false)
     {
-      std::cout<<"  Expected '"<<expected<<"', got '"<<desc<<"'\n";
+      ISE_Out::Out()<<"  Expected '"
+                    <<expected
+                    <<"', got '"
+                    <<desc
+                    <<"'\n";
     }
 
-    ReportResult("MHA::Description",passed);
+    CAIF_TestHarness::Report("MHA::Description",passed);
   }
   CAIF_TEST_CATCH_BLOCK("MHA::Description")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_AttentionTests::RunAll()
 {
-  std::cout<<"=== CAIF_DeviceMultiHeadAttention<float,float> Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF_DeviceMultiHeadAttention<float,float> Tests ===\n\n";
   TestForwardShape();
   TestForwardNonCausal();
   TestForwardCausal();
-  TestBackwardInputGrad(kGradModePrecise);
-  TestBackwardInputGrad(kGradModeTF32);
-  TestBackwardWeightGrad(kGradModePrecise);
-  TestBackwardWeightGrad(kGradModeTF32);
+  TestBackwardInputGrad(g_caif_grad_mode_precise);
+  TestBackwardInputGrad(g_caif_grad_mode_tf32);
+  TestBackwardWeightGrad(g_caif_grad_mode_precise);
+  TestBackwardWeightGrad(g_caif_grad_mode_tf32);
   TestParameterCount();
   TestZeroGradients();
   TestDescription();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif  // USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_AttentionTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

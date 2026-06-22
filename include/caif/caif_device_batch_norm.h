@@ -95,8 +95,21 @@ class CAIF_DeviceBatchNorm:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     // Internal accessors — every member access in method bodies routes
     // through these so subclasses can override storage / instrumentation.
     uint32_t NumFeaturesInternal()const{return _num_features;}
+    void SetNumFeatures(const uint32_t v){_num_features=v;}
     float EpsilonInternal()const{return _epsilon;}
+    void SetEpsilon(const float v){_epsilon=v;}
     float MomentumInternal()const{return _momentum;}
+    void SetMomentum(const float v){_momentum=v;}
+    void SetGamma(CAIF_DeviceTensor t){_gamma=std::move(t);}
+    void SetBeta(CAIF_DeviceTensor t){_beta=std::move(t);}
+    void SetGammaGrad(CAIF_DeviceTensor t){_gamma_grad=std::move(t);}
+    void SetBetaGrad(CAIF_DeviceTensor t){_beta_grad=std::move(t);}
+    void SetRunningMean(CAIF_DeviceTensor t){_running_mean=std::move(t);}
+    void SetRunningVar(CAIF_DeviceTensor t){_running_var=std::move(t);}
+    std::vector<uint32_t> &CachedInputShapeMutable(){return _cached_input_shape;}
+    void SetCachedMean(std::vector<float> v){_cached_mean=std::move(v);}
+    void SetCachedInvStd(std::vector<float> v){_cached_inv_std=std::move(v);}
+    void SetCachedNormalized(std::vector<float> v){_cached_normalized=std::move(v);}
 
     CAIF_DeviceTensor &Gamma(){return _gamma;}
     const CAIF_DeviceTensor &Gamma()const{return _gamma;}

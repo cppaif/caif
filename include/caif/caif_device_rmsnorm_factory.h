@@ -24,6 +24,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -34,11 +35,10 @@
 namespace instance
 {
 
-class CAIF_DeviceRMSNormFactory
+class CAIF_DeviceRMSNormFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceRMSNormFactory()=delete;
-    ~CAIF_DeviceRMSNormFactory()=delete;
 
     /**
      * @brief Construct the right CAIF_DeviceRMSNorm<ComputeT, StorageT>

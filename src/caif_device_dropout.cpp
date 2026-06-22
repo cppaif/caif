@@ -22,31 +22,15 @@
 #include "caif_ops.h"
 #include "caif_run_context.h"
 #include "caif_exception.h"
+#include "caif_serialization_constants.h"
+#include "caif_dropout_rng.h"
+#include "caif_constants.h"
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
 namespace instance
 {
-
-
-static uint64_t SplitMix64(uint64_t x)
-{
-  uint64_t z=(x+0x9E3779B97F4A7C15ULL);
-  z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL;
-  z=(z^(z>>27))*0x94D049BB133111EBULL;
-  return z^(z>>31);
-}
-
-static float UniformFromBits(const uint64_t bits)
-{
-  const uint64_t mantissa=(bits>>11)&((1ULL<<53)-1ULL);
-  const double unit_double=static_cast<double>(mantissa)/static_cast<double>(1ULL<<53);
-  return static_cast<float>(unit_double);
-}
-
-constexpr float DROPOUT_FULL_KEEP_RATE=0.0f;
-constexpr uint64_t DROPOUT_COUNTER_MIX=0xD1342543DE82EF95ULL;
 
 
 template<typename ComputeT,typename StorageT>
@@ -59,7 +43,7 @@ CAIF_DeviceDropout<ComputeT,StorageT>::CAIF_DeviceDropout(float rate,
 {
   try
   {
-    if(_rate<0.0f || _rate>=1.0f)
+    if(Rate()<0.0f || Rate()>=1.0f)
     {
       THROW_CAIFE("CAIF_DeviceDropout: rate must be in [0,1)");
     }
@@ -70,11 +54,11 @@ CAIF_DeviceDropout<ComputeT,StorageT>::CAIF_DeviceDropout(float rate,
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceDropout<ComputeT,StorageT>::CAIF_DeviceDropout(CAIF_DeviceDropout &&other):
                                   CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
-                                  _rate(other._rate),
-                                  _cached_mask(std::move(other._cached_mask)),
-                                  _cached_mask_active(other._cached_mask_active)
+                                  _rate(other.Rate()),
+                                  _cached_mask(std::move(other.CachedMask())),
+                                  _cached_mask_active(other.CachedMaskActive())
 {
-  other._cached_mask_active=false;
+  other.SetCachedMaskActive(false);
 }
 
 template<typename ComputeT,typename StorageT>
@@ -86,10 +70,10 @@ CAIF_DeviceDropout<ComputeT,StorageT>::operator=(CAIF_DeviceDropout &&other)
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _rate=other._rate;
-      _cached_mask=std::move(other._cached_mask);
-      _cached_mask_active=other._cached_mask_active;
-      other._cached_mask_active=false;
+      SetRate(other.Rate());
+      SetCachedMask(std::move(other.CachedMask()));
+      SetCachedMaskActive(other.CachedMaskActive());
+      other.SetCachedMaskActive(false);
     }
     return *this;
   }
@@ -106,24 +90,24 @@ CAIF_DeviceDropout<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
   {
     AssertInputDtype(input);
 
-    if(ctx.Training()==false || _rate==DROPOUT_FULL_KEEP_RATE)
+    if(ctx.Training()==false || Rate()==g_caif_dropout_full_keep_rate)
     {
-      _cached_mask_active=false;
+      SetCachedMaskActive(false);
       return input.Clone();
     }
 
-    const float keep_probability=1.0f-_rate;
+    const float keep_probability=1.0f-Rate();
     const float scale=1.0f/keep_probability;
     const size_t element_count=input.TotalElements();
     std::vector<float> mask_host(element_count,0.0f);
 
     const uint64_t seed=ctx.RandomSeed();
     const uint64_t call_counter=ctx.NextRandomCounter();
-    const uint64_t base=SplitMix64(seed^(DROPOUT_COUNTER_MIX*(call_counter+1ULL)));
+    const uint64_t base=CAIF_DropoutRng::SplitMix64(seed^(g_caif_dropout_counter_mix*(call_counter+1ULL)));
     for(size_t i=0;i<element_count;++i)
     {
-      const uint64_t bits=SplitMix64(base^static_cast<uint64_t>(i));
-      const float u=UniformFromBits(bits);
+      const uint64_t bits=CAIF_DropoutRng::SplitMix64(base^static_cast<uint64_t>(i));
+      const float u=CAIF_DropoutRng::UniformFromBits(bits);
       if(u<keep_probability)
       {
         mask_host[i]=scale;
@@ -166,8 +150,8 @@ CAIF_DeviceDropout<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
     }
     CAIF_Ops::Multiply(input,mask,output);
 
-    _cached_mask=std::move(mask);
-    _cached_mask_active=true;
+    SetCachedMask(std::move(mask));
+    SetCachedMaskActive(true);
     return output;
   }
   CAIF_CATCH_BLOCK();
@@ -181,7 +165,7 @@ CAIF_DeviceDropout<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
 {
   try
   {
-    if(_cached_mask_active==false)
+    if(CachedMaskActive()==false)
     {
       return grad_output.Clone();
     }
@@ -196,7 +180,7 @@ CAIF_DeviceDropout<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
       CAIF_CudaStream &stream=ctx.Stream();
       grad_input=CAIF_DeviceTensor::Zeros(grad_output.Shape(),stream,sdt);
     }
-    CAIF_Ops::Multiply(grad_output,_cached_mask,grad_input);
+    CAIF_Ops::Multiply(grad_output,CachedMask(),grad_input);
     return grad_input;
   }
   CAIF_CATCH_BLOCK();
@@ -258,7 +242,7 @@ const CAIF_DeviceTensor &CAIF_DeviceDropout<ComputeT,StorageT>::GradientTensor(s
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceDropout<ComputeT,StorageT>::Description()const
 {
-  return "CAIF_DeviceDropout";
+  return g_serial_tag_dropout;
 }
 
 template<typename ComputeT,typename StorageT>

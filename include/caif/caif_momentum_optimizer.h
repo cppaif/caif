@@ -15,6 +15,7 @@
 #pragma once
 
 #include "caif_optimizer.h"
+#include "caif_optimizer_type.h"
 
 #include <vector>
 
@@ -30,9 +31,9 @@ class CAIF_MomentumOptimizer:public CAIF_Optimizer
                            CAIF_CudaStream &stream);
     ~CAIF_MomentumOptimizer()override=default;
 
-    CAIF_OptimizerType_e Type()const override
+    CAIF_OptimizerType::CAIF_OptimizerType_e Type()const override
     {
-      return CAIF_OptimizerType_e::Momentum;
+      return CAIF_OptimizerType::CAIF_OptimizerType_e::Momentum;
     }
 
   protected:
@@ -40,14 +41,22 @@ class CAIF_MomentumOptimizer:public CAIF_Optimizer
     void UpdateOne(CAIF_DeviceTensor &target,
                    const CAIF_DeviceTensor &grad,
                    const size_t idx)override;
+    bool BatchedStep(CAIF_DeviceNetwork &network)override;
 
   private:
     float Momentum()const{return _momentum;}
     const std::vector<CAIF_DeviceTensor> &Velocities()const{return _velocity;}
     std::vector<CAIF_DeviceTensor> &VelocitiesMut(){return _velocity;}
+    std::vector<float *> &HostVelocityPtrsMut(){return _h_velocity_ptrs;}
+    CAIF_DeviceTensor &DeviceVelocityPtrsMut(){return _d_velocity_ptrs;}
 
     float _momentum;
     std::vector<CAIF_DeviceTensor> _velocity;
+
+    // Batched-step scratch: host staging + device buffer of per-tensor velocity
+    // pointers, in trainable order. Filled by BatchedStep.
+    std::vector<float *> _h_velocity_ptrs;
+    CAIF_DeviceTensor _d_velocity_ptrs;
 };
 
 }//end instance namespace

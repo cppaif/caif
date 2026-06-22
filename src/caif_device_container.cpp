@@ -14,7 +14,9 @@
 
 #include "caif_device_container.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
 
 namespace instance
 {
@@ -37,8 +39,8 @@ CAIF_DeviceContainer &CAIF_DeviceContainer::operator=(CAIF_DeviceContainer &&oth
   if(this!=&other)
   {
     CAIF_DeviceLayer::operator=(std::move(other));
-    _sublayers=std::move(other._sublayers);
-    _trainable=std::move(other._trainable);
+    SetSublayers(std::move(other.Sublayers()));
+    SetTrainable(std::move(other.Trainable()));
   }
   return *this;
 }
@@ -51,8 +53,8 @@ void CAIF_DeviceContainer::AddLayer(std::unique_ptr<CAIF_DeviceLayer> layer)
     {
       THROW_CAIFE("DeviceContainer::AddLayer: layer is null");
     }
-    _sublayers.push_back(std::move(layer));
-    _trainable.push_back(true);
+    Sublayers().push_back(std::move(layer));
+    Trainable().push_back(true);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -69,7 +71,7 @@ void CAIF_DeviceContainer::ReplaceLayer(size_t index,std::unique_ptr<CAIF_Device
     {
       THROW_CAIFE("DeviceContainer::ReplaceLayer: index out of range");
     }
-    _sublayers[index]=std::move(layer);
+    Sublayers()[index]=std::move(layer);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -78,11 +80,11 @@ CAIF_DeviceLayer &CAIF_DeviceContainer::Layer(size_t index)
 {
   try
   {
-    if(index>=_sublayers.size())
+    if(index>=Sublayers().size())
     {
       THROW_CAIFE("DeviceContainer::Layer: index out of range");
     }
-    return *_sublayers[index];
+    return *Sublayers()[index];
   }
   CAIF_CATCH_BLOCK()
 }
@@ -91,11 +93,11 @@ const CAIF_DeviceLayer &CAIF_DeviceContainer::Layer(size_t index)const
 {
   try
   {
-    if(index>=_sublayers.size())
+    if(index>=Sublayers().size())
     {
       THROW_CAIFE("DeviceContainer::Layer: index out of range");
     }
-    return *_sublayers[index];
+    return *Sublayers()[index];
   }
   CAIF_CATCH_BLOCK()
 }
@@ -104,11 +106,11 @@ void CAIF_DeviceContainer::SetLayerTrainable(size_t index,bool trainable)
 {
   try
   {
-    if(index>=_trainable.size())
+    if(index>=Trainable().size())
     {
       THROW_CAIFE("DeviceContainer::SetLayerTrainable: index out of range");
     }
-    _trainable[index]=trainable;
+    Trainable()[index]=trainable;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -117,11 +119,11 @@ bool CAIF_DeviceContainer::IsLayerTrainable(size_t index)const
 {
   try
   {
-    if(index>=_trainable.size())
+    if(index>=Trainable().size())
     {
       THROW_CAIFE("DeviceContainer::IsLayerTrainable: index out of range");
     }
-    return _trainable[index];
+    return Trainable()[index];
   }
   CAIF_CATCH_BLOCK()
 }
@@ -131,15 +133,15 @@ CAIF_DeviceTensor CAIF_DeviceContainer::ForwardImpl(const CAIF_DeviceTensor &inp
 {
   try
   {
-    if(_sublayers.empty()==true)
+    if(Sublayers().empty()==true)
     {
       return input.Clone();
     }
 
-    CAIF_DeviceTensor current=_sublayers[0]->Forward(input,ctx);
-    for(size_t i=1;i<_sublayers.size();++i)
+    CAIF_DeviceTensor current=Sublayers()[0]->Forward(input,ctx);
+    for(size_t i=1;i<Sublayers().size();++i)
     {
-      current=_sublayers[i]->Forward(current,ctx);
+      current=Sublayers()[i]->Forward(current,ctx);
     }
     return current;
   }
@@ -151,15 +153,15 @@ CAIF_DeviceTensor CAIF_DeviceContainer::BackwardImpl(const CAIF_DeviceTensor &gr
 {
   try
   {
-    if(_sublayers.empty()==true)
+    if(Sublayers().empty()==true)
     {
       return grad_output.Clone();
     }
 
-    CAIF_DeviceTensor current=_sublayers.back()->Backward(grad_output,ctx);
-    for(size_t i=_sublayers.size()-1;i>0;--i)
+    CAIF_DeviceTensor current=Sublayers().back()->Backward(grad_output,ctx);
+    for(size_t i=Sublayers().size()-1;i>0;--i)
     {
-      current=_sublayers[i-1]->Backward(current,ctx);
+      current=Sublayers()[i-1]->Backward(current,ctx);
     }
     return current;
   }
@@ -170,11 +172,11 @@ void CAIF_DeviceContainer::ZeroGradients()
 {
   try
   {
-    for(size_t i=0;i<_sublayers.size();++i)
+    for(size_t i=0;i<Sublayers().size();++i)
     {
-      if(_trainable[i]==true)
+      if(Trainable()[i]==true)
       {
-        _sublayers[i]->ZeroGradients();
+        Sublayers()[i]->ZeroGradients();
       }
     }
   }
@@ -186,7 +188,7 @@ size_t CAIF_DeviceContainer::ParameterTensorCount()const
   try
   {
     size_t total=0;
-    for(const auto &layer:_sublayers)
+    for(const auto &layer:Sublayers())
     {
       total+=layer->ParameterTensorCount();
     }
@@ -201,7 +203,7 @@ CAIF_DeviceContainer::ResolveParameterIndex(size_t index)
   try
   {
     size_t offset=0;
-    for(auto &layer:_sublayers)
+    for(auto &layer:Sublayers())
     {
       const size_t count=layer->ParameterTensorCount();
       if(index<offset+count)
@@ -221,7 +223,7 @@ CAIF_DeviceContainer::ResolveParameterIndex(size_t index)const
   try
   {
     size_t offset=0;
-    for(const auto &layer:_sublayers)
+    for(const auto &layer:Sublayers())
     {
       const size_t count=layer->ParameterTensorCount();
       if(index<offset+count)
@@ -305,7 +307,7 @@ size_t CAIF_DeviceContainer::TotalParameterCount()const
   try
   {
     size_t total=0;
-    for(const auto &layer:_sublayers)
+    for(const auto &layer:Sublayers())
     {
       total+=layer->TotalParameterCount();
     }
@@ -318,8 +320,10 @@ std::string CAIF_DeviceContainer::Description()const
 {
   try
   {
-    return std::string(g_caif_description_container_prefix)+
-           "("+std::to_string(_sublayers.size())+" sublayers)";
+    return std::string(g_serial_tag_container)+
+           g_serial_open_paren+
+           std::to_string(Sublayers().size())+
+           g_serial_suffix_sublayers;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -329,10 +333,10 @@ std::vector<std::string> CAIF_DeviceContainer::ParameterNames(const std::string 
   try
   {
     std::vector<std::string> names;
-    for(size_t i=0;i<_sublayers.size();++i)
+    for(size_t i=0;i<Sublayers().size();++i)
     {
-      const std::string layer_prefix=prefix+"layers."+std::to_string(i)+".";
-      std::vector<std::string> sublayer_names=_sublayers[i]->ParameterNames(layer_prefix);
+      const std::string layer_prefix=prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathGenericContainerLayer_e)+std::to_string(i)+".";
+      std::vector<std::string> sublayer_names=Sublayers()[i]->ParameterNames(layer_prefix);
       for(auto &name:sublayer_names)
       {
         names.push_back(std::move(name));
@@ -387,7 +391,7 @@ std::vector<std::string> CAIF_DeviceContainer::FrozenTensorNames(const std::stri
     const size_t n=LayerCount();
     for(size_t i=0;i<n;++i)
     {
-      const std::string layer_prefix=prefix+"layers."+std::to_string(i)+".";
+      const std::string layer_prefix=prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathGenericContainerLayer_e)+std::to_string(i)+".";
       std::vector<std::string> sub=Layer(i).FrozenTensorNames(layer_prefix);
       for(auto &nm:sub)
       {
@@ -404,7 +408,7 @@ float CAIF_DeviceContainer::AuxLoss()const
   try
   {
     float total=0.0f;
-    for(const auto &layer:_sublayers)
+    for(const auto &layer:Sublayers())
     {
       total+=layer->AuxLoss();
     }

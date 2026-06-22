@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -28,11 +29,10 @@
 namespace instance
 {
 
-class CAIF_DeviceTabularEmbeddingFactory
+class CAIF_DeviceTabularEmbeddingFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceTabularEmbeddingFactory()=delete;
-    ~CAIF_DeviceTabularEmbeddingFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t num_features,

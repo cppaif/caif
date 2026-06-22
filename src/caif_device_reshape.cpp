@@ -14,6 +14,7 @@
 
 #include "caif_device_reshape.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -31,8 +32,8 @@ CAIF_DeviceReshape<ComputeT,StorageT>::CAIF_DeviceReshape(const std::vector<uint
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceReshape<ComputeT,StorageT>::CAIF_DeviceReshape(CAIF_DeviceReshape &&other):
                                           Base_t(std::move(other)),
-                                          _target_shape(std::move(other._target_shape)),
-                                          _cached_input_shape(std::move(other._cached_input_shape))
+                                          _target_shape(std::move(other.TargetShape())),
+                                          _cached_input_shape(std::move(other.CachedInputShape()))
 {
 }
 
@@ -45,8 +46,8 @@ CAIF_DeviceReshape<ComputeT,StorageT>::operator=(CAIF_DeviceReshape &&other)
     if(this!=&other)
     {
       Base_t::operator=(std::move(other));
-      _target_shape=std::move(other._target_shape);
-      _cached_input_shape=std::move(other._cached_input_shape);
+      SetTargetShape(std::move(other.TargetShape()));
+      SetCachedInputShape(std::move(other.CachedInputShape()));
     }
     return *this;
   }
@@ -62,14 +63,14 @@ CAIF_DeviceReshape<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
   try
   {
     static_cast<void>(ctx);
-    _cached_input_shape=input.Shape();
+    SetCachedInputShape(input.Shape());
     size_t input_elements=1u;
-    for(const uint32_t d:_cached_input_shape)
+    for(const uint32_t d:CachedInputShape())
     {
       input_elements*=static_cast<size_t>(d);
     }
     size_t target_elements=1u;
-    for(const uint32_t d:_target_shape)
+    for(const uint32_t d:TargetShape())
     {
       target_elements*=static_cast<size_t>(d);
     }
@@ -78,7 +79,7 @@ CAIF_DeviceReshape<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
       THROW_CAIFE("Reshape target element count does not match input");
     }
     CAIF_DeviceTensor output=input.Clone();
-    output.Reshape(_target_shape);
+    output.Reshape(TargetShape());
     return output;
   }
   CAIF_CATCH_BLOCK();
@@ -93,12 +94,12 @@ CAIF_DeviceReshape<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
   try
   {
     static_cast<void>(ctx);
-    if(_cached_input_shape.empty()==true)
+    if(CachedInputShape().empty()==true)
     {
       THROW_CAIFE("Reshape backward called before forward");
     }
     CAIF_DeviceTensor grad_input=grad_output.Clone();
-    grad_input.Reshape(_cached_input_shape);
+    grad_input.Reshape(CachedInputShape());
     return grad_input;
   }
   CAIF_CATCH_BLOCK();
@@ -162,7 +163,7 @@ CAIF_DeviceReshape<ComputeT,StorageT>::GradientTensor(size_t index)const
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceReshape<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_reshape;
+  return g_serial_tag_reshape;
 }
 
 template<typename ComputeT,typename StorageT>

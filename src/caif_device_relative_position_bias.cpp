@@ -16,6 +16,8 @@
 #include "caif_device_relative_position_bias_factory.h"
 #include "caif_ops.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
+#include "caif_serialization_constants.h"
 #include <cmath>
 #include <vector>
 
@@ -24,7 +26,7 @@ namespace instance
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::CAIF_DeviceRelativePositionBias(
-                                                  const Config_t &config,
+                                                  const CAIF_DeviceRelativePositionBiasConfig &config,
                                                   CAIF_CudaStream &stream):
                                           CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                           _config(config),
@@ -33,18 +35,18 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::CAIF_DeviceRelativePositionB
 {
   try
   {
-    if(config.num_heads==0)
+    if(config.NumHeads()==0)
     {
       THROW_CAIFE("CAIF_DeviceRelativePositionBias: num_heads must be > 0");
     }
-    if(config.num_buckets==0)
+    if(config.NumBuckets()==0)
     {
       THROW_CAIFE("CAIF_DeviceRelativePositionBias: num_buckets must be > 0");
     }
 
     const float limit=std::sqrt(g_caif_xavier_uniform_scale/
-                                 static_cast<float>(config.num_heads+config.num_buckets));
-    const size_t total=static_cast<size_t>(config.num_heads)*config.num_buckets;
+                                 static_cast<float>(config.NumHeads()+config.NumBuckets()));
+    const size_t total=static_cast<size_t>(config.NumHeads())*config.NumBuckets();
     std::vector<float> init_data(total);
     for(size_t i=0;i<total;++i)
     {
@@ -52,10 +54,10 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::CAIF_DeviceRelativePositionB
       init_data[i]=(t-std::floor(t))*2.0f*limit-limit;
     }
 
-    _embedding=CAIF_DeviceTensor::Uninitialized({config.num_heads,config.num_buckets},stream);
-    _embedding.CopyFromHost(init_data.data(),total);
+    SetEmbedding(CAIF_DeviceTensor::Uninitialized({config.NumHeads(),config.NumBuckets()},stream));
+    Embedding().CopyFromHost(init_data.data(),total);
 
-    _grad_embedding=CAIF_DeviceTensor::Zeros({config.num_heads,config.num_buckets},stream);
+    SetGradEmbedding(CAIF_DeviceTensor::Zeros({config.NumHeads(),config.NumBuckets()},stream));
   }
   CAIF_CATCH_BLOCK()
 }
@@ -79,9 +81,9 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::operator=(CAIF_DeviceRelativ
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _config=other._config;
-      _embedding=std::move(other._embedding);
-      _grad_embedding=std::move(other._grad_embedding);
+      SetConfig(other.Config());
+      SetEmbedding(std::move(other.Embedding()));
+      SetGradEmbedding(std::move(other.GradEmbedding()));
     }
     return *this;
   }
@@ -94,13 +96,13 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::ComputeBias(uint32_t q_len,u
 {
   try
   {
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({_config.num_heads,q_len,k_len},
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({Config().NumHeads(),q_len,k_len},
                                                               Stream(),StorageDtype());
 
-    CAIF_Ops::ComputeRelativePositionBias(_embedding,
+    CAIF_Ops::ComputeRelativePositionBias(Embedding(),
                                           output,
-                                          _config.max_distance,
-                                          _config.bidirectional);
+                                          Config().MaxDistance(),
+                                          Config().Bidirectional());
 
     return output;
   }
@@ -119,9 +121,9 @@ void CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::AccumulateGradient(
     (void)k_len;
 
     CAIF_Ops::AccumulateRelativePositionBiasGradient(grad_bias,
-                                                     _grad_embedding,
-                                                     _config.max_distance,
-                                                     _config.bidirectional);
+                                                     GradEmbedding(),
+                                                     Config().MaxDistance(),
+                                                     Config().Bidirectional());
   }
   CAIF_CATCH_BLOCK()
 }
@@ -164,7 +166,7 @@ void CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_embedding.FillZero();
+    GradEmbedding().FillZero();
   }
   CAIF_CATCH_BLOCK()
 }
@@ -238,7 +240,7 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::GradientTensor(size_t index)
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::TotalParameterCount()const
 {
-  return static_cast<size_t>(_config.num_heads)*_config.num_buckets;
+  return static_cast<size_t>(Config().NumHeads())*Config().NumBuckets();
 }
 
 template<typename ComputeT,typename StorageT>
@@ -246,20 +248,25 @@ std::string CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::Description()con
 {
   try
   {
-    std::string bidir_str="false";
-    if(_config.bidirectional==true)
+    std::string bidir_str=g_serial_json_false;
+    if(Config().Bidirectional()==true)
     {
-      bidir_str="true";
+      bidir_str=g_serial_json_true;
     }
-    return "RelativePositionBias(heads="+
-           std::to_string(_config.num_heads)+
-           ",buckets="+
-           std::to_string(_config.num_buckets)+
-           ",max_dist="+
-           std::to_string(_config.max_distance)+
-           ",bidir="+
+    return std::string(g_serial_tag_relative_position_bias)+
+           g_serial_open_paren+
+           g_serial_kv_heads+
+           std::to_string(Config().NumHeads())+
+           g_serial_comma+
+           g_serial_kv_buckets+
+           std::to_string(Config().NumBuckets())+
+           g_serial_comma+
+           g_serial_kv_max_dist+
+           std::to_string(Config().MaxDistance())+
+           g_serial_comma+
+           g_serial_kv_bidir+
            bidir_str+
-           ")";
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -271,7 +278,7 @@ CAIF_DeviceRelativePositionBias<ComputeT,StorageT>::ParameterNames(const std::st
   try
   {
     std::vector<std::string> names;
-    names.push_back(prefix+"relative_attention_bias.weight");
+    names.push_back(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::RelativePositionBias_e));
     return names;
   }
   CAIF_CATCH_BLOCK()

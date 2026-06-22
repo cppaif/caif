@@ -20,6 +20,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -30,11 +31,10 @@
 namespace instance
 {
 
-class CAIF_DeviceLayerNormFactory
+class CAIF_DeviceLayerNormFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceLayerNormFactory()=delete;
-    ~CAIF_DeviceLayerNormFactory()=delete;
 
     /**
      * @brief Construct the right CAIF_DeviceLayerNorm<ComputeT, StorageT>

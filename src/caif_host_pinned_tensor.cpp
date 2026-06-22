@@ -48,18 +48,18 @@ CAIF_HostPinnedTensor::CAIF_HostPinnedTensor(const std::vector<uint32_t> &shape,
 {
   try
   {
-    if(_bytes==0u)
+    if(Bytes()==0u)
     {
       THROW_CAIFE("CAIF_HostPinnedTensor: zero-byte shape");
     }
 #ifdef USE_CAIF_CUDA
-    cudaError_t status=cudaMallocHost(&_host_ptr,_bytes);
+    cudaError_t status=cudaMallocHost(&_host_ptr,Bytes());
     if(status!=cudaSuccess)
     {
       std::string err_msg="cudaMallocHost failed: ";
       err_msg+=cudaGetErrorString(status);
       err_msg+=" (requested ";
-      err_msg+=std::to_string(_bytes);
+      err_msg+=std::to_string(Bytes());
       err_msg+=" bytes)";
       THROW_CAIFE(err_msg);
     }
@@ -73,10 +73,10 @@ CAIF_HostPinnedTensor::CAIF_HostPinnedTensor(const std::vector<uint32_t> &shape,
 CAIF_HostPinnedTensor::~CAIF_HostPinnedTensor()
 {
 #ifdef USE_CAIF_CUDA
-  if(_host_ptr!=nullptr)
+  if(IsAllocated()==true)
   {
-    cudaFreeHost(_host_ptr);
-    _host_ptr=nullptr;
+    cudaFreeHost(HostPtr());
+    SetHostPtr(nullptr);
   }
 #endif
 }
@@ -87,8 +87,8 @@ CAIF_HostPinnedTensor::CAIF_HostPinnedTensor(CAIF_HostPinnedTensor &&other):
                                             _host_ptr(other._host_ptr),
                                             _bytes(other._bytes)
 {
-  other._host_ptr=nullptr;
-  other._bytes=0u;
+  other.SetHostPtr(nullptr);
+  other.SetBytes(0u);
 }
 
 CAIF_HostPinnedTensor &
@@ -97,17 +97,17 @@ CAIF_HostPinnedTensor::operator=(CAIF_HostPinnedTensor &&other)
   if(this!=&other)
   {
 #ifdef USE_CAIF_CUDA
-    if(_host_ptr!=nullptr)
+    if(IsAllocated()==true)
     {
-      cudaFreeHost(_host_ptr);
+      cudaFreeHost(HostPtr());
     }
 #endif
-    _shape=std::move(other._shape);
-    _dtype=other._dtype;
-    _host_ptr=other._host_ptr;
-    _bytes=other._bytes;
-    other._host_ptr=nullptr;
-    other._bytes=0u;
+    SetShape(std::move(other._shape));
+    SetDtype(other.Dtype());
+    SetHostPtr(other.HostPtr());
+    SetBytes(other.Bytes());
+    other.SetHostPtr(nullptr);
+    other.SetBytes(0u);
   }
   return *this;
 }
@@ -145,6 +145,37 @@ void CAIF_HostPinnedTensor::CopyFromDevice(const CAIF_DeviceTensor &src)
       THROW_CAIFE("CopyFromDevice: source dtype does not match host buffer dtype");
     }
     src.CopyToHostRaw(HostPtr());
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+void CAIF_HostPinnedTensor::CopyFromDeviceAsync(const CAIF_DeviceTensor &src,
+                                                CAIF_CudaStream &stream)
+{
+  try
+  {
+    if(IsAllocated()==false)
+    {
+      THROW_CAIFE("CopyFromDeviceAsync: host buffer is not allocated");
+    }
+    if(src.Shape()!=Shape())
+    {
+      THROW_CAIFE("CopyFromDeviceAsync: source shape does not match host buffer shape");
+    }
+    if(src.Dtype()!=Dtype())
+    {
+      THROW_CAIFE("CopyFromDeviceAsync: source dtype does not match host buffer dtype");
+    }
+#ifdef USE_CAIF_CUDA
+    cudaMemcpyAsync(HostPtr(),
+                    src.DeviceDataRaw(),
+                    Bytes(),
+                    cudaMemcpyDeviceToHost,
+                    stream.Handle());
+#else
+    (void)stream;
+    src.CopyToHostRaw(HostPtr());
+#endif
   }
   CAIF_CATCH_BLOCK()
 }

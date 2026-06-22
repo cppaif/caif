@@ -14,6 +14,7 @@
 
 #include "caif_device_flatten.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -29,7 +30,7 @@ CAIF_DeviceFlatten<ComputeT,StorageT>::CAIF_DeviceFlatten(CAIF_CudaStream &strea
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceFlatten<ComputeT,StorageT>::CAIF_DeviceFlatten(CAIF_DeviceFlatten &&other):
                                           Base_t(std::move(other)),
-                                          _cached_input_shape(std::move(other._cached_input_shape))
+                                          _cached_input_shape(std::move(other.CachedInputShape()))
 {
 }
 
@@ -42,7 +43,7 @@ CAIF_DeviceFlatten<ComputeT,StorageT>::operator=(CAIF_DeviceFlatten &&other)
     if(this!=&other)
     {
       Base_t::operator=(std::move(other));
-      _cached_input_shape=std::move(other._cached_input_shape);
+      SetCachedInputShape(std::move(other.CachedInputShape()));
     }
     return *this;
   }
@@ -58,16 +59,16 @@ CAIF_DeviceFlatten<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
   try
   {
     static_cast<void>(ctx);
-    _cached_input_shape=input.Shape();
-    if(_cached_input_shape.size()<2u)
+    SetCachedInputShape(input.Shape());
+    if(CachedInputShape().size()<2u)
     {
       THROW_CAIFE("Flatten input must have at least 2 dims");
     }
-    const uint32_t batch=_cached_input_shape[0];
+    const uint32_t batch=CachedInputShape()[0];
     uint32_t feature_count=1u;
-    for(size_t i=1;i<_cached_input_shape.size();++i)
+    for(size_t i=1;i<CachedInputShape().size();++i)
     {
-      feature_count*=_cached_input_shape[i];
+      feature_count*=CachedInputShape()[i];
     }
     CAIF_DeviceTensor output=input.Clone();
     const std::vector<uint32_t> flat_shape={batch,feature_count};
@@ -86,12 +87,12 @@ CAIF_DeviceFlatten<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
   try
   {
     static_cast<void>(ctx);
-    if(_cached_input_shape.empty()==true)
+    if(CachedInputShape().empty()==true)
     {
       THROW_CAIFE("Flatten backward called before forward");
     }
     CAIF_DeviceTensor grad_input=grad_output.Clone();
-    grad_input.Reshape(_cached_input_shape);
+    grad_input.Reshape(CachedInputShape());
     return grad_input;
   }
   CAIF_CATCH_BLOCK();
@@ -155,7 +156,7 @@ CAIF_DeviceFlatten<ComputeT,StorageT>::GradientTensor(size_t index)const
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceFlatten<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_flatten;
+  return g_serial_tag_flatten;
 }
 
 template<typename ComputeT,typename StorageT>

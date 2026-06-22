@@ -16,15 +16,12 @@
 // CAIF - AI Framework
 // Test: SGD / Momentum / RMSprop / AdaGrad single-step correctness.
 //
-// Pattern mirrors test_adam_master_weights.cpp: a TestParamLayer holds a
-// single fp32 param + fp32 grad tensor, the test fills both with known
-// values, calls the corresponding CAIF_DeviceNetwork::Initialize* shim,
-// runs OptimizerStep() once, and asserts the resulting param matches
-// the analytic formula for that optimizer.
-//
-// Multi-step monotonic-loss tests would catch state-update bugs that
-// single-step doesn't (state vector accumulates incorrectly across
-// steps).  Added below as a second case per optimizer.
+// CAIF_OptimizerTestLayer holds a single fp32 param + fp32 grad tensor; each
+// case fills both with known values, calls the matching
+// CAIF_DeviceNetwork::Initialize* shim, runs OptimizerStep() once (or twice
+// for the multi-step cases), and asserts the resulting param matches the
+// analytic formula for that optimizer. Multi-step cases catch state-vector
+// accumulation bugs that a single step would miss.
 //------------------------------------------------------------------------------
 #include "caif_device_network.h"
 #include "caif_device_layer.h"
@@ -35,46 +32,51 @@
 #include "caif_data_type.h"
 #include "caif_exception.h"
 #include "caif_test_harness.h"
+#include "ise_lib/ise_out.h"
 
 #include <cmath>
 #include <memory>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
-
-void ReportResult(const char *name,bool ok)
-{
-  CAIF_TestHarness::Report(name,ok);
-}
 
 #ifdef USE_CAIF_CUDA
 
-constexpr uint32_t g_test_rows=4;
-constexpr uint32_t g_test_cols=8;
+constexpr uint32_t g_caif_opt_test_rows=4;
+constexpr uint32_t g_caif_opt_test_cols=8;
+constexpr float g_caif_opt_test_p0=1.0f;
+constexpr float g_caif_opt_test_grad=0.1f;
+constexpr float g_caif_opt_test_lr=0.01f;
+constexpr float g_caif_opt_test_momentum=0.9f;
+constexpr float g_caif_opt_test_sgd_wd=0.05f;
+constexpr float g_caif_opt_test_rmsprop_alpha=0.99f;
+constexpr float g_caif_opt_test_rmsprop_eps=1.0e-8f;
+constexpr float g_caif_opt_test_adagrad_eps=1.0e-10f;
+constexpr float g_caif_opt_test_tol=1.0e-5f;
+constexpr float g_caif_opt_test_tol_loose=1.0e-4f;
 
-class TestParamLayer:public CAIF_DeviceLayer
+//------------------------------------------------------------------------------
+// Test-only layer: a single fp32 parameter + fp32 gradient tensor. Forward and
+// Backward are unused (the network's optimizer plumbing is what is probed), so
+// they throw if called.
+//------------------------------------------------------------------------------
+class CAIF_OptimizerTestLayer:public CAIF_DeviceLayer
 {
   public:
-    explicit TestParamLayer(CAIF_CudaStream &stream):CAIF_DeviceLayer(stream)
+    explicit CAIF_OptimizerTestLayer(CAIF_CudaStream &stream):CAIF_DeviceLayer(stream),
+                                                              _param(MakeZeroFp32(stream)),
+                                                              _grad(MakeZeroFp32(stream))
     {
-      const CAIF_DataType::CAIF_DataType_e fp32=CAIF_DataType::CAIF_DataType_e::Float32;
-      const std::vector<uint32_t> shape={g_test_rows,g_test_cols};
-      _param=CAIF_DeviceTensor::Zeros(shape,stream,fp32);
-      _grad=CAIF_DeviceTensor::Zeros(shape,stream,fp32);
     }
 
-    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &,
-                                  CAIF_RunContext &)override
+    CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &,CAIF_RunContext &)override
     {
-      THROW_CAIFE("TestParamLayer::ForwardImpl not used in this test");
+      THROW_CAIFE("CAIF_OptimizerTestLayer::ForwardImpl not used in this test");
     }
-    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &,
-                                   CAIF_RunContext &)override
+    CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &,CAIF_RunContext &)override
     {
-      THROW_CAIFE("TestParamLayer::BackwardImpl not used in this test");
+      THROW_CAIFE("CAIF_OptimizerTestLayer::BackwardImpl not used in this test");
     }
     CAIF_RunContext::Subsystem_e SubsystemTag()const override
     {
@@ -82,7 +84,7 @@ class TestParamLayer:public CAIF_DeviceLayer
     }
     void ZeroGradients()override
     {
-      _grad.Fill(0.0f);
+      GradientTensor(0).Fill(0.0f);
     }
     size_t ParameterTensorCount()const override
     {
@@ -106,30 +108,75 @@ class TestParamLayer:public CAIF_DeviceLayer
     }
     size_t TotalParameterCount()const override
     {
-      return _param.TotalElements();
+      return ParameterTensor(0).TotalElements();
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeStorageDtype()const override
+    {
+      return CAIF_DataType::CAIF_DataType_e::Float32;
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeComputeDtype()const override
+    {
+      return CAIF_DataType::CAIF_DataType_e::Float32;
     }
     std::string Description()const override
     {
-      return "TestParamLayer";
+      return "CAIF_OptimizerTestLayer";
     }
     std::vector<std::string> ParameterNames(const std::string &prefix)const override
     {
       return {prefix+"weight"};
     }
 
+  protected:
+
   private:
+    static CAIF_DeviceTensor MakeZeroFp32(CAIF_CudaStream &stream)
+    {
+      return CAIF_DeviceTensor::Zeros({g_caif_opt_test_rows,g_caif_opt_test_cols},
+                                      stream,
+                                      CAIF_DataType::CAIF_DataType_e::Float32);
+    }
+
     CAIF_DeviceTensor _param;
     CAIF_DeviceTensor _grad;
 };
 
-void FillTensor(CAIF_DeviceTensor &t,const float value)
+//------------------------------------------------------------------------------
+// Optimizer single-/multi-step analytic checks.
+//------------------------------------------------------------------------------
+class CAIF_OptimizerTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void FillTensor(CAIF_DeviceTensor &t,const float value);
+    static std::vector<float> ReadTensor(const CAIF_DeviceTensor &t);
+    static bool AllClose(const std::vector<float> &got,const float expected,const float tol);
+    static CAIF_DeviceNetwork BuildOneLayerNet(CAIF_CudaStream &stream,
+                                               const float param_value,
+                                               const float grad_value);
+
+    static void TestSgdSingleStep();
+    static void TestSgdWeightDecay();
+    static void TestMomentumSingleStep();
+    static void TestMomentumTwoSteps();
+    static void TestRmspropSingleStep();
+    static void TestAdaGradSingleStep();
+    static void TestAdaGradAccumGrows();
+    static void TestStepBeforeInitThrows();
+};
+
+void CAIF_OptimizerTests::FillTensor(CAIF_DeviceTensor &t,const float value)
 {
   const size_t n=t.TotalElements();
   std::vector<float> host(n,value);
   t.CopyFromHost(host.data(),n);
 }
 
-std::vector<float> ReadTensor(const CAIF_DeviceTensor &t)
+std::vector<float> CAIF_OptimizerTests::ReadTensor(const CAIF_DeviceTensor &t)
 {
   const size_t n=t.TotalElements();
   std::vector<float> host(n);
@@ -137,9 +184,9 @@ std::vector<float> ReadTensor(const CAIF_DeviceTensor &t)
   return host;
 }
 
-bool AllClose(const std::vector<float> &got,
-              const float expected,
-              const float tol=1e-5f)
+bool CAIF_OptimizerTests::AllClose(const std::vector<float> &got,
+                                   const float expected,
+                                   const float tol)
 {
   for(size_t i=0;i<got.size();++i)
   {
@@ -152,12 +199,13 @@ bool AllClose(const std::vector<float> &got,
   return true;
 }
 
-CAIF_DeviceNetwork BuildOneLayerNet(CAIF_CudaStream &stream,
-                                    const float param_value,
-                                    const float grad_value)
+CAIF_DeviceNetwork CAIF_OptimizerTests::BuildOneLayerNet(CAIF_CudaStream &stream,
+                                                         const float param_value,
+                                                         const float grad_value)
 {
   CAIF_DeviceNetwork net(stream);
-  std::unique_ptr<TestParamLayer> layer=std::make_unique<TestParamLayer>(stream);
+  std::unique_ptr<CAIF_OptimizerTestLayer> layer=
+    std::make_unique<CAIF_OptimizerTestLayer>(stream);
   FillTensor(layer->ParameterTensor(0),param_value);
   FillTensor(layer->GradientTensor(0),grad_value);
   net.AddLayer(std::move(layer));
@@ -167,44 +215,37 @@ CAIF_DeviceNetwork BuildOneLayerNet(CAIF_CudaStream &stream,
 //------------------------------------------------------------------------------
 // SGD single-step:  param -= lr * (grad + wd*param)
 //------------------------------------------------------------------------------
-void TestSgdSingleStep()
+void CAIF_OptimizerTests::TestSgdSingleStep()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float wd=0.0f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeSgd(lr,wd);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeSgd(g_caif_opt_test_lr,0.0f);
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float expected=p0-lr*g;
-    ReportResult("Optimizer::Sgd::SingleStep",AllClose(got,expected));
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad;
+    CAIF_TestHarness::Report("Optimizer::Sgd::SingleStep",
+                             AllClose(got,expected,g_caif_opt_test_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::Sgd::SingleStep")
 }
 
-void TestSgdWeightDecay()
+void CAIF_OptimizerTests::TestSgdWeightDecay()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float wd=0.05f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeSgd(lr,wd);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeSgd(g_caif_opt_test_lr,g_caif_opt_test_sgd_wd);
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float expected=p0-lr*(g+wd*p0);
-    ReportResult("Optimizer::Sgd::WeightDecay",AllClose(got,expected));
+    const float decayed_grad=g_caif_opt_test_grad+g_caif_opt_test_sgd_wd*g_caif_opt_test_p0;
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*decayed_grad;
+    CAIF_TestHarness::Report("Optimizer::Sgd::WeightDecay",
+                             AllClose(got,expected,g_caif_opt_test_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::Sgd::WeightDecay")
 }
@@ -213,48 +254,43 @@ void TestSgdWeightDecay()
 // Momentum single-step:  v = momentum*v + (grad + wd*param);  param -= lr*v
 // At t=1 with v0=0:      v1 = grad,  param1 = p0 - lr*grad
 //------------------------------------------------------------------------------
-void TestMomentumSingleStep()
+void CAIF_OptimizerTests::TestMomentumSingleStep()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float momentum=0.9f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeMomentum(lr,momentum,0.0f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeMomentum(g_caif_opt_test_lr,g_caif_opt_test_momentum,0.0f);
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float expected=p0-lr*g;
-    ReportResult("Optimizer::Momentum::SingleStep",AllClose(got,expected));
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad;
+    CAIF_TestHarness::Report("Optimizer::Momentum::SingleStep",
+                             AllClose(got,expected,g_caif_opt_test_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::Momentum::SingleStep")
 }
 
+//------------------------------------------------------------------------------
 // Two-step momentum:  v2 = momentum*v1 + grad;  param2 = param1 - lr*v2
 // With constant grad: v1=g, v2=momentum*g + g = g*(momentum+1)
 // param2 = p0 - lr*g - lr*g*(momentum+1) = p0 - lr*g*(2 + momentum)
-void TestMomentumTwoSteps()
+//------------------------------------------------------------------------------
+void CAIF_OptimizerTests::TestMomentumTwoSteps()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float momentum=0.9f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeMomentum(lr,momentum,0.0f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeMomentum(g_caif_opt_test_lr,g_caif_opt_test_momentum,0.0f);
     net.OptimizerStep();
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float expected=p0-lr*g*(2.0f+momentum);
-    ReportResult("Optimizer::Momentum::TwoSteps",AllClose(got,expected,1e-5f));
+    const float steps=2.0f+g_caif_opt_test_momentum;
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad*steps;
+    CAIF_TestHarness::Report("Optimizer::Momentum::TwoSteps",
+                             AllClose(got,expected,g_caif_opt_test_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::Momentum::TwoSteps")
 }
@@ -263,25 +299,24 @@ void TestMomentumTwoSteps()
 // RMSprop single-step: avg_sq = alpha*0 + (1-alpha)*grad^2;
 //                      param  = p0 - lr*grad / (sqrt(avg_sq) + epsilon)
 //------------------------------------------------------------------------------
-void TestRmspropSingleStep()
+void CAIF_OptimizerTests::TestRmspropSingleStep()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float alpha=0.99f;
-    const float eps=1e-8f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeRmsprop(lr,alpha,eps,0.0f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeRmsprop(g_caif_opt_test_lr,
+                          g_caif_opt_test_rmsprop_alpha,
+                          g_caif_opt_test_rmsprop_eps,
+                          0.0f);
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float avg_sq=(1.0f-alpha)*g*g;
-    const float expected=p0-lr*g/(std::sqrt(avg_sq)+eps);
-    ReportResult("Optimizer::Rmsprop::SingleStep",AllClose(got,expected));
+    const float avg_sq=(1.0f-g_caif_opt_test_rmsprop_alpha)*g_caif_opt_test_grad*g_caif_opt_test_grad;
+    const float denom=std::sqrt(avg_sq)+g_caif_opt_test_rmsprop_eps;
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad/denom;
+    CAIF_TestHarness::Report("Optimizer::Rmsprop::SingleStep",
+                             AllClose(got,expected,g_caif_opt_test_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::Rmsprop::SingleStep")
 }
@@ -290,50 +325,48 @@ void TestRmspropSingleStep()
 // AdaGrad single-step: accum = grad^2;
 //                      param = p0 - lr*grad / (sqrt(accum) + epsilon)
 //------------------------------------------------------------------------------
-void TestAdaGradSingleStep()
+void CAIF_OptimizerTests::TestAdaGradSingleStep()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float eps=1e-10f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeAdaGrad(lr,eps,0.0f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeAdaGrad(g_caif_opt_test_lr,g_caif_opt_test_adagrad_eps,0.0f);
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float accum=g*g;
-    const float expected=p0-lr*g/(std::sqrt(accum)+eps);
-    ReportResult("Optimizer::AdaGrad::SingleStep",AllClose(got,expected,1e-4f));
+    const float accum=g_caif_opt_test_grad*g_caif_opt_test_grad;
+    const float denom=std::sqrt(accum)+g_caif_opt_test_adagrad_eps;
+    const float expected=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad/denom;
+    CAIF_TestHarness::Report("Optimizer::AdaGrad::SingleStep",
+                             AllClose(got,expected,g_caif_opt_test_tol_loose));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::AdaGrad::SingleStep")
 }
 
+//------------------------------------------------------------------------------
 // Two-step AdaGrad: accum keeps growing -> per-step LR shrinks.
-// step1: accum = g^2;       p1 = p0 - lr*g/(sqrt(g^2)+eps) ~= p0 - lr (when eps tiny)
-// step2: accum = 2*g^2;     p2 = p1 - lr*g/(sqrt(2)*|g| + eps) ~= p1 - lr/sqrt(2)
-void TestAdaGradAccumGrows()
+// step1: accum = g^2;    p1 = p0 - lr*g/(sqrt(g^2)+eps)
+// step2: accum = 2*g^2;  p2 = p1 - lr*g/(sqrt(2*g^2)+eps)
+//------------------------------------------------------------------------------
+void CAIF_OptimizerTests::TestAdaGradAccumGrows()
 {
   try
   {
     CAIF_CudaStream stream;
-    const float p0=1.0f;
-    const float g=0.1f;
-    const float lr=0.01f;
-    const float eps=1e-10f;
-
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,p0,g);
-    net.InitializeAdaGrad(lr,eps,0.0f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
+    net.InitializeAdaGrad(g_caif_opt_test_lr,g_caif_opt_test_adagrad_eps,0.0f);
     net.OptimizerStep();
     net.OptimizerStep();
 
     const std::vector<float> got=ReadTensor(net.Layer(0).ParameterTensor(0));
-    const float p1=p0-lr*g/(std::sqrt(g*g)+eps);
-    const float expected=p1-lr*g/(std::sqrt(2.0f*g*g)+eps);
-    ReportResult("Optimizer::AdaGrad::AccumGrows",AllClose(got,expected,1e-4f));
+    const float g_sq=g_caif_opt_test_grad*g_caif_opt_test_grad;
+    const float denom1=std::sqrt(g_sq)+g_caif_opt_test_adagrad_eps;
+    const float p1=g_caif_opt_test_p0-g_caif_opt_test_lr*g_caif_opt_test_grad/denom1;
+    const float denom2=std::sqrt(2.0f*g_sq)+g_caif_opt_test_adagrad_eps;
+    const float expected=p1-g_caif_opt_test_lr*g_caif_opt_test_grad/denom2;
+    CAIF_TestHarness::Report("Optimizer::AdaGrad::AccumGrows",
+                             AllClose(got,expected,g_caif_opt_test_tol_loose));
   }
   CAIF_TEST_CATCH_BLOCK("Optimizer::AdaGrad::AccumGrows")
 }
@@ -341,13 +374,13 @@ void TestAdaGradAccumGrows()
 //------------------------------------------------------------------------------
 // Negative case: calling OptimizerStep before any Initialize* must throw.
 //------------------------------------------------------------------------------
-void TestStepBeforeInitThrows()
+void CAIF_OptimizerTests::TestStepBeforeInitThrows()
 {
   bool threw=false;
   try
   {
     CAIF_CudaStream stream;
-    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,1.0f,0.1f);
+    CAIF_DeviceNetwork net=BuildOneLayerNet(stream,g_caif_opt_test_p0,g_caif_opt_test_grad);
     net.OptimizerStep();
   }
   catch(const ISE_Exception &)
@@ -358,18 +391,13 @@ void TestStepBeforeInitThrows()
   {
     threw=false;
   }
-  ReportResult("Optimizer::StepBeforeInitThrows",threw);
+  CAIF_TestHarness::Report("Optimizer::StepBeforeInitThrows",threw);
 }
 
-#endif// USE_CAIF_CUDA
-
-}// anon namespace
-
-int main()
+void CAIF_OptimizerTests::RunAll()
 {
-#ifdef USE_CAIF_CUDA
-  std::cout<<"=== CAIF Optimizer Tests ==="<<std::endl;
-  std::cout<<""<<std::endl;
+  ISE_Out::Out()<<"=== CAIF Optimizer Tests ==="
+                <<"\n\n";
   TestSgdSingleStep();
   TestSgdWeightDecay();
   TestMomentumSingleStep();
@@ -378,9 +406,20 @@ int main()
   TestAdaGradSingleStep();
   TestAdaGradAccumGrows();
   TestStepBeforeInitThrows();
-  return CAIF_TestHarness::FinalExitCode();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_OptimizerTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 #else
-  std::cout<<"Skipped (USE_CAIF_CUDA not defined)"<<std::endl;
+  ISE_Out::Out()<<"Skipped (USE_CAIF_CUDA not defined)"
+                <<"\n";
   return 0;
 #endif
 }

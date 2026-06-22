@@ -103,7 +103,11 @@ CAIF_DeviceContext &CAIF_DeviceContext::Instance()
 
 void CAIF_DeviceContext::Initialize()
 {
-  if(_initialized==true)
+  // NOTE: this body touches `_cublas_handle` / `_cublaslt_handle` /
+  // `_cudnn_handle` / `_cublaslt_workspace` directly, never via their
+  // accessors — those accessors lazily call Initialize() and would
+  // re-enter. See the member-declaration comment in caif_device_context.h.
+  if(IsInitialized()==true)
   {
     return;
   }
@@ -122,11 +126,11 @@ void CAIF_DeviceContext::Initialize()
   }
 
   // Set device
-  if(_device_id>=device_count)
+  if(DeviceId()>=device_count)
   {
-    _device_id=0;
+    SetDeviceId(0);
   }
-  cudaError_t set_status=cudaSetDevice(_device_id);
+  cudaError_t set_status=cudaSetDevice(DeviceId());
   if(set_status!=cudaSuccess)
   {
     THROW_CAIFE("cudaSetDevice failed");
@@ -160,7 +164,7 @@ void CAIF_DeviceContext::Initialize()
   if(cublaslt_status!=CUBLAS_STATUS_SUCCESS)
   {
     cublasDestroy(_cublas_handle);
-    _cublas_handle=nullptr;
+    SetCublasHandle(nullptr);
     THROW_CAIFE("Failed to create cublasLt handle");
   }
 
@@ -170,25 +174,25 @@ void CAIF_DeviceContext::Initialize()
   if(meminfo_status!=cudaSuccess)
   {
     cublasLtDestroy(_cublaslt_handle);
-    _cublaslt_handle=nullptr;
+    SetCublasLtHandle(nullptr);
     cublasDestroy(_cublas_handle);
-    _cublas_handle=nullptr;
+    SetCublasHandle(nullptr);
     THROW_CAIFE("cudaMemGetInfo failed");
   }
-  CAIF_DeviceProperties &props=CAIF_DeviceProperties::ForDevice(_device_id);
+  CAIF_DeviceProperties &props=CAIF_DeviceProperties::ForDevice(DeviceId());
   bool ws_is_override=false;
-  _cublaslt_workspace_size=ResolveCublasLtWorkspaceSize(
+  SetCublasLtWorkspaceSize(ResolveCublasLtWorkspaceSize(
                                     props.ComputeCapabilityMajor(),
                                     props.ComputeCapabilityMinor(),
                                     free_vram,
-                                    ws_is_override);
-  cudaError_t ws_status=cudaMalloc(&_cublaslt_workspace,_cublaslt_workspace_size);
+                                    ws_is_override));
+  cudaError_t ws_status=cudaMalloc(&_cublaslt_workspace,CublasLtWorkspaceSize());
   if(ws_status!=cudaSuccess)
   {
     cublasLtDestroy(_cublaslt_handle);
-    _cublaslt_handle=nullptr;
+    SetCublasLtHandle(nullptr);
     cublasDestroy(_cublas_handle);
-    _cublas_handle=nullptr;
+    SetCublasHandle(nullptr);
     THROW_CAIFE("Failed to allocate cublasLt workspace");
   }
   const char *basis_label="auto";
@@ -196,7 +200,7 @@ void CAIF_DeviceContext::Initialize()
   {
     basis_label="override";
   }
-  const double workspace_megabytes=static_cast<double>(_cublaslt_workspace_size)/
+  const double workspace_megabytes=static_cast<double>(CublasLtWorkspaceSize())/
                                    g_caif_bytes_per_megabyte_d;
   std::fprintf(stderr,
                "[CAIF] cuBLAS-Lt workspace: %.2f MB (%s, sm_%d%d)\n",
@@ -210,15 +214,15 @@ void CAIF_DeviceContext::Initialize()
   if(cudnn_status!=CUDNN_STATUS_SUCCESS)
   {
     cudaFree(_cublaslt_workspace);
-    _cublaslt_workspace=nullptr;
+    SetCublasLtWorkspace(nullptr);
     cublasLtDestroy(_cublaslt_handle);
-    _cublaslt_handle=nullptr;
+    SetCublasLtHandle(nullptr);
     cublasDestroy(_cublas_handle);
-    _cublas_handle=nullptr;
+    SetCublasHandle(nullptr);
     THROW_CAIFE("Failed to create cuDNN handle");
   }
 
-  _initialized=true;
+  SetInitialized(true);
 #else
   THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif
@@ -226,32 +230,34 @@ void CAIF_DeviceContext::Initialize()
 
 void CAIF_DeviceContext::Cleanup()
 {
+  // Direct member access only — same lazy-accessor re-entrancy hazard as
+  // Initialize(). See the member-declaration comment in caif_device_context.h.
 #ifdef USE_CAIF_CUDA
-  if(_initialized==true)
+  if(IsInitialized()==true)
   {
     if(_cudnn_handle!=nullptr)
     {
       cudnnDestroy(_cudnn_handle);
-      _cudnn_handle=nullptr;
+      SetCudnnHandle(nullptr);
     }
     if(_cublaslt_workspace!=nullptr)
     {
       cudaFree(_cublaslt_workspace);
-      _cublaslt_workspace=nullptr;
-      _cublaslt_workspace_size=0;
+      SetCublasLtWorkspace(nullptr);
+      SetCublasLtWorkspaceSize(0);
     }
     if(_cublaslt_handle!=nullptr)
     {
       cublasLtDestroy(_cublaslt_handle);
-      _cublaslt_handle=nullptr;
+      SetCublasLtHandle(nullptr);
     }
     if(_cublas_handle!=nullptr)
     {
       cublasDestroy(_cublas_handle);
-      _cublas_handle=nullptr;
+      SetCublasHandle(nullptr);
     }
-    _last_cublas_stream=nullptr;
-    _initialized=false;
+    SetLastCublasStream(nullptr);
+    SetInitialized(false);
   }
 #endif
 }
@@ -259,7 +265,7 @@ void CAIF_DeviceContext::Cleanup()
 #ifdef USE_CAIF_CUDA
 cublasHandle_t CAIF_DeviceContext::CublasHandle()
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
@@ -268,7 +274,7 @@ cublasHandle_t CAIF_DeviceContext::CublasHandle()
 
 cudnnHandle_t CAIF_DeviceContext::CudnnHandle()
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
@@ -277,7 +283,7 @@ cudnnHandle_t CAIF_DeviceContext::CudnnHandle()
 
 cublasLtHandle_t CAIF_DeviceContext::CublasLtHandle()
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
@@ -286,7 +292,7 @@ cublasLtHandle_t CAIF_DeviceContext::CublasLtHandle()
 
 void *CAIF_DeviceContext::CublasLtWorkspace()
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
@@ -300,15 +306,15 @@ size_t CAIF_DeviceContext::CublasLtWorkspaceSize()const
 
 void CAIF_DeviceContext::SetCublasStream(cudaStream_t stream)
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
-  if(stream==_last_cublas_stream)
+  if(stream==LastCublasStream())
   {
     return;
   }
-  cublasStatus_t status=cublasSetStream(_cublas_handle,stream);
+  cublasStatus_t status=cublasSetStream(CublasHandle(),stream);
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("Failed to set cuBLAS stream");
@@ -318,11 +324,11 @@ void CAIF_DeviceContext::SetCublasStream(cudaStream_t stream)
 
 void CAIF_DeviceContext::SetCudnnStream(cudaStream_t stream)
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
-  cudnnStatus_t status=cudnnSetStream(_cudnn_handle,stream);
+  cudnnStatus_t status=cudnnSetStream(CudnnHandle(),stream);
   if(status!=CUDNN_STATUS_SUCCESS)
   {
     THROW_CAIFE("Failed to set cuDNN stream");
@@ -332,11 +338,11 @@ void CAIF_DeviceContext::SetCudnnStream(cudaStream_t stream)
 
 CAIF_DeviceProperties &CAIF_DeviceContext::DeviceProperties()
 {
-  if(_initialized==false)
+  if(IsInitialized()==false)
   {
     Initialize();
   }
-  return CAIF_DeviceProperties::ForDevice(_device_id);
+  return CAIF_DeviceProperties::ForDevice(DeviceId());
 }
 
 }//end instance namespace

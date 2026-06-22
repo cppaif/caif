@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "caif_device_geglu_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_exception.h"
 
 namespace instance
@@ -31,7 +31,7 @@ void CAIF_DeviceGeGLUActivation<ComputeT,StorageT>::Forward(
     {
       THROW_CAIFE("CAIF_DeviceGeGLUActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(gate_input.TotalElements());
+    const int64_t n=static_cast<int64_t>(gate_input.TotalElements());
     launch_gated_activation_forward<StorageT>(gate_input.template DevicePtr<StorageT>(),
                                                up_input.template DevicePtr<StorageT>(),
                                                output.template DevicePtr<StorageT>(),
@@ -56,7 +56,7 @@ void CAIF_DeviceGeGLUActivation<ComputeT,StorageT>::Backward(
     {
       THROW_CAIFE("CAIF_DeviceGeGLUActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
     launch_gated_activation_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
                                                 cached_gate_input.template DevicePtr<StorageT>(),
                                                 cached_up_input.template DevicePtr<StorageT>(),

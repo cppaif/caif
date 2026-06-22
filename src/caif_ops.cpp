@@ -34,7 +34,7 @@ namespace instance
 void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,
                          const CAIF_DeviceTensor &b,
                          const CAIF_DeviceTensor &c,
-                         const char *op_name)
+                         const std::string &op_name)
 {
   try
   {
@@ -49,7 +49,7 @@ void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,
 
 void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,
                          const CAIF_DeviceTensor &b,
-                         const char *op_name)
+                         const std::string &op_name)
 {
   try
   {
@@ -62,21 +62,26 @@ void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,
   CAIF_CATCH_BLOCK();
 }
 
-void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,const char *op_name)
+void CAIF_Ops::RequireSameLocation(const CAIF_DeviceTensor &a,const std::string &op_name)
 {
   (void)a;
   (void)op_name;
 }
 
-//------------------------------------------------------------------------------
-// Dispatch helper: true iff a lives on the host backend.
-//------------------------------------------------------------------------------
-
-bool IsHost(const CAIF_DeviceTensor &t)
+void CAIF_Ops::RequireMatchingDtype(const CAIF_DeviceTensor &a,
+                                    const CAIF_DeviceTensor &b,
+                                    const CAIF_DeviceTensor &out,
+                                    const std::string &op)
 {
-  return t.Location()==CAIF_DeviceTensor::Location_e::Host_e;
+  try
+  {
+    if(a.Dtype()!=b.Dtype() || a.Dtype()!=out.Dtype())
+    {
+      THROW_CAIFE("CAIF_Ops::"+op+": matmul inputs and output must share a dtype");
+    }
+  }
+  CAIF_CATCH_BLOCK();
 }
-
 
 //------------------------------------------------------------------------------
 // Matrix operations
@@ -273,6 +278,24 @@ void CAIF_Ops::Scale(CAIF_DeviceTensor &tensor,float scale)
     else
     {
       ScaleDevice(tensor,scale);
+    }
+  }
+  CAIF_CATCH_BLOCK();
+}
+
+void CAIF_Ops::UnscaleCheckInf(CAIF_DeviceTensor &grad,
+                               float inv_scale,
+                               CAIF_DeviceTensor &found_inf)
+{
+  try
+  {
+    if(IsHost(grad)==true)
+    {
+      UnscaleCheckInfHost(grad,inv_scale,found_inf);
+    }
+    else
+    {
+      UnscaleCheckInfDevice(grad,inv_scale,found_inf);
     }
   }
   CAIF_CATCH_BLOCK();
@@ -823,18 +846,20 @@ void CAIF_Ops::ELU(const CAIF_DeviceTensor &input,
   CAIF_CATCH_BLOCK();
 }
 
-void CAIF_Ops::GELU(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)
+void CAIF_Ops::GELU(const CAIF_DeviceTensor &input,
+                    CAIF_DeviceTensor &output,
+                    const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
   try
   {
     RequireSameLocation(input,output,"GELU");
     if(IsHost(input)==true)
     {
-      GELUHost(input,output);
+      GELUHost(input,output,approx);
     }
     else
     {
-      GELUDevice(input,output);
+      GELUDevice(input,output,approx);
     }
   }
   CAIF_CATCH_BLOCK();
@@ -980,19 +1005,20 @@ void CAIF_Ops::ELUBackward(const CAIF_DeviceTensor &grad_output,
 }
 
 void CAIF_Ops::GELUBackward(const CAIF_DeviceTensor &grad_output,
-                  const CAIF_DeviceTensor &input,
-                  CAIF_DeviceTensor &grad_input)
+                            const CAIF_DeviceTensor &input,
+                            CAIF_DeviceTensor &grad_input,
+                            const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
   try
   {
     RequireSameLocation(grad_output,input,grad_input,"GELUBackward");
     if(IsHost(grad_output)==true)
     {
-      GELUBackwardHost(grad_output,input,grad_input);
+      GELUBackwardHost(grad_output,input,grad_input,approx);
     }
     else
     {
-      GELUBackwardDevice(grad_output,input,grad_input);
+      GELUBackwardDevice(grad_output,input,grad_input,approx);
     }
   }
   CAIF_CATCH_BLOCK();

@@ -18,177 +18,212 @@
 #include "caif_device_multi_head_attention.h"
 #include "caif_device_token_embedding.h"
 #include "caif_device_linear_head.h"
+#include "caif_device_layer_typed.h"
 #include "caif_exception.h"
 
 namespace instance
 {
 
-std::unique_ptr<CAIF_DevicePreNormBlock<float,float>>
-  CAIF_MoEComposer::BuildMoEBlock(const BlockConfig_t &cfg,CAIF_CudaStream &stream)
+template<typename ComputeT,typename StorageT>
+std::unique_ptr<CAIF_DevicePreNormBlock<ComputeT,StorageT>> CAIF_MoEComposer::BuildMoEBlockImpl(
+                                                                           const CAIF_MoEComposerBlockConfig &cfg,
+                                                                           CAIF_CudaStream &stream)
 {
   try
   {
-    if(cfg.dim==0)
+    if(cfg.Dim()==0)
     {
       THROW_CAIFE("MoEComposer: block dim must be > 0");
     }
-    if(cfg.num_heads==0)
+    if(cfg.NumHeads()==0)
     {
       THROW_CAIFE("MoEComposer: num_heads must be > 0");
     }
-    if(cfg.num_kv_heads==0)
+    if(cfg.NumKvHeads()==0)
     {
       THROW_CAIFE("MoEComposer: num_kv_heads must be > 0");
     }
-    if(cfg.dim%cfg.num_heads!=0)
+    if(cfg.Dim()%cfg.NumHeads()!=0)
     {
       THROW_CAIFE("MoEComposer: dim must be divisible by num_heads");
     }
-    if(cfg.moe_num_experts==0)
+    if(cfg.MoeNumExperts()==0)
     {
       THROW_CAIFE("MoEComposer: moe_num_experts must be > 0");
     }
-    if(cfg.moe_top_k==0||cfg.moe_top_k>cfg.moe_num_experts)
+    if(cfg.MoeTopK()==0||cfg.MoeTopK()>cfg.MoeNumExperts())
     {
       THROW_CAIFE("MoEComposer: moe_top_k must be > 0 and <= moe_num_experts");
     }
-    if(cfg.moe_input_dim!=cfg.dim)
+    if(cfg.MoeInputDim()!=cfg.Dim())
     {
       THROW_CAIFE("MoEComposer: moe_input_dim must equal block dim");
     }
 
-    auto norm1=CAIF_DeviceRMSNormFactory::Create(cfg.dim,
+    auto norm1=CAIF_DeviceRMSNormFactory::Create(cfg.Dim(),
                                                  stream,
-                                                 CAIF_DataType::CAIF_DataType_e::Float32,
-                                                 CAIF_DataType::CAIF_DataType_e::Float32,
-                                                 cfg.norm_eps);
+                                                 CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype(),
+                                                 CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype(),
+                                                 cfg.NormEps());
 
-    CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t attn_cfg;
-    attn_cfg.dim          =cfg.dim;
-    attn_cfg.num_heads    =cfg.num_heads;
-    attn_cfg.num_kv_heads =cfg.num_kv_heads;
-    attn_cfg.head_dim     =cfg.dim/cfg.num_heads;
-    attn_cfg.causal       =cfg.causal;
-    attn_cfg.use_rope     =cfg.use_rope;
-    attn_cfg.rope_base    =cfg.rope_base;
-    attn_cfg.rope_style   =cfg.rope_style;
-    attn_cfg.dropout_rate =cfg.attention_dropout;
-    auto attn=std::make_unique<CAIF_DeviceMultiHeadAttention<float,float>>(attn_cfg,stream);
+    CAIF_DeviceMultiHeadAttentionConfig attn_cfg(cfg.Dim(),
+                                                 cfg.NumHeads(),
+                                                 cfg.NumKvHeads(),
+                                                 cfg.Dim()/cfg.NumHeads(),
+                                                 cfg.Causal(),
+                                                 cfg.UseRope(),
+                                                 cfg.RopeBase(),
+                                                 cfg.AttentionDropout());
+    attn_cfg.SetRopeStyle(cfg.RopeStyle());
+    auto attn=std::make_unique<CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>>(attn_cfg,stream);
 
-    auto norm2=CAIF_DeviceRMSNormFactory::Create(cfg.dim,
+    auto norm2=CAIF_DeviceRMSNormFactory::Create(cfg.Dim(),
                                                  stream,
-                                                 CAIF_DataType::CAIF_DataType_e::Float32,
-                                                 CAIF_DataType::CAIF_DataType_e::Float32,
-                                                 cfg.norm_eps);
+                                                 CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype(),
+                                                 CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype(),
+                                                 cfg.NormEps());
 
-    auto moe=std::make_unique<CAIF_DeviceMoELayer<float,float>>(cfg.moe_input_dim,
-                                                   cfg.moe_hidden_dim,
-                                                   cfg.moe_num_experts,
-                                                   cfg.moe_top_k,
-                                                   cfg.moe_expert_use_gated,
-                                                   cfg.moe_expert_use_bias,
-                                                   cfg.moe_num_shared_experts,
-                                                   cfg.moe_shared_hidden_dim,
-                                                   cfg.moe_router_use_bias,
-                                                   cfg.moe_router_noise_std,
-                                                   cfg.moe_capacity_factor,
-                                                   cfg.moe_overflow_strategy,
-                                                   cfg.moe_balance_loss_weight,
-                                                   cfg.moe_z_loss_weight,
-                                                   stream);
+    auto moe=std::make_unique<CAIF_DeviceMoELayer<ComputeT,StorageT>>(cfg.MoeInputDim(),
+                                                                      cfg.MoeHiddenDim(),
+                                                                      cfg.MoeNumExperts(),
+                                                                      cfg.MoeTopK(),
+                                                                      cfg.MoeExpertUseGated(),
+                                                                      cfg.MoeExpertUseBias(),
+                                                                      cfg.MoeNumSharedExperts(),
+                                                                      cfg.MoeSharedHiddenDim(),
+                                                                      cfg.MoeRouterUseBias(),
+                                                                      cfg.MoeRouterNoiseStd(),
+                                                                      cfg.MoeCapacityFactor(),
+                                                                      cfg.MoeOverflowStrategy(),
+                                                                      cfg.MoeBalanceLossWeight(),
+                                                                      cfg.MoeZLossWeight(),
+                                                                      stream);
 
-    CAIF_DevicePreNormBlock<float,float>::SubLayerVec_t sublayers;
+    typename CAIF_DevicePreNormBlock<ComputeT,StorageT>::SubLayerVec_t sublayers;
     sublayers.reserve(2);
 
-    CAIF_DevicePreNormBlock<float,float>::SubLayer_t sl_attn;
-    sl_attn.norm_prefix =cfg.norm1_prefix;
-    sl_attn.layer_prefix=cfg.attn_prefix;
+    typename CAIF_DevicePreNormBlock<ComputeT,StorageT>::SubLayer_t sl_attn;
+    sl_attn.norm_prefix =cfg.Norm1Prefix();
+    sl_attn.layer_prefix=cfg.AttnPrefix();
     sl_attn.norm =std::move(norm1);
     sl_attn.layer=std::move(attn);
     sublayers.push_back(std::move(sl_attn));
 
-    CAIF_DevicePreNormBlock<float,float>::SubLayer_t sl_moe;
-    sl_moe.norm_prefix =cfg.norm2_prefix;
-    sl_moe.layer_prefix=cfg.moe_prefix;
+    typename CAIF_DevicePreNormBlock<ComputeT,StorageT>::SubLayer_t sl_moe;
+    sl_moe.norm_prefix =cfg.Norm2Prefix();
+    sl_moe.layer_prefix=cfg.MoePrefix();
     sl_moe.norm =std::move(norm2);
     sl_moe.layer=std::move(moe);
     sublayers.push_back(std::move(sl_moe));
 
-    return std::make_unique<CAIF_DevicePreNormBlock<float,float>>(std::move(sublayers),stream);
+    return std::make_unique<CAIF_DevicePreNormBlock<ComputeT,StorageT>>(std::move(sublayers),stream);
   }
   CAIF_CATCH_BLOCK()
   return nullptr;
 }
 
-std::unique_ptr<CAIF_DeviceNetwork>
-  CAIF_MoEComposer::BuildModel(const ModelConfig_t &cfg,CAIF_CudaStream &stream)
+std::unique_ptr<CAIF_DevicePreNormBlock<float,float>> CAIF_MoEComposer::BuildMoEBlock(
+                                                                           const CAIF_MoEComposerBlockConfig &cfg,
+                                                                           CAIF_CudaStream &stream)
+{
+  return BuildMoEBlockImpl<float,float>(cfg,stream);
+}
+
+template<typename ComputeT,typename StorageT>
+std::unique_ptr<CAIF_DeviceNetwork> CAIF_MoEComposer::BuildModelImpl(const CAIF_MoEComposerModelConfig &cfg,
+                                                                     CAIF_CudaStream &stream)
 {
   try
   {
-    if(cfg.vocab_size==0)
+    if(cfg.VocabSize()==0)
     {
       THROW_CAIFE("MoEComposer: vocab_size must be > 0");
     }
-    if(cfg.num_layers==0)
+    if(cfg.NumLayers()==0)
     {
       THROW_CAIFE("MoEComposer: num_layers must be > 0");
     }
-    if(cfg.block_template.dim==0)
+    if(cfg.BlockTemplate().Dim()==0)
     {
       THROW_CAIFE("MoEComposer: block_template.dim must be > 0");
     }
 
     auto network=std::make_unique<CAIF_DeviceNetwork>(stream);
 
-    const uint32_t dim=cfg.block_template.dim;
-    uint32_t output_dim=cfg.output_dim;
-    if(output_dim==0) output_dim=cfg.vocab_size;
+    const uint32_t dim=cfg.BlockTemplate().Dim();
+    uint32_t output_dim=cfg.OutputDim();
+    if(output_dim==0) output_dim=cfg.VocabSize();
 
-    // TODO: paths in this composer still pin to <float, float> until
-    // the embedding/head/positional layers all migrate. Replace with
-    // the dtype-bearing factory once the rest of the model is templated.
-    CAIF_DeviceTokenEmbedding<float,float>::Config_t emb_cfg{cfg.vocab_size,dim};
-    auto embedding=std::make_unique<CAIF_DeviceTokenEmbedding<float,float>>(emb_cfg,stream);
-    CAIF_DeviceTokenEmbedding<float,float> *embedding_raw=embedding.get();
+    // Embedding / positional / head are built at <ComputeT, StorageT> so the
+    // whole model (including a bf16 DSv2-Lite) assembles at the config dtype;
+    // the public BuildModel below dispatches to the concrete instantiation.
+    CAIF_DeviceTokenEmbeddingConfig emb_cfg{cfg.VocabSize(),dim};
+    auto embedding=std::make_unique<CAIF_DeviceTokenEmbedding<ComputeT,StorageT>>(emb_cfg,stream);
+    CAIF_DeviceTokenEmbedding<ComputeT,StorageT> *embedding_raw=embedding.get();
     network->AddLayer(std::move(embedding));
 
-    if(cfg.block_template.use_rope==false&&cfg.pe_mode!=PositionalEncodingMode_e::None)
+    if(cfg.BlockTemplate().UseRope()==false&&
+       cfg.PeMode()!=CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::None)
     {
-      CAIF_DevicePositionalEncoding<float,float>::Config_t pe_cfg{cfg.max_seq_len,
-                                                                  dim,
-                                                                  cfg.pe_mode};
-      network->AddLayer(std::make_unique<CAIF_DevicePositionalEncoding<float,float>>(pe_cfg,
-                                                                                      stream));
+      CAIF_DevicePositionalEncodingConfig pe_cfg{cfg.MaxSeqLen(),dim,cfg.PeMode()};
+      network->AddLayer(std::make_unique<CAIF_DevicePositionalEncoding<ComputeT,StorageT>>(pe_cfg,
+                                                                                           stream));
     }
 
-    BlockConfig_t block_cfg=cfg.block_template;
-    for(uint32_t i=0;i<cfg.num_layers;++i)
+    CAIF_MoEComposerBlockConfig block_cfg=cfg.BlockTemplate();
+    for(uint32_t i=0;i<cfg.NumLayers();++i)
     {
-      network->AddLayer(BuildMoEBlock(block_cfg,stream));
+      network->AddLayer(BuildMoEBlockImpl<ComputeT,StorageT>(block_cfg,stream));
     }
 
     network->AddLayer(CAIF_DeviceRMSNormFactory::Create(dim,
                                                         stream,
-                                                        CAIF_DataType::CAIF_DataType_e::Float32,
-                                                        CAIF_DataType::CAIF_DataType_e::Float32,
-                                                        cfg.final_norm_eps));
+                                                        CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype(),
+                                                        CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype(),
+                                                        cfg.FinalNormEps()));
 
-    CAIF_DeviceLinearHead<float,float>::Config_t head_cfg{dim,
-                                             output_dim,
-                                             false};
-    if(cfg.tie_weights==true)
+    CAIF_DeviceLinearHeadConfig head_cfg{dim,output_dim,false};
+    if(cfg.TieWeights()==true)
     {
-      network->AddLayer(std::make_unique<CAIF_DeviceLinearHead<float,float>>(head_cfg,
-                                                                embedding_raw->ParameterTensor(0),
-                                                                embedding_raw->GradientTensor(0),
-                                                                stream));
+      network->AddLayer(std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(
+                                                                      head_cfg,
+                                                                      embedding_raw->ParameterTensor(0),
+                                                                      embedding_raw->GradientTensor(0),
+                                                                      stream));
     }
     else
     {
-      network->AddLayer(std::make_unique<CAIF_DeviceLinearHead<float,float>>(head_cfg,stream));
+      network->AddLayer(std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(head_cfg,stream));
     }
 
     return network;
+  }
+  CAIF_CATCH_BLOCK()
+  return nullptr;
+}
+
+std::unique_ptr<CAIF_DeviceNetwork> CAIF_MoEComposer::BuildModel(const CAIF_MoEComposerModelConfig &cfg,
+                                                                 CAIF_CudaStream &stream)
+{
+  try
+  {
+    const CAIF_DataType::CAIF_DataType_e cd=cfg.ComputeDtype();
+    const CAIF_DataType::CAIF_DataType_e sd=cfg.StorageDtype();
+    if(cd==CAIF_DataType::CAIF_DataType_e::Float32&&sd==CAIF_DataType::CAIF_DataType_e::Float32)
+    {
+      return BuildModelImpl<float,float>(cfg,stream);
+    }
+#ifdef USE_CAIF_CUDA
+    if(cd==CAIF_DataType::CAIF_DataType_e::Float32&&sd==CAIF_DataType::CAIF_DataType_e::Float16)
+    {
+      return BuildModelImpl<float,__half>(cfg,stream);
+    }
+    if(cd==CAIF_DataType::CAIF_DataType_e::Float32&&sd==CAIF_DataType::CAIF_DataType_e::BFloat16)
+    {
+      return BuildModelImpl<float,__nv_bfloat16>(cfg,stream);
+    }
+#endif
+    THROW_CAIFE("MoEComposer: BuildModel supports compute=fp32 with storage in {fp32,fp16,bf16}");
   }
   CAIF_CATCH_BLOCK()
   return nullptr;

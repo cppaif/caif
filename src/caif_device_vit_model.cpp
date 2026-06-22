@@ -19,7 +19,9 @@
 #include "caif_device_vit_model.h"
 #include "caif_ops.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
 
 #include <cstring>
 #include <cmath>
@@ -28,7 +30,7 @@ namespace instance
 {
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(const Config_t &config,
+CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(const CAIF_DeviceViTModelConfig &config,
                                                              CAIF_CudaStream &stream):
                                                              CAIF_DeviceContainer(stream),
                                                              _config(config),
@@ -38,70 +40,65 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(const Config_t &conf
   try
   {
     // Validate config
-    if(config.image_height%config.patch_size!=0)
+    if(config.ImageHeight()%config.PatchSize()!=0)
     {
       THROW_CAIFE("DeviceViTModel: image_height must be divisible by patch_size");
     }
-    if(config.image_width%config.patch_size!=0)
+    if(config.ImageWidth()%config.PatchSize()!=0)
     {
       THROW_CAIFE("DeviceViTModel: image_width must be divisible by patch_size");
     }
-    if(config.dim==0||config.num_layers==0||config.num_heads==0)
+    if(config.Dim()==0||config.NumLayers()==0||config.NumHeads()==0)
     {
       THROW_CAIFE("DeviceViTModel: dim, num_layers, num_heads must be > 0");
     }
-    if(config.dim%config.num_heads!=0)
+    if(config.Dim()%config.NumHeads()!=0)
     {
       THROW_CAIFE("DeviceViTModel: dim must be divisible by num_heads");
     }
 
     // [0] Patch embedding (with CLS token)
-    typename CAIF_DevicePatchEmbedding<ComputeT,StorageT>::Config_t patch_config;
-    patch_config.image_height=config.image_height;
-    patch_config.image_width=config.image_width;
-    patch_config.channels=config.channels;
-    patch_config.patch_size=config.patch_size;
-    patch_config.dim=config.dim;
-    patch_config.use_cls_token=true;
+    CAIF_DevicePatchEmbeddingConfig patch_config(config.ImageHeight(),
+                                                 config.ImageWidth(),
+                                                 config.Channels(),
+                                                 config.PatchSize(),
+                                                 config.Dim(),
+                                                 true);
     AddLayer(std::make_unique<CAIF_DevicePatchEmbedding<ComputeT,StorageT>>(patch_config,stream));
 
     // [1] Positional encoding — ViT uses learnable position embeddings
-    const uint32_t num_patches_h=config.image_height/config.patch_size;
-    const uint32_t num_patches_w=config.image_width/config.patch_size;
+    const uint32_t num_patches_h=config.ImageHeight()/config.PatchSize();
+    const uint32_t num_patches_w=config.ImageWidth()/config.PatchSize();
     const uint32_t seq_len=num_patches_h*num_patches_w+1;  // +1 for CLS
 
-    typename CAIF_DevicePositionalEncoding<ComputeT,StorageT>::Config_t pe_config;
-    pe_config.max_seq_len=seq_len;
-    pe_config.dim=config.dim;
-    pe_config.mode=PositionalEncodingMode_e::Learned;
+    CAIF_DevicePositionalEncodingConfig pe_config(
+      seq_len,
+      config.Dim(),
+      CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned);
     AddLayer(std::make_unique<CAIF_DevicePositionalEncoding<ComputeT,StorageT>>(pe_config,stream));
 
     // [2 .. 1+N] Transformer blocks
-    for(uint32_t i=0;i<config.num_layers;++i)
+    for(uint32_t i=0;i<config.NumLayers();++i)
     {
-      typename CAIF_DeviceTransformerBlock<ComputeT,StorageT>::TransformerBlockConfig_t block_config;
-      block_config.dim=config.dim;
-      block_config.num_heads=config.num_heads;
-      block_config.num_kv_heads=config.num_heads;  // Standard MHA for ViT
-      block_config.ffn_dim=config.ffn_hidden_dim;
-      block_config.causal=false;  // ViT is bidirectional
-      block_config.use_rope=config.use_rope;
-      block_config.rope_base=config.rope_base;
-      block_config.rope_style=config.rope_style;
-      block_config.dropout_rate=config.dropout_rate;
+      CAIF_DeviceTransformerBlockConfig block_config(config.Dim(),
+                                                     config.NumHeads(),
+                                                     config.NumHeads(),
+                                                     config.FfnHiddenDim(),
+                                                     config.DropoutRate(),
+                                                     false,
+                                                     config.UseRope(),
+                                                     config.RopeBase());
+      block_config.SetRopeStyle(config.RopeStyle());
       AddLayer(std::make_unique<CAIF_DeviceTransformerBlock<ComputeT,StorageT>>(block_config,stream));
     }
 
     // [2+N] Final layer norm
-    AddLayer(std::make_unique<CAIF_DeviceLayerNorm<ComputeT,StorageT>>(config.dim,
+    AddLayer(std::make_unique<CAIF_DeviceLayerNorm<ComputeT,StorageT>>(config.Dim(),
                                                                         stream,
                                                                         g_caif_vit_layernorm_eps));
 
     // [3+N] Classification head (CLS token -> num_classes)
-    typename CAIF_DeviceLinearHead<ComputeT,StorageT>::Config_t head_config;
-    head_config.input_dim=config.dim;
-    head_config.output_dim=config.num_classes;
-    head_config.use_bias=true;
+    CAIF_DeviceLinearHeadConfig head_config(config.Dim(),config.NumClasses(),true);
     AddLayer(std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(head_config,stream));
   }
   CAIF_CATCH_BLOCK()
@@ -110,9 +107,9 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(const Config_t &conf
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceViTModel<ComputeT,StorageT>::CAIF_DeviceViTModel(CAIF_DeviceViTModel &&other):
                                   CAIF_DeviceContainer(std::move(other)),
-                                  _config(other._config),
-                                  _cached_cls_output(std::move(other._cached_cls_output)),
-                                  _cached_batch(other._cached_batch)
+                                  _config(other.Config()),
+                                  _cached_cls_output(std::move(other.CachedClsOutputMutable())),
+                                  _cached_batch(other.CachedBatch())
 {
 }
 
@@ -123,9 +120,9 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::operator=(CAIF_DeviceViTModel &&other)
   if(this!=&other)
   {
     CAIF_DeviceContainer::operator=(std::move(other));
-    _config=other._config;
-    _cached_cls_output=std::move(other._cached_cls_output);
-    _cached_batch=other._cached_batch;
+    SetConfig(other.Config());
+    SetCachedClsOutput(std::move(other.CachedClsOutputMutable()));
+    SetCachedBatch(other.CachedBatch());
   }
   return *this;
 }
@@ -143,17 +140,17 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inp
     {
       THROW_CAIFE("DeviceViTModel: input must be 4D [batch, H, W, C]");
     }
-    if(shape[1]!=_config.image_height||shape[2]!=_config.image_width)
+    if(shape[1]!=Config().ImageHeight()||shape[2]!=Config().ImageWidth())
     {
       THROW_CAIFE("DeviceViTModel: input image size mismatch");
     }
-    if(shape[3]!=_config.channels)
+    if(shape[3]!=Config().Channels())
     {
       THROW_CAIFE("DeviceViTModel: input channels mismatch");
     }
 
     const uint32_t batch=shape[0];
-    _cached_batch=batch;
+    SetCachedBatch(batch);
 
     // Step 1: Patch embedding -> [batch, seq_len, dim]
     CAIF_DeviceTensor x=Layer(PatchEmbeddingSlot()).Forward(input,ctx);
@@ -162,7 +159,7 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inp
     x=Layer(PositionalEncodingSlot()).Forward(x,ctx);
 
     // Step 3: Pass through transformer blocks
-    for(uint32_t i=0;i<_config.num_layers;++i)
+    for(uint32_t i=0;i<Config().NumLayers();++i)
     {
       x=Layer(FirstBlockSlot()+i).Forward(x,ctx);
     }
@@ -173,7 +170,7 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inp
     // Step 5: Extract CLS token (position 0) -> [batch, dim]
     constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
     const uint32_t seq_len=SequenceLength();
-    const uint32_t dim=_config.dim;
+    const uint32_t dim=Config().Dim();
 
     CAIF_DeviceTensor cls_output=CAIF_DeviceTensor::Uninitialized({batch,dim},ctx.Stream(),sd);
 
@@ -199,7 +196,7 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inp
 
     if(ctx.Training()==true)
     {
-      _cached_cls_output=cls_output.Clone();
+      SetCachedClsOutput(cls_output.Clone());
     }
 
     // Step 6: Classification head -> [batch, num_classes]
@@ -218,9 +215,9 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gr
   try
   {
     constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
-    const uint32_t batch=_cached_batch;
+    const uint32_t batch=CachedBatch();
     const uint32_t seq_len=SequenceLength();
-    const uint32_t dim=_config.dim;
+    const uint32_t dim=Config().Dim();
 
     // Step 1: Backward through classification head
     CAIF_DeviceTensor grad_cls=Layer(ClassificationHeadSlot()).Backward(grad_output,ctx);
@@ -253,7 +250,7 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gr
     CAIF_DeviceTensor grad_x=Layer(FinalNormSlot()).Backward(grad_seq,ctx);
 
     // Step 4: Backward through transformer blocks (in reverse order)
-    for(int i=static_cast<int>(_config.num_layers)-1;i>=0;--i)
+    for(int i=static_cast<int>(Config().NumLayers())-1;i>=0;--i)
     {
       grad_x=Layer(FirstBlockSlot()+static_cast<size_t>(i)).Backward(grad_x,ctx);
     }
@@ -275,15 +272,31 @@ std::string CAIF_DeviceViTModel<ComputeT,StorageT>::Description()const
   try
   {
     const uint32_t num_patches=NumPatches();
-    return std::string(g_caif_description_vit_prefix)+
-           "(img="+std::to_string(_config.image_height)+"x"+
-           std::to_string(_config.image_width)+
-           ",patch="+std::to_string(_config.patch_size)+
-           ",patches="+std::to_string(num_patches)+
-           ",dim="+std::to_string(_config.dim)+
-           ",layers="+std::to_string(_config.num_layers)+
-           ",heads="+std::to_string(_config.num_heads)+
-           ",classes="+std::to_string(_config.num_classes)+")";
+    return std::string(g_serial_tag_vit)+
+           g_serial_open_paren+
+           g_serial_kv_img+
+           std::to_string(Config().ImageHeight())+
+           g_serial_dim_separator+
+           std::to_string(Config().ImageWidth())+
+           g_serial_comma+
+           g_serial_kv_patch+
+           std::to_string(Config().PatchSize())+
+           g_serial_comma+
+           g_serial_kv_patches+
+           std::to_string(num_patches)+
+           g_serial_comma+
+           g_serial_kv_dim+
+           std::to_string(Config().Dim())+
+           g_serial_comma+
+           g_serial_kv_layers+
+           std::to_string(Config().NumLayers())+
+           g_serial_comma+
+           g_serial_kv_heads+
+           std::to_string(Config().NumHeads())+
+           g_serial_comma+
+           g_serial_kv_classes+
+           std::to_string(Config().NumClasses())+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -297,28 +310,30 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ParameterNames(const std::string &prefix
     std::vector<std::string> names;
     std::vector<std::string> slot_names;
 
+    const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
+
     // Patch embedding
-    slot_names=Layer(PatchEmbeddingSlot()).ParameterNames(prefix+g_caif_name_vit_patch_embeddings);
+    slot_names=Layer(PatchEmbeddingSlot()).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathViTPatchEmbed_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Positional encoding
-    slot_names=Layer(PositionalEncodingSlot()).ParameterNames(prefix+g_caif_name_vit_position_embeddings);
+    slot_names=Layer(PositionalEncodingSlot()).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathEmbedPos_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Transformer blocks
-    for(uint32_t i=0;i<_config.num_layers;++i)
+    for(uint32_t i=0;i<Config().NumLayers();++i)
     {
-      std::string block_prefix=prefix+g_caif_name_vit_encoder_layer+std::to_string(i)+".";
+      std::string block_prefix=prefix+reg.Name(CAIF_ParamRole::Role_e::PathViTBlocks_e)+std::to_string(i)+".";
       slot_names=Layer(FirstBlockSlot()+i).ParameterNames(block_prefix);
       names.insert(names.end(),slot_names.begin(),slot_names.end());
     }
 
     // Final norm
-    slot_names=Layer(FinalNormSlot()).ParameterNames(prefix+g_caif_name_vit_layernorm);
+    slot_names=Layer(FinalNormSlot()).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathFinalNorm_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     // Classification head
-    slot_names=Layer(ClassificationHeadSlot()).ParameterNames(prefix+g_caif_name_vit_classifier);
+    slot_names=Layer(ClassificationHeadSlot()).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathHead_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     return names;
@@ -329,8 +344,8 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::ParameterNames(const std::string &prefix
 template<typename ComputeT,typename StorageT>
 uint32_t CAIF_DeviceViTModel<ComputeT,StorageT>::NumPatches()const
 {
-  const uint32_t num_patches_h=_config.image_height/_config.patch_size;
-  const uint32_t num_patches_w=_config.image_width/_config.patch_size;
+  const uint32_t num_patches_h=Config().ImageHeight()/Config().PatchSize();
+  const uint32_t num_patches_w=Config().ImageWidth()/Config().PatchSize();
   return num_patches_h*num_patches_w;
 }
 
@@ -379,7 +394,7 @@ CAIF_DeviceViTModel<ComputeT,StorageT>::TransformerBlock(size_t index)
 {
   try
   {
-    if(index>=_config.num_layers)
+    if(index>=Config().NumLayers())
     {
       THROW_CAIFE("DeviceViTModel: transformer block index out of range");
     }

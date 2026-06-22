@@ -21,6 +21,7 @@
 
 #include "caif_device_max_pooling2d.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_cudnn_util.h"
 #include "caif_device_context.h"
 #include "caif_exception.h"
@@ -35,9 +36,6 @@
 
 namespace instance
 {
-
-
-constexpr size_t POOLING_INPUT_RANK=4;
 
 #ifdef USE_CAIF_CUDA
 
@@ -335,7 +333,7 @@ CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::CAIF_DeviceMaxPooling2D(const Config
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::CAIF_DeviceMaxPooling2D(CAIF_DeviceMaxPooling2D &&other):
                                 CAIF_DevicePooling2D<ComputeT,StorageT>(std::move(other)),
-                                _cached_max_indices(std::move(other._cached_max_indices))
+                                _cached_max_indices(std::move(other.CachedMaxIndicesMutable()))
 {
 }
 
@@ -348,7 +346,7 @@ CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::operator=(CAIF_DeviceMaxPooling2D &&
     if(this!=&other)
     {
       CAIF_DevicePooling2D<ComputeT,StorageT>::operator=(std::move(other));
-      _cached_max_indices=std::move(other._cached_max_indices);
+      SetCachedMaxIndices(std::move(other.CachedMaxIndicesMutable()));
     }
     return *this;
   }
@@ -365,14 +363,14 @@ CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
   {
     (void)ctx;
     const std::vector<uint32_t> &in_shape=input.Shape();
-    if(in_shape.size()!=POOLING_INPUT_RANK)
+    if(in_shape.size()!=g_caif_pooling_input_rank)
     {
       THROW_CAIFE("CAIF_DeviceMaxPooling2D: expects rank-4 input [N,H,W,C]");
     }
-    const uint32_t pH=Config().pool_height;
-    const uint32_t pW=Config().pool_width;
-    const uint32_t sH=Config().stride_height;
-    const uint32_t sW=Config().stride_width;
+    const uint32_t pH=Config().PoolHeight();
+    const uint32_t pW=Config().PoolWidth();
+    const uint32_t sH=Config().StrideHeight();
+    const uint32_t sW=Config().StrideWidth();
 
     if(input.Location()==CAIF_DeviceTensor::Location_e::Host_e)
     {
@@ -418,10 +416,10 @@ CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
   try
   {
     (void)ctx;
-    const uint32_t pH=Config().pool_height;
-    const uint32_t pW=Config().pool_width;
-    const uint32_t sH=Config().stride_height;
-    const uint32_t sW=Config().stride_width;
+    const uint32_t pH=Config().PoolHeight();
+    const uint32_t pW=Config().PoolWidth();
+    const uint32_t sH=Config().StrideHeight();
+    const uint32_t sW=Config().StrideWidth();
 
     if(grad_output.Location()==CAIF_DeviceTensor::Location_e::Host_e)
     {
@@ -452,7 +450,7 @@ CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceMaxPooling2D<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_max_pooling2d;
+  return g_serial_tag_max_pooling2d;
 }
 
 // Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.

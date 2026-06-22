@@ -15,6 +15,7 @@
 #include "caif_device_pre_norm_block.h"
 #include "caif_ops.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 #include <sstream>
@@ -40,8 +41,8 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::CAIF_DevicePreNormBlock(SubLayerVec_
       THROW_CAIFE("PreNormBlock: must have at least one sub-layer");
     }
 
-    _norm_prefixes.reserve(sub_layers.size());
-    _layer_prefixes.reserve(sub_layers.size());
+    NormPrefixes().reserve(sub_layers.size());
+    LayerPrefixes().reserve(sub_layers.size());
 
     for(size_t i=0;i<sub_layers.size();++i)
     {
@@ -54,8 +55,8 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::CAIF_DevicePreNormBlock(SubLayerVec_
         THROW_CAIFE("PreNormBlock: sub-layer "+std::to_string(i)+" has null layer");
       }
 
-      _norm_prefixes.push_back(std::move(sub_layers[i].norm_prefix));
-      _layer_prefixes.push_back(std::move(sub_layers[i].layer_prefix));
+      NormPrefixes().push_back(std::move(sub_layers[i].norm_prefix));
+      LayerPrefixes().push_back(std::move(sub_layers[i].layer_prefix));
       AddLayer(std::move(sub_layers[i].norm));
       AddLayer(std::move(sub_layers[i].layer));
     }
@@ -83,11 +84,11 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::operator=(CAIF_DevicePreNormBlock &&
   if(this!=&other)
   {
     CAIF_DeviceContainer::operator=(std::move(other));
-    _norm_prefixes=std::move(other._norm_prefixes);
-    _layer_prefixes=std::move(other._layer_prefixes);
-    _norms_trainable=other._norms_trainable;
-    _checkpointed=other._checkpointed;
-    _saved_input=std::move(other._saved_input);
+    SetNormPrefixes(std::move(other.NormPrefixes()));
+    SetLayerPrefixes(std::move(other.LayerPrefixes()));
+    SetNormsTrainable(other.NormsTrainable());
+    SetCheckpointed(other.Checkpointed());
+    SetSavedInput(std::move(other.SavedInput()));
     _offload_scheduler=std::move(other._offload_scheduler);
   }
   return *this;
@@ -124,7 +125,7 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::ForwardLoop(const CAIF_DeviceTensor 
 
       if(HasOffloadScheduler()==true)
       {
-        OffloadSchedulerMut().OnExitForwardStage(i);
+        OffloadSchedulerMut().OnExitForwardStage(i,ctx.Stream());
       }
     }
 
@@ -165,7 +166,7 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::BackwardLoop(const CAIF_DeviceTensor
 
       if(HasOffloadScheduler()==true)
       {
-        OffloadSchedulerMut().OnExitBackwardStage(i);
+        OffloadSchedulerMut().OnExitBackwardStage(i,ctx.Stream());
       }
     }
 
@@ -250,12 +251,14 @@ template<typename ComputeT,typename StorageT>
 std::string CAIF_DevicePreNormBlock<ComputeT,StorageT>::Description()const
 {
   std::ostringstream ss;
-  ss<<g_caif_description_pre_norm_block_prefix
-    <<"(stages="
+  ss<<g_serial_tag_pre_norm_block
+    <<g_serial_open_paren
+    <<g_serial_kv_stages
     <<SubLayerCount()
-    <<",params="
+    <<g_serial_comma
+    <<g_serial_kv_params
     <<TotalParameterCount()
-    <<")";
+    <<g_serial_close_paren;
   return ss.str();
 }
 
@@ -272,10 +275,10 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::ParameterNames(const std::string &pr
       const CAIF_DeviceLayer &norm=Layer(i*g_caif_prenorm_stage_stride+g_caif_prenorm_norm_offset);
       const CAIF_DeviceLayer &sub=Layer(i*g_caif_prenorm_stage_stride+g_caif_prenorm_layer_offset);
 
-      auto norm_names=norm.ParameterNames(prefix+_norm_prefixes[i]);
+      auto norm_names=norm.ParameterNames(prefix+NormPrefixes()[i]);
       names.insert(names.end(),norm_names.begin(),norm_names.end());
 
-      auto layer_names=sub.ParameterNames(prefix+_layer_prefixes[i]);
+      auto layer_names=sub.ParameterNames(prefix+LayerPrefixes()[i]);
       names.insert(names.end(),layer_names.begin(),layer_names.end());
     }
     return names;
@@ -345,10 +348,10 @@ CAIF_DevicePreNormBlock<ComputeT,StorageT>::FrozenTensorNames(const std::string 
       const CAIF_DeviceLayer &norm=Layer(i*g_caif_prenorm_stage_stride+g_caif_prenorm_norm_offset);
       const CAIF_DeviceLayer &sub=Layer(i*g_caif_prenorm_stage_stride+g_caif_prenorm_layer_offset);
 
-      auto norm_names=norm.FrozenTensorNames(prefix+_norm_prefixes[i]);
+      auto norm_names=norm.FrozenTensorNames(prefix+NormPrefixes()[i]);
       names.insert(names.end(),norm_names.begin(),norm_names.end());
 
-      auto layer_names=sub.FrozenTensorNames(prefix+_layer_prefixes[i]);
+      auto layer_names=sub.FrozenTensorNames(prefix+LayerPrefixes()[i]);
       names.insert(names.end(),layer_names.begin(),layer_names.end());
     }
     return names;

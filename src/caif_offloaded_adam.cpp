@@ -80,8 +80,13 @@ void CAIF_OffloadedAdam::UpdateOne(CAIF_DeviceTensor &target,
                          WeightDecay(),
                          StepCount());
 
-    HostMMut()[idx]->CopyFromDevice(m_dev);
-    HostVMut()[idx]->CopyFromDevice(v_dev);
+    // Async writeback on the optimizer stream — no per-parameter stall. The
+    // next step's PrefetchToDevice H2D is stream-ordered after this copy, and
+    // m_dev/v_dev are freed via cudaFreeAsync on the same stream (ordered after
+    // the copy), so this is correct without a sync. (Was two synchronizing
+    // CopyFromDevice calls per param.)
+    HostMMut()[idx]->CopyFromDeviceAsync(m_dev,Stream());
+    HostVMut()[idx]->CopyFromDeviceAsync(v_dev,Stream());
   }
   CAIF_CATCH_BLOCK()
 }

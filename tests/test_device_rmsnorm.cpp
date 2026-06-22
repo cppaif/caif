@@ -12,40 +12,74 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Tests for CAIF_DeviceRMSNorm<float,float>.
+//------------------------------------------------------------------------------
 #include "caif_device_rmsnorm.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_test_harness.h"
 #include "caif_cpu_reference/caif_cpu_rmsnorm.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
+#ifdef USE_CAIF_CUDA
+
+constexpr uint32_t g_caif_rmsnorm_test_rows_2d=4;
+constexpr uint32_t g_caif_rmsnorm_test_dim=8;
+constexpr uint32_t g_caif_rmsnorm_test_batch_3d=2;
+constexpr uint32_t g_caif_rmsnorm_test_seq_3d=3;
+constexpr uint32_t g_caif_rmsnorm_test_rows_gamma=2;
+constexpr uint32_t g_caif_rmsnorm_test_dim_param=64;
+constexpr uint32_t g_caif_rmsnorm_test_dim_desc=128;
+constexpr uint32_t g_caif_rmsnorm_test_rows_bwd=2;
+constexpr float g_caif_rmsnorm_test_tol=1e-4f;
+constexpr float g_caif_rmsnorm_test_grad_tol=1e-2f;
+constexpr float g_caif_rmsnorm_test_fd_h=1e-3f;
+
+//------------------------------------------------------------------------------
+// RMSNorm forward and backward correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_RMSNormTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static bool FloatEqual(float a,float b,float tolerance=g_caif_rmsnorm_test_tol);
+
+    static void TestForward2D();
+    static void TestForward3D();
+    static void TestGammaScaling();
+    static void TestBackwardGradients();
+    static void TestParameterCount();
+    static void TestZeroGradients();
+    static void TestDescription();
+};
+
+bool CAIF_RMSNormTests::FloatEqual(const float a,const float b,const float tolerance)
 {
   return CAIF_TestHarness::FloatEqual(a,b,tolerance);
 }
 
-#ifdef USE_CAIF_CUDA
-
 //------------------------------------------------------------------------------
 // Test 1: Forward correctness (2D input)
 //------------------------------------------------------------------------------
-static void TestForward2D()
+void CAIF_RMSNormTests::TestForward2D()
 {
   try
   {
-    const uint32_t rows=4;
-    const uint32_t dim=8;
+    const uint32_t rows=g_caif_rmsnorm_test_rows_2d;
+    const uint32_t dim=g_caif_rmsnorm_test_dim;
     const float epsilon=g_caif_epsilon;
 
     CAIF_CudaStream stream;
@@ -60,10 +94,8 @@ static void TestForward2D()
       host_input[i]=static_cast<float>(i)*0.1f-0.5f;
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{rows,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{rows,dim},stream);
 
-    // GPU forward
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=norm.Forward(input,ctx);
@@ -73,21 +105,26 @@ static void TestForward2D()
     std::vector<float> gamma_vals(dim,1.0f);
     std::vector<float> expected(rows*dim);
     CAIF_CpuRMSNorm::Apply(host_input.data(),gamma_vals.data(),expected.data(),
-                rows,dim,epsilon);
+                           rows,dim,epsilon);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
       if(FloatEqual(host_output.Data()[i],expected[i])==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": got "
+                      <<host_output.Data()[i]
+                      <<" expected "
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("RMSNorm::Forward2D",passed);
+    CAIF_TestHarness::Report("RMSNorm::Forward2D",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::Forward2D")
 }
@@ -95,13 +132,13 @@ static void TestForward2D()
 //------------------------------------------------------------------------------
 // Test 2: Forward correctness (3D input treated as [rows, dim])
 //------------------------------------------------------------------------------
-static void TestForward3D()
+void CAIF_RMSNormTests::TestForward3D()
 {
   try
   {
-    const uint32_t batch=2;
-    const uint32_t seq_len=3;
-    const uint32_t dim=8;
+    const uint32_t batch=g_caif_rmsnorm_test_batch_3d;
+    const uint32_t seq_len=g_caif_rmsnorm_test_seq_3d;
+    const uint32_t dim=g_caif_rmsnorm_test_dim;
     const uint32_t rows=batch*seq_len;
     const float epsilon=g_caif_epsilon;
 
@@ -116,8 +153,9 @@ static void TestForward3D()
       host_input[i]=static_cast<float>(i)*0.05f-1.0f;
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -131,7 +169,7 @@ static void TestForward3D()
        host_output.Shape()[1]!=seq_len||
        host_output.Shape()[2]!=dim)
     {
-      std::cout<<"  Shape mismatch\n";
+      ISE_Out::Out()<<"  Shape mismatch\n";
       passed=false;
     }
 
@@ -139,19 +177,24 @@ static void TestForward3D()
     std::vector<float> gamma_vals(dim,1.0f);
     std::vector<float> expected(rows*dim);
     CAIF_CpuRMSNorm::Apply(host_input.data(),gamma_vals.data(),expected.data(),
-                rows,dim,epsilon);
+                           rows,dim,epsilon);
 
     for(size_t i=0;i<expected.size()&&passed==true;++i)
     {
       if(FloatEqual(host_output.Data()[i],expected[i])==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": got "
+                      <<host_output.Data()[i]
+                      <<" expected "
+                      <<expected[i]
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult("RMSNorm::Forward3D",passed);
+    CAIF_TestHarness::Report("RMSNorm::Forward3D",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::Forward3D")
 }
@@ -159,12 +202,12 @@ static void TestForward3D()
 //------------------------------------------------------------------------------
 // Test 3: Non-unit gamma values affect output
 //------------------------------------------------------------------------------
-static void TestGammaScaling()
+void CAIF_RMSNormTests::TestGammaScaling()
 {
   try
   {
-    const uint32_t rows=2;
-    const uint32_t dim=8;
+    const uint32_t rows=g_caif_rmsnorm_test_rows_gamma;
+    const uint32_t dim=g_caif_rmsnorm_test_dim;
     const float epsilon=g_caif_epsilon;
 
     CAIF_CudaStream stream;
@@ -186,8 +229,7 @@ static void TestGammaScaling()
       host_input[i]=static_cast<float>(i)*0.2f-0.8f;
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{rows,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{rows,dim},stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=norm.Forward(input,ctx);
@@ -196,21 +238,26 @@ static void TestGammaScaling()
     // CPU reference with custom gamma
     std::vector<float> expected(rows*dim);
     CAIF_CpuRMSNorm::Apply(host_input.data(),gamma_vals.data(),expected.data(),
-                rows,dim,epsilon);
+                           rows,dim,epsilon);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
       if(FloatEqual(host_output.Data()[i],expected[i])==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": got "<<host_output.Data()[i]
-                 <<" expected "<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": got "
+                      <<host_output.Data()[i]
+                      <<" expected "
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("RMSNorm::GammaScaling",passed);
+    CAIF_TestHarness::Report("RMSNorm::GammaScaling",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::GammaScaling")
 }
@@ -218,15 +265,15 @@ static void TestGammaScaling()
 //------------------------------------------------------------------------------
 // Test 4: Backward correctness (finite-difference gradient check)
 //------------------------------------------------------------------------------
-static void TestBackwardGradients()
+void CAIF_RMSNormTests::TestBackwardGradients()
 {
   try
   {
-    const uint32_t rows=2;
-    const uint32_t dim=8;
+    const uint32_t rows=g_caif_rmsnorm_test_rows_bwd;
+    const uint32_t dim=g_caif_rmsnorm_test_dim;
     const float epsilon=g_caif_epsilon;
-    const float h=1e-3f;
-    const float grad_tol=1e-2f;
+    const float h=g_caif_rmsnorm_test_fd_h;
+    const float grad_tol=g_caif_rmsnorm_test_grad_tol;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
@@ -249,11 +296,10 @@ static void TestBackwardGradients()
     CAIF_DeviceRMSNorm<float,float> norm(dim,stream,epsilon);
     norm.ParameterTensor(0).CopyFromHost(gamma_vals.data(),dim);
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{rows,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{rows,dim},stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
-    CAIF_DeviceTensor output=norm.Forward(input,ctx);
+    norm.Forward(input,ctx);
 
     // grad_output = ones (d(sum)/d(output) = 1 for each element)
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::Uninitialized({rows,dim},stream);
@@ -281,8 +327,9 @@ static void TestBackwardGradients()
       // Forward with perturbed input (+h)
       CAIF_DeviceRMSNorm<float,float> norm_p(dim,stream,epsilon);
       norm_p.ParameterTensor(0).CopyFromHost(gamma_vals.data(),dim);
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               input_plus.data(),{rows,dim},stream);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(input_plus.data(),
+                                                              {rows,dim},
+                                                              stream);
       CAIF_DeviceTensor out_p=norm_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
       float sum_plus=0.0f;
@@ -294,8 +341,9 @@ static void TestBackwardGradients()
       // Forward with perturbed input (-h)
       CAIF_DeviceRMSNorm<float,float> norm_m(dim,stream,epsilon);
       norm_m.ParameterTensor(0).CopyFromHost(gamma_vals.data(),dim);
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               input_minus.data(),{rows,dim},stream);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(input_minus.data(),
+                                                              {rows,dim},
+                                                              stream);
       CAIF_DeviceTensor out_m=norm_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
@@ -309,8 +357,13 @@ static void TestBackwardGradients()
 
       if(std::fabs(numerical-analytical)>grad_tol)
       {
-        std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
-                 <<" numerical="<<numerical<<"\n";
+        ISE_Out::Out()<<"  dx mismatch at "
+                      <<i
+                      <<": analytical="
+                      <<analytical
+                      <<" numerical="
+                      <<numerical
+                      <<"\n";
         passed=false;
       }
     }
@@ -325,8 +378,9 @@ static void TestBackwardGradients()
 
       CAIF_DeviceRMSNorm<float,float> norm_gp(dim,stream,epsilon);
       norm_gp.ParameterTensor(0).CopyFromHost(gamma_plus.data(),dim);
-      CAIF_DeviceTensor inp_gp=CAIF_DeviceTensor::FromHostData(
-                                host_input.data(),{rows,dim},stream);
+      CAIF_DeviceTensor inp_gp=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                               {rows,dim},
+                                                               stream);
       CAIF_DeviceTensor out_gp=norm_gp.Forward(inp_gp,ctx);
       CAIF_HostTensor hout_gp=out_gp.ToHost();
       float sum_plus=0.0f;
@@ -337,8 +391,9 @@ static void TestBackwardGradients()
 
       CAIF_DeviceRMSNorm<float,float> norm_gm(dim,stream,epsilon);
       norm_gm.ParameterTensor(0).CopyFromHost(gamma_minus.data(),dim);
-      CAIF_DeviceTensor inp_gm=CAIF_DeviceTensor::FromHostData(
-                                host_input.data(),{rows,dim},stream);
+      CAIF_DeviceTensor inp_gm=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                               {rows,dim},
+                                                               stream);
       CAIF_DeviceTensor out_gm=norm_gm.Forward(inp_gm,ctx);
       CAIF_HostTensor hout_gm=out_gm.ToHost();
       float sum_minus=0.0f;
@@ -352,13 +407,18 @@ static void TestBackwardGradients()
 
       if(std::fabs(numerical-analytical)>grad_tol)
       {
-        std::cout<<"  dgamma mismatch at "<<c<<": analytical="<<analytical
-                 <<" numerical="<<numerical<<"\n";
+        ISE_Out::Out()<<"  dgamma mismatch at "
+                      <<c
+                      <<": analytical="
+                      <<analytical
+                      <<" numerical="
+                      <<numerical
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult("RMSNorm::BackwardGradients",passed);
+    CAIF_TestHarness::Report("RMSNorm::BackwardGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::BackwardGradients")
 }
@@ -366,29 +426,33 @@ static void TestBackwardGradients()
 //------------------------------------------------------------------------------
 // Test 5: Parameter counts
 //------------------------------------------------------------------------------
-static void TestParameterCount()
+void CAIF_RMSNormTests::TestParameterCount()
 {
   try
   {
-    const uint32_t dim=64;
+    const uint32_t dim=g_caif_rmsnorm_test_dim_param;
     CAIF_CudaStream stream;
     CAIF_DeviceRMSNorm<float,float> norm(dim,stream);
 
     bool passed=true;
     if(norm.ParameterTensorCount()!=1)
     {
-      std::cout<<"  ParameterTensorCount expected 1, got "
-               <<norm.ParameterTensorCount()<<"\n";
+      ISE_Out::Out()<<"  ParameterTensorCount expected 1, got "
+                    <<norm.ParameterTensorCount()
+                    <<"\n";
       passed=false;
     }
     if(norm.TotalParameterCount()!=dim)
     {
-      std::cout<<"  TotalParameterCount expected "<<dim<<", got "
-               <<norm.TotalParameterCount()<<"\n";
+      ISE_Out::Out()<<"  TotalParameterCount expected "
+                    <<dim
+                    <<", got "
+                    <<norm.TotalParameterCount()
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("RMSNorm::ParameterCount",passed);
+    CAIF_TestHarness::Report("RMSNorm::ParameterCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::ParameterCount")
 }
@@ -396,12 +460,12 @@ static void TestParameterCount()
 //------------------------------------------------------------------------------
 // Test 6: ZeroGradients
 //------------------------------------------------------------------------------
-static void TestZeroGradients()
+void CAIF_RMSNormTests::TestZeroGradients()
 {
   try
   {
-    const uint32_t rows=2;
-    const uint32_t dim=8;
+    const uint32_t rows=g_caif_rmsnorm_test_rows_gamma;
+    const uint32_t dim=g_caif_rmsnorm_test_dim;
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
@@ -409,15 +473,13 @@ static void TestZeroGradients()
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(rows*dim,1.0f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{rows,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),{rows,dim},stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     norm.Forward(input,ctx);
 
     std::vector<float> grad_ones(rows*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{rows,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),{rows,dim},stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     norm.Backward(grad_out,ctx);
 
@@ -430,14 +492,17 @@ static void TestZeroGradients()
     {
       if(host_grad.Data()[i]!=0.0f)
       {
-        std::cout<<"  Gradient not zeroed at "<<i<<": "
-                 <<host_grad.Data()[i]<<"\n";
+        ISE_Out::Out()<<"  Gradient not zeroed at "
+                      <<i
+                      <<": "
+                      <<host_grad.Data()[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("RMSNorm::ZeroGradients",passed);
+    CAIF_TestHarness::Report("RMSNorm::ZeroGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::ZeroGradients")
 }
@@ -445,11 +510,11 @@ static void TestZeroGradients()
 //------------------------------------------------------------------------------
 // Test 7: Description string
 //------------------------------------------------------------------------------
-static void TestDescription()
+void CAIF_RMSNormTests::TestDescription()
 {
   try
   {
-    const uint32_t dim=128;
+    const uint32_t dim=g_caif_rmsnorm_test_dim_desc;
     CAIF_CudaStream stream;
     CAIF_DeviceRMSNorm<float,float> norm(dim,stream);
 
@@ -457,21 +522,19 @@ static void TestDescription()
     bool passed=(desc=="RMSNorm(128)");
     if(passed==false)
     {
-      std::cout<<"  Expected 'RMSNorm(128)', got '"<<desc<<"'\n";
+      ISE_Out::Out()<<"  Expected 'RMSNorm(128)', got '"
+                    <<desc
+                    <<"'\n";
     }
 
-    ReportResult("RMSNorm::Description",passed);
+    CAIF_TestHarness::Report("RMSNorm::Description",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RMSNorm::Description")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_RMSNormTests::RunAll()
 {
-  std::cout<<"=== CAIF_DeviceRMSNorm<float,float> Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF_DeviceRMSNorm<float,float> Tests ===\n\n";
   TestForward2D();
   TestForward3D();
   TestGammaScaling();
@@ -479,12 +542,26 @@ int main()
   TestParameterCount();
   TestZeroGradients();
   TestDescription();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+  ISE_Out::Out()<<"\n=== Summary ===\n"
+                <<"Passed: "
+                <<CAIF_TestHarness::PassedCount()
+                <<"\n"
+                <<"Failed: "
+                <<CAIF_TestHarness::FailedCount()
+                <<"\n";
+}
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
-  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
-  return CAIF_TestHarness::FinalExitCode();
+#endif  // USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_RMSNormTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

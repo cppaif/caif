@@ -74,7 +74,18 @@ class CAIF_DeviceContainer:public CAIF_DeviceLayer
     // The trainable flag for the slot is preserved.
     void ReplaceLayer(size_t index,std::unique_ptr<CAIF_DeviceLayer> layer);
 
-    size_t LayerCount()const{return _sublayers.size();}
+    size_t LayerCount()const{return Sublayers().size();}
+
+    // Internal accessors — single point of access for the sublayer
+    // and trainable vectors. Used inside Container's own method bodies
+    // and from subclasses (PreNormBlock etc.) per the protected-member
+    // discipline.
+    SublayerVec_t &Sublayers(){return _sublayers;}
+    const SublayerVec_t &Sublayers()const{return _sublayers;}
+    void SetSublayers(SublayerVec_t &&v){_sublayers=std::move(v);}
+    TrainableVec_t &Trainable(){return _trainable;}
+    const TrainableVec_t &Trainable()const{return _trainable;}
+    void SetTrainable(TrainableVec_t &&v){_trainable=std::move(v);}
 
     CAIF_DeviceLayer &Layer(size_t index);
     const CAIF_DeviceLayer &Layer(size_t index)const;
@@ -108,6 +119,19 @@ class CAIF_DeviceContainer:public CAIF_DeviceLayer
     std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
     float AuxLoss()const override;
+
+    // Containers hold heterogeneous-dtype children, so they have no
+    // single answer for either dtype. Return Float32 as a sentinel;
+    // callers that need per-leaf dtypes recurse into Layer(i) and
+    // call RuntimeStorageDtype()/RuntimeComputeDtype() on each child.
+    CAIF_DataType::CAIF_DataType_e RuntimeStorageDtype()const override
+    {
+      return CAIF_DataType::CAIF_DataType_e::Float32;
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeComputeDtype()const override
+    {
+      return CAIF_DataType::CAIF_DataType_e::Float32;
+    }
 
   protected:
     std::pair<CAIF_DeviceLayer *,size_t> ResolveParameterIndex(size_t index);

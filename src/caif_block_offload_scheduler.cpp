@@ -20,6 +20,7 @@ namespace instance
 
 CAIF_BlockOffloadScheduler::CAIF_BlockOffloadScheduler()
 try:_stage_layers(),
+    _prefetch_events(),
     _copy_stream()
 {
 }
@@ -31,6 +32,7 @@ CAIF_BlockOffloadScheduler::~CAIF_BlockOffloadScheduler()
 
 CAIF_BlockOffloadScheduler::CAIF_BlockOffloadScheduler(CAIF_BlockOffloadScheduler &&other)
 try:_stage_layers(std::move(other._stage_layers)),
+    _prefetch_events(std::move(other._prefetch_events)),
     _copy_stream(std::move(other._copy_stream))
 {
 }
@@ -44,6 +46,7 @@ CAIF_BlockOffloadScheduler::operator=(CAIF_BlockOffloadScheduler &&other)
     if(this!=&other)
     {
       _stage_layers=std::move(other._stage_layers);
+      _prefetch_events=std::move(other._prefetch_events);
       _copy_stream=std::move(other._copy_stream);
     }
     return *this;
@@ -75,11 +78,11 @@ size_t CAIF_BlockOffloadScheduler::LayerCountAtStage(const size_t stage_index)co
 {
   try
   {
-    if(stage_index>=_stage_layers.size())
+    if(stage_index>=StageLayers().size())
     {
       return 0u;
     }
-    return _stage_layers[stage_index].size();
+    return StageLayers()[stage_index].size();
   }
   CAIF_CATCH_BLOCK()
   return 0u;
@@ -90,11 +93,11 @@ bool CAIF_BlockOffloadScheduler::HasLayerAt(const size_t stage_index,
 {
   try
   {
-    if(stage_index>=_stage_layers.size())
+    if(stage_index>=StageLayers().size())
     {
       return false;
     }
-    return layer_index<_stage_layers[stage_index].size();
+    return layer_index<StageLayers()[stage_index].size();
   }
   CAIF_CATCH_BLOCK()
   return false;
@@ -109,7 +112,7 @@ CAIF_BlockOffloadScheduler::LayerAt(const size_t stage_index,const size_t layer_
     {
       THROW_CAIFE("CAIF_BlockOffloadScheduler::LayerAt: index out of range");
     }
-    CAIF_DeviceFrozenLinearBase *p=_stage_layers[stage_index][layer_index];
+    CAIF_DeviceFrozenLinearBase *p=StageLayers()[stage_index][layer_index];
     if(p==nullptr)
     {
       THROW_CAIFE("CAIF_BlockOffloadScheduler::LayerAt: registered layer is null");
@@ -128,7 +131,7 @@ CAIF_BlockOffloadScheduler::LayerAt(const size_t stage_index,const size_t layer_
     {
       THROW_CAIFE("CAIF_BlockOffloadScheduler::LayerAt: index out of range");
     }
-    const CAIF_DeviceFrozenLinearBase *p=_stage_layers[stage_index][layer_index];
+    const CAIF_DeviceFrozenLinearBase *p=StageLayers()[stage_index][layer_index];
     if(p==nullptr)
     {
       THROW_CAIFE("CAIF_BlockOffloadScheduler::LayerAt: registered layer is null");
@@ -164,9 +167,13 @@ void CAIF_BlockOffloadScheduler::EnsureStageCapacity(const size_t stage_index)
 {
   try
   {
-    if(_stage_layers.size()<=stage_index)
+    if(StageLayers().size()<=stage_index)
     {
-      _stage_layers.resize(stage_index+1u);
+      StageLayers().resize(stage_index+1u);
+    }
+    if(PrefetchEvents().size()<=stage_index)
+    {
+      PrefetchEvents().resize(stage_index+1u);
     }
   }
   CAIF_CATCH_BLOCK()
@@ -177,7 +184,7 @@ void CAIF_BlockOffloadScheduler::AppendLayerAtStage(const size_t stage_index,
 {
   try
   {
-    _stage_layers[stage_index].push_back(&layer);
+    StageLayers()[stage_index].push_back(&layer);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -244,26 +251,94 @@ void CAIF_BlockOffloadScheduler::EvictStage(const size_t stage_index)
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_BlockOffloadScheduler::OnEnterForwardStage(const size_t stage_index,
-                                                      CAIF_CudaStream &compute_stream)
+bool CAIF_BlockOffloadScheduler::StageFullyPrefetched(const size_t stage_index)const
 {
   try
   {
-    if(HasAnyOffloadedLayer()==false)
+    const size_t nl=LayerCountAtStage(stage_index);
+    for(size_t i=0;i<nl;++i)
+    {
+      if(LayerAt(stage_index,i).IsPrefetched()==false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+  CAIF_CATCH_BLOCK()
+  return true;
+}
+
+void CAIF_BlockOffloadScheduler::IssuePrefetch(const size_t stage_index)
+{
+  try
+  {
+    if(LayerCountAtStage(stage_index)==0u)
     {
       return;
     }
-    // MVP: prefetch this stage on the compute stream (synchronous wrt
-    // compute, so the weight is guaranteed visible by the time the stage
-    // runs). Async-overlap with prior stage's compute is a follow-up
-    // optimization (would issue on copy_stream and insert a cross-stream
-    // wait); this simpler path is correct first, fast later.
-    PrefetchStage(stage_index,compute_stream);
+    if(PrefetchEvents()[stage_index]!=nullptr)
+    {
+      return;
+    }
+    if(StageFullyPrefetched(stage_index)==true)
+    {
+      return;
+    }
+    PrefetchStage(stage_index,CopyStream());
+    PrefetchEvents()[stage_index]=std::make_unique<CAIF_CudaEvent>(CopyStream().RecordEvent());
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_BlockOffloadScheduler::OnExitForwardStage(const size_t stage_index)
+void CAIF_BlockOffloadScheduler::AwaitPrefetch(const size_t stage_index,
+                                               CAIF_CudaStream &compute_stream)
+{
+  try
+  {
+    if(LayerCountAtStage(stage_index)==0u)
+    {
+      return;
+    }
+    if(StageFullyPrefetched(stage_index)==false &&
+       PrefetchEvents()[stage_index]==nullptr)
+    {
+      // Cold start: forward stage 0, or backward re-entering a stage the
+      // forward sweep evicted. Issue the H2D now; the wait below covers it.
+      IssuePrefetch(stage_index);
+    }
+    if(PrefetchEvents()[stage_index]!=nullptr)
+    {
+      compute_stream.WaitFor(*PrefetchEvents()[stage_index]);
+      PrefetchEvents()[stage_index].reset();
+    }
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+void CAIF_BlockOffloadScheduler::GuardedEvict(const size_t stage_index,
+                                              CAIF_CudaStream &compute_stream)
+{
+  try
+  {
+    if(LayerCountAtStage(stage_index)==0u)
+    {
+      return;
+    }
+    // Read-before-free guard: the stage's weights were allocated on the
+    // copy stream, so their cudaFreeAsync lands there. Making the copy
+    // stream wait on compute's reads orders the frees after them with no
+    // host stall.
+    CAIF_CudaEvent compute_done=compute_stream.RecordEvent();
+    CopyStream().WaitFor(compute_done);
+    EvictStage(stage_index);
+    PrefetchEvents()[stage_index].reset();
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+void CAIF_BlockOffloadScheduler::OnEnterForwardStage(const size_t stage_index,
+                                                     CAIF_CudaStream &compute_stream)
 {
   try
   {
@@ -271,18 +346,36 @@ void CAIF_BlockOffloadScheduler::OnExitForwardStage(const size_t stage_index)
     {
       return;
     }
-    // Evict this stage's frozen weights immediately after its forward
-    // compute completes. The earlier "no eviction during forward"
-    // policy assumed the entire frozen base fits on GPU; that only
-    // holds for small models. Full-depth bf16 add-MoE on 27-layer
-    // DSv2-Lite has ~30 GB of frozen routed-expert weights — way past
-    // a 32 GB card budget when ALL blocks' weights stay resident
-    // through the forward sweep. Backward's `OnEnterBackwardStage`
-    // re-prefetches lazily (PrefetchStage is idempotent), so the
-    // round-trip cost is one extra host->device DMA per block per
-    // step in exchange for keeping GPU peak bounded by the working
-    // set of one block at a time.
-    EvictStage(stage_index);
+    // Wait (GPU-side) on this stage's H2D — cold-started on the copy
+    // stream for stage 0 — then issue the next stage's prefetch so its
+    // DMA overlaps this stage's compute.
+    AwaitPrefetch(stage_index,compute_stream);
+    if(stage_index+1u<StageCount())
+    {
+      IssuePrefetch(stage_index+1u);
+    }
+  }
+  CAIF_CATCH_BLOCK()
+}
+
+void CAIF_BlockOffloadScheduler::OnExitForwardStage(const size_t stage_index,
+                                                    CAIF_CudaStream &compute_stream)
+{
+  try
+  {
+    if(HasAnyOffloadedLayer()==false)
+    {
+      return;
+    }
+    // Evict this stage's frozen weights as soon as its forward compute
+    // completes (guarded — the frees are stream-ordered behind compute's
+    // reads). Keeping every block's weights resident through the forward
+    // sweep only works when the frozen base fits on GPU; full-depth bf16
+    // add-MoE on 27-layer DSv2-Lite has ~30 GB of frozen routed-expert
+    // weights — past a 32 GB card. Backward re-prefetches lazily, so the
+    // round-trip cost is one extra host->device DMA per block per step in
+    // exchange for a GPU peak bounded by one block's working set.
+    GuardedEvict(stage_index,compute_stream);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -296,15 +389,20 @@ void CAIF_BlockOffloadScheduler::OnEnterBackwardStage(const size_t stage_index,
     {
       return;
     }
-    // Forward kept the weight prefetched; backward only needs to ensure the
-    // weight is still loaded. If a prior backward stage evicted this stage
-    // (e.g. via EvictAll on context boundary), re-prefetch.
-    PrefetchStage(stage_index,compute_stream);
+    // The forward sweep evicted this stage; AwaitPrefetch cold-starts the
+    // re-prefetch when no lookahead H2D is pending. Backward walks stages
+    // high -> low, so the lookahead target is stage_index-1.
+    AwaitPrefetch(stage_index,compute_stream);
+    if(stage_index>0u)
+    {
+      IssuePrefetch(stage_index-1u);
+    }
   }
   CAIF_CATCH_BLOCK()
 }
 
-void CAIF_BlockOffloadScheduler::OnExitBackwardStage(const size_t stage_index)
+void CAIF_BlockOffloadScheduler::OnExitBackwardStage(const size_t stage_index,
+                                                     CAIF_CudaStream &compute_stream)
 {
   try
   {
@@ -313,8 +411,8 @@ void CAIF_BlockOffloadScheduler::OnExitBackwardStage(const size_t stage_index)
       return;
     }
     // Stage's backward is done — its frozen weight is no longer needed in
-    // this iteration. Free the GPU scratch.
-    EvictStage(stage_index);
+    // this iteration. Free the GPU scratch (guarded).
+    GuardedEvict(stage_index,compute_stream);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -327,6 +425,11 @@ void CAIF_BlockOffloadScheduler::EvictAll()
     for(size_t s=0;s<ns;++s)
     {
       EvictStage(s);
+    }
+    const size_t ne=PrefetchEvents().size();
+    for(size_t s=0;s<ne;++s)
+    {
+      PrefetchEvents()[s].reset();
     }
   }
   CAIF_CATCH_BLOCK()

@@ -20,6 +20,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_tensor.h"
 
 #include <memory>
@@ -28,9 +29,27 @@
 namespace instance
 {
 
-class CAIF_DeviceActivation
+class CAIF_DeviceActivation:public CAIF_Base
 {
   public:
+    // Closed enumeration of the element-wise activation functions a dense layer
+    // selects by value. (The polymorphic strategy hierarchy in this same file —
+    // pointwise / gated middles — is the runtime object form; this enum is the
+    // selector a CAIF_DeviceDenseLayer / its factory keys on.)
+    enum class CAIF_DeviceActivation_e
+    {
+      None,
+      ReLU,
+      Sigmoid,
+      Tanh,
+      Softmax,
+      LeakyReLU,
+      ELU,
+      GELU,
+      Swish,
+      GELUExact
+    };
+
     virtual ~CAIF_DeviceActivation()=default;
 
     virtual bool IsGated()const=0;

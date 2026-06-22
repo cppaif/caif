@@ -14,6 +14,7 @@
 
 #include "caif_sgd_optimizer.h"
 #include "caif_ops.h"
+#include "caif_cuda_kernels_optimizers.cuh"
 #include "caif_exception.h"
 
 namespace instance
@@ -41,6 +42,32 @@ void CAIF_SgdOptimizer::UpdateOne(CAIF_DeviceTensor &target,
     CAIF_Ops::SgdUpdate(target,grad,LearningRate(),WeightDecay());
   }
   CAIF_CATCH_BLOCK()
+}
+
+bool CAIF_SgdOptimizer::BatchedStep(CAIF_DeviceNetwork &network)
+{
+#ifdef USE_CAIF_CUDA
+  try
+  {
+    if(BuildSharedBatch(network)==false)
+    {
+      return false;
+    }
+    launch_multi_tensor_sgd<float>(BatchTargetsDevice(),
+                                   BatchGradsDevice(),
+                                   BatchOffsetsDevice(),
+                                   BatchNumTensors(),
+                                   BatchTotalElements(),
+                                   LearningRate(),
+                                   WeightDecay(),
+                                   Stream().Handle());
+    return true;
+  }
+  CAIF_CATCH_BLOCK()
+#else
+  (void)network;
+  return false;
+#endif
 }
 
 }//end instance namespace

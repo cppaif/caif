@@ -35,6 +35,7 @@
 #pragma once
 
 #include "caif_optimizer.h"
+#include "caif_optimizer_type.h"
 #include "caif_host_pinned_tensor.h"
 
 #include <cstdint>
@@ -57,9 +58,9 @@ class CAIF_OffloadedAdam:public CAIF_Optimizer
                        CAIF_CudaStream &stream);
     ~CAIF_OffloadedAdam()override=default;
 
-    CAIF_OptimizerType_e Type()const override
+    CAIF_OptimizerType::CAIF_OptimizerType_e Type()const override
     {
-      return CAIF_OptimizerType_e::Adam;
+      return CAIF_OptimizerType::CAIF_OptimizerType_e::Adam;
     }
 
   protected:

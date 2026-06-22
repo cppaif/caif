@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 #include "caif_base.h"
+#include "caif_gelu_approximation.h"
 
 #ifndef USE_CAIF_CUDA
 typedef void *cudaStream_t;
@@ -227,6 +228,16 @@ class CAIF_Ops:public CAIF_Base
    * @param scale Scalar multiplier
    */
   static void Scale(CAIF_DeviceTensor &tensor,float scale);
+
+  // Mixed-precision loss scaler: unscale `grad` in place by
+  // inv_scale and flag overflow. If any element is non-finite after
+  // unscaling, found_inf (a 1-element fp32 tensor) is set to 1.0f; the flag is
+  // never cleared here, so applying this across many grads accumulates the OR.
+  // The caller zeroes found_inf before the sweep and skips the optimizer step
+  // when it ends up set. grad / found_inf must share a stream.
+  static void UnscaleCheckInf(CAIF_DeviceTensor &grad,
+                              float inv_scale,
+                              CAIF_DeviceTensor &found_inf);
 
   /**
    * @brief Scaled addition: target = target + source * scale
@@ -558,14 +569,18 @@ class CAIF_Ops:public CAIF_Base
            float alpha=1.0f);
 
   /**
-   * @brief GELU activation: output = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+   * @brief GELU activation: Gaussian Error Linear Unit.
    *
-   * Gaussian Error Linear Unit - approximation using tanh.
+   * Tanh : output = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+   * Exact: output = 0.5*x*(1 + erf(x/sqrt(2)))
    *
    * @param input Input tensor
    * @param output Output tensor (must be pre-allocated)
+   * @param approx Which GELU formula to apply
    */
-  static void GELU(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output);
+  static void GELU(const CAIF_DeviceTensor &input,
+                   CAIF_DeviceTensor &output,
+                   const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
 
   /**
    * @brief Swish activation: output = x * sigmoid(x)
@@ -674,10 +689,12 @@ class CAIF_Ops:public CAIF_Base
    * @param grad_output Gradient from the next layer
    * @param input Original input to GELU
    * @param grad_input Output gradient (must be pre-allocated)
+   * @param approx Which GELU formula was applied in the forward pass
    */
   static void GELUBackward(const CAIF_DeviceTensor &grad_output,
-                    const CAIF_DeviceTensor &input,
-                    CAIF_DeviceTensor &grad_input);
+                           const CAIF_DeviceTensor &input,
+                           CAIF_DeviceTensor &grad_input,
+                           const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
 
   /**
    * @brief Swish backward pass
@@ -1160,6 +1177,32 @@ class CAIF_Ops:public CAIF_Base
                          CAIF_DeviceTensor &expert_counts);
 
   /**
+   * @brief DeepSeek group-limited routing mask (in place, device-only)
+   *
+   * Splits each token's experts into n_group equal groups, scores a group by
+   * the sum of its top-2 expert scores, keeps the top-topk_group groups, and
+   * sets every expert in a non-selected group to the neg-sentinel so the
+   * downstream top-k never picks it.
+   *
+   * @param selection Selection scores [num_tokens x num_experts], modified in place
+   * @param n_group Number of expert groups (num_experts must be divisible by it)
+   * @param topk_group Groups kept per token (in [1, n_group])
+   */
+  static void MoEGroupMask(CAIF_DeviceTensor &selection,uint32_t n_group,uint32_t topk_group);
+
+  /**
+   * @brief Aux-loss-free router bias update (DeepSeek-V3, in place, device-only)
+   *
+   * Nudges each expert's router bias toward balance from its observed token
+   * load: bias[e] += rate * sign(mean_load - load[e]). No gradient, no aux loss.
+   *
+   * @param bias Router bias [num_experts], modified in place
+   * @param expert_counts Per-expert token counts [num_experts] (int32)
+   * @param rate Bias-update magnitude
+   */
+  static void MoEBiasUpdate(CAIF_DeviceTensor &bias,const CAIF_DeviceTensor &expert_counts,float rate);
+
+  /**
    * @brief ST-MoE router z-loss gradient contribution (in-place add).
    *
    * grad_logits[t,e] += logsumexp_scaled[t] * probs[t,e]
@@ -1297,12 +1340,12 @@ class CAIF_Ops:public CAIF_Base
   static void RequireSameLocation(const CAIF_DeviceTensor &a,
                            const CAIF_DeviceTensor &b,
                            const CAIF_DeviceTensor &c,
-                           const char *op_name);
+                           const std::string &op_name);
   static void RequireSameLocation(const CAIF_DeviceTensor &a,
                            const CAIF_DeviceTensor &b,
-                           const char *op_name);
+                           const std::string &op_name);
   static void RequireSameLocation(const CAIF_DeviceTensor &a,
-                           const char *op_name);
+                           const std::string &op_name);
 
   //----------------------------------------------------------------------------
   // Device-backend entry points (caif_ops_device.cpp)
@@ -1355,6 +1398,9 @@ class CAIF_Ops:public CAIF_Base
                  const CAIF_DeviceTensor &b,
                  CAIF_DeviceTensor &output);
   static void ScaleDevice(CAIF_DeviceTensor &tensor,float scale);
+  static void UnscaleCheckInfDevice(CAIF_DeviceTensor &grad,
+                                    float inv_scale,
+                                    CAIF_DeviceTensor &found_inf);
   static void ScaleDevice(const CAIF_DeviceTensor &input,
                    float scale,
                    CAIF_DeviceTensor &output);
@@ -1428,7 +1474,9 @@ class CAIF_Ops:public CAIF_Base
   static void ELUDevice(const CAIF_DeviceTensor &input,
                  CAIF_DeviceTensor &output,
                  float alpha);
-  static void GELUDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output);
+  static void GELUDevice(const CAIF_DeviceTensor &input,
+                         CAIF_DeviceTensor &output,
+                         const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
   static void SwishDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output);
   static void ReLUBackwardDevice(const CAIF_DeviceTensor &grad_output,
                           const CAIF_DeviceTensor &input,
@@ -1452,8 +1500,9 @@ class CAIF_Ops:public CAIF_Base
                          CAIF_DeviceTensor &grad_input,
                          float alpha);
   static void GELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
-                          const CAIF_DeviceTensor &input,
-                          CAIF_DeviceTensor &grad_input);
+                                 const CAIF_DeviceTensor &input,
+                                 CAIF_DeviceTensor &grad_input,
+                                 const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
   static void SwishBackwardDevice(const CAIF_DeviceTensor &grad_output,
                            const CAIF_DeviceTensor &input,
                            const CAIF_DeviceTensor &output,
@@ -1662,6 +1711,9 @@ class CAIF_Ops:public CAIF_Base
                const CAIF_DeviceTensor &b,
                CAIF_DeviceTensor &output);
   static void ScaleHost(CAIF_DeviceTensor &tensor,float scale);
+  static void UnscaleCheckInfHost(CAIF_DeviceTensor &grad,
+                                  float inv_scale,
+                                  CAIF_DeviceTensor &found_inf);
   static void ScaleHost(const CAIF_DeviceTensor &input,
                  float scale,
                  CAIF_DeviceTensor &output);
@@ -1714,7 +1766,9 @@ class CAIF_Ops:public CAIF_Base
   static void ELUHost(const CAIF_DeviceTensor &input,
                CAIF_DeviceTensor &output,
                float alpha);
-  static void GELUHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output);
+  static void GELUHost(const CAIF_DeviceTensor &input,
+                       CAIF_DeviceTensor &output,
+                       const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
   static void SwishHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output);
   static void ReLUBackwardHost(const CAIF_DeviceTensor &grad_output,
                         const CAIF_DeviceTensor &input,
@@ -1738,8 +1792,9 @@ class CAIF_Ops:public CAIF_Base
                        CAIF_DeviceTensor &grad_input,
                        float alpha);
   static void GELUBackwardHost(const CAIF_DeviceTensor &grad_output,
-                        const CAIF_DeviceTensor &input,
-                        CAIF_DeviceTensor &grad_input);
+                               const CAIF_DeviceTensor &input,
+                               CAIF_DeviceTensor &grad_input,
+                               const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx);
   static void SwishBackwardHost(const CAIF_DeviceTensor &grad_output,
                          const CAIF_DeviceTensor &input,
                          const CAIF_DeviceTensor &output,
@@ -1907,6 +1962,41 @@ class CAIF_Ops:public CAIF_Base
   protected:
 
   private:
+    // True iff `t` lives on the host backend. Used by every public op
+    // dispatcher to branch between *Host and *Device implementations.
+    static bool IsHost(const CAIF_DeviceTensor &t)
+    {
+      return t.Location()==CAIF_DeviceTensor::Location_e::Host_e;
+    }
+
+    // T5-style relative-position bucketing: maps a signed relative
+    // position to a bucket index. Used by the host relative-position-bias
+    // forward and gradient-accumulation paths.
+    static int32_t RelativePositionBucket(int32_t relative_position,
+                                          uint32_t max_distance,
+                                          bool bidirectional,
+                                          uint32_t num_buckets);
+
+    // Throws if the two matmul inputs and the output do not all share the
+    // same dtype. `op` names the calling op (a g_caif_op_* matmul label) for
+    // the diagnostic. Enforced identically on the host and device backends so
+    // both reject the same inputs: the device path cannot mix input dtypes in
+    // one cuBLAS-Lt GEMM, and the host path matches it for consistency.
+    static void RequireMatchingDtype(const CAIF_DeviceTensor &a,
+                                     const CAIF_DeviceTensor &b,
+                                     const CAIF_DeviceTensor &out,
+                                     const std::string &op);
+
+    // Validates a last-dim slice (rank, matching leading dims, dtype, slice
+    // bounds) and yields the flattened row count plus the in/out column
+    // widths. Used by the device slice forward/backward paths.
+    static void SliceValidateAndDims(const CAIF_DeviceTensor &input,
+                                     const CAIF_DeviceTensor &output,
+                                     uint32_t col_start,
+                                     const std::string &op_name,
+                                     int &rows,
+                                     int &in_cols,
+                                     int &out_cols);
 
     CAIF_Ops()=delete;
 };//end CAIF_Ops class

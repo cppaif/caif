@@ -34,21 +34,18 @@ CAIF_DeviceRelativePositionBiasFactory::Create(uint32_t num_heads,
     (void)compute_dtype;
     if(storage_dtype==Dtype_e::Float32)
     {
-      CAIF_DeviceRelativePositionBias<float,float>::Config_t cfg{num_heads,num_buckets,
-                                                                  max_distance,bidirectional};
+      CAIF_DeviceRelativePositionBiasConfig cfg{num_heads,num_buckets,max_distance,bidirectional};
       return std::make_unique<CAIF_DeviceRelativePositionBias<float,float>>(cfg,stream);
     }
 #ifdef USE_CAIF_CUDA
     if(storage_dtype==Dtype_e::Float16)
     {
-      CAIF_DeviceRelativePositionBias<__half,__half>::Config_t cfg{num_heads,num_buckets,
-                                                                    max_distance,bidirectional};
+      CAIF_DeviceRelativePositionBiasConfig cfg{num_heads,num_buckets,max_distance,bidirectional};
       return std::make_unique<CAIF_DeviceRelativePositionBias<__half,__half>>(cfg,stream);
     }
     if(storage_dtype==Dtype_e::BFloat16)
     {
-      CAIF_DeviceRelativePositionBias<__nv_bfloat16,__nv_bfloat16>::Config_t
-                                            cfg{num_heads,num_buckets,max_distance,bidirectional};
+      CAIF_DeviceRelativePositionBiasConfig cfg{num_heads,num_buckets,max_distance,bidirectional};
       return std::make_unique<CAIF_DeviceRelativePositionBias<__nv_bfloat16,
                                                                 __nv_bfloat16>>(cfg,stream);
     }

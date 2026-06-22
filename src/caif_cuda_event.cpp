@@ -35,20 +35,20 @@ CAIF_CudaEvent::CAIF_CudaEvent():
   {
     THROW_CAIFE("Failed to create CUDA event");
   }
-  _valid=true;
+  SetValid(true);
 #endif
 }
 
 CAIF_CudaEvent::~CAIF_CudaEvent()
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==true&&_event!=nullptr)
+  if(IsValid()==true&&Handle()!=nullptr)
   {
-    cudaEventDestroy(_event);
-    _event=nullptr;
+    cudaEventDestroy(Handle());
+    SetEvent(nullptr);
   }
 #endif
-  _valid=false;
+  SetValid(false);
 }
 
 CAIF_CudaEvent::CAIF_CudaEvent(CAIF_CudaEvent &&other)noexcept:
@@ -58,9 +58,9 @@ CAIF_CudaEvent::CAIF_CudaEvent(CAIF_CudaEvent &&other)noexcept:
                                                            _valid(other._valid)
 {
 #ifdef USE_CAIF_CUDA
-  other._event=nullptr;
+  other.SetEvent(nullptr);
 #endif
-  other._valid=false;
+  other.SetValid(false);
 }
 
 CAIF_CudaEvent &CAIF_CudaEvent::operator=(CAIF_CudaEvent &&other)noexcept
@@ -69,15 +69,15 @@ CAIF_CudaEvent &CAIF_CudaEvent::operator=(CAIF_CudaEvent &&other)noexcept
   {
 #ifdef USE_CAIF_CUDA
     // Destroy current event if valid
-    if(_valid==true&&_event!=nullptr)
+    if(IsValid()==true&&Handle()!=nullptr)
     {
-      cudaEventDestroy(_event);
+      cudaEventDestroy(Handle());
     }
-    _event=other._event;
-    other._event=nullptr;
+    SetEvent(other.Handle());
+    other.SetEvent(nullptr);
 #endif
-    _valid=other._valid;
-    other._valid=false;
+    SetValid(other.IsValid());
+    other.SetValid(false);
   }
   return *this;
 }
@@ -85,11 +85,11 @@ CAIF_CudaEvent &CAIF_CudaEvent::operator=(CAIF_CudaEvent &&other)noexcept
 void CAIF_CudaEvent::Synchronize()const
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==false)
+  if(IsValid()==false)
   {
     THROW_CAIFE("Cannot synchronize invalid CUDA event");
   }
-  cudaError_t status=cudaEventSynchronize(_event);
+  cudaError_t status=cudaEventSynchronize(Handle());
   if(status!=cudaSuccess)
   {
     THROW_CAIFE("Failed to synchronize CUDA event");
@@ -100,11 +100,11 @@ void CAIF_CudaEvent::Synchronize()const
 bool CAIF_CudaEvent::IsComplete()const
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==false)
+  if(IsValid()==false)
   {
     return true;  // Invalid events are considered complete
   }
-  cudaError_t status=cudaEventQuery(_event);
+  cudaError_t status=cudaEventQuery(Handle());
   if(status==cudaSuccess)
   {
     return true;

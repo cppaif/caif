@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Test: CAIF_DeviceT5Attention + CAIF_DeviceRelativePositionBias correctness
+//       and benchmark vs base MHA.
+//------------------------------------------------------------------------------
 #include "caif_device_t5_attention.h"
 #include "caif_test_harness.h"
 #include "caif_device_multi_head_attention.h"
@@ -23,44 +28,84 @@
 #include "caif_cpu_reference/caif_cpu_softmax.h"
 #include "caif_cpu_reference/caif_cpu_matmul.h"
 #include "caif_cpu_reference/caif_cpu_relative_position.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
 #include <chrono>
 #include <string>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
-
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
-{
-  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
-}
 
 #ifdef USE_CAIF_CUDA
 
-//------------------------------------------------------------------------------
-// CPU reference helpers (primitives in caif_cpu_reference/)
-//------------------------------------------------------------------------------
+constexpr float g_caif_t5_test_forward_tol=5e-3f;
+constexpr float g_caif_t5_test_rpb_tol=1e-4f;
+constexpr int g_caif_t5_bench_warmup_iters=5;
+constexpr int g_caif_t5_bench_iters=50;
+constexpr int g_caif_t5_rpb_bench_warmup=10;
+constexpr int g_caif_t5_rpb_bench_iters=100;
 
-// CPU reference: full MHA forward with position bias
-static void CpuT5MHA(const float *input,
-                      const float *w_q,
-                      const float *w_k,
-                      const float *w_v,
-                      const float *w_o,
-                      const float *pos_bias,
-                      float *output,
-                      int batch,
-                      int seq_len,
-                      int dim,
-                      int num_heads,
-                      int head_dim,
-                      bool causal)
+//------------------------------------------------------------------------------
+// T5 Attention + Relative Position Bias correctness + benchmark tests.
+//------------------------------------------------------------------------------
+class CAIF_T5AttentionTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    // CPU reference: full MHA forward with position bias
+    static void CpuT5MHA(const float *input,
+                         const float *w_q,
+                         const float *w_k,
+                         const float *w_v,
+                         const float *w_o,
+                         const float *pos_bias,
+                         float *output,
+                         int batch,
+                         int seq_len,
+                         int dim,
+                         int num_heads,
+                         int head_dim,
+                         bool causal);
+
+    static CAIF_DeviceMultiHeadAttentionConfig MakeConfig(
+                                                                           uint32_t dim,
+                                                                           uint32_t num_heads,
+                                                                           bool causal);
+
+    static void TestRPBForwardBidirectional();
+    static void TestRPBForwardUnidirectional();
+    static void TestRPBShape();
+    static void TestRPBParameters();
+    static void TestT5AttentionForward();
+    static void TestT5AttentionCausal();
+    static void TestT5AttentionBackward();
+    static void TestBaseMHARegression();
+    static void BenchmarkRPBForward();
+    static void BenchmarkT5vsBaseMHA();
+    static void BenchmarkT5ForwardBackward();
+};
+
+//------------------------------------------------------------------------------
+// CPU reference MHA forward with optional position bias
+//------------------------------------------------------------------------------
+void CAIF_T5AttentionTests::CpuT5MHA(const float *input,
+                                      const float *w_q,
+                                      const float *w_k,
+                                      const float *w_v,
+                                      const float *w_o,
+                                      const float *pos_bias,
+                                      float *output,
+                                      const int batch,
+                                      const int seq_len,
+                                      const int dim,
+                                      const int num_heads,
+                                      const int head_dim,
+                                      const bool causal)
 {
   const int bs=batch*seq_len;
   const int qk_dim=num_heads*head_dim;
@@ -95,7 +140,8 @@ static void CpuT5MHA(const float *input,
 
       // scores = Q @ K^T -> [seq_len, seq_len]
       std::vector<float> scores(seq_len*seq_len);
-      CAIF_CpuMatMul::TransposeB(q_head.data(),k_head.data(),scores.data(),seq_len,head_dim,seq_len);
+      CAIF_CpuMatMul::TransposeB(q_head.data(),k_head.data(),scores.data(),
+                                  seq_len,head_dim,seq_len);
 
       // Scale
       const float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
@@ -144,28 +190,26 @@ static void CpuT5MHA(const float *input,
   CAIF_CpuMatMul::Apply(concat.data(),w_o,output,bs,qk_dim,dim);
 }
 
-//------------------------------------------------------------------------------
-// Helper: make attention config
-//------------------------------------------------------------------------------
-static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeConfig(
-  uint32_t dim,uint32_t num_heads,bool causal)
+CAIF_DeviceMultiHeadAttentionConfig
+CAIF_T5AttentionTests::MakeConfig(const uint32_t dim,
+                                   const uint32_t num_heads,
+                                   const bool causal)
 {
-  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
-  config.dim=dim;
-  config.num_heads=num_heads;
-  config.num_kv_heads=num_heads;
-  config.head_dim=dim/num_heads;
-  config.causal=causal;
-  config.use_rope=false;
-  config.rope_base=g_caif_rope_default_base;
-  config.dropout_rate=0.0f;
+  CAIF_DeviceMultiHeadAttentionConfig config(dim,
+                                             num_heads,
+                                             num_heads,
+                                             dim/num_heads,
+                                             causal,
+                                             false,
+                                             g_caif_rope_default_base,
+                                             0.0f);
   return config;
 }
 
 //------------------------------------------------------------------------------
 // Test 1: RPB forward matches CPU reference (bidirectional)
 //------------------------------------------------------------------------------
-static void TestRPBForwardBidirectional()
+void CAIF_T5AttentionTests::TestRPBForwardBidirectional()
 {
   try
   {
@@ -176,11 +220,7 @@ static void TestRPBForwardBidirectional()
     const uint32_t k_len=8;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t config;
-    config.num_heads=num_heads;
-    config.num_buckets=num_buckets;
-    config.max_distance=max_distance;
-    config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig config(num_heads,num_buckets,max_distance,true);
 
     CAIF_DeviceRelativePositionBias<float,float> rpb(config,stream);
 
@@ -193,27 +233,32 @@ static void TestRPBForwardBidirectional()
     // CPU reference
     std::vector<float> expected(num_heads*q_len*k_len);
     CAIF_CpuRelativePosition::BiasForward(h_emb.Data(),
-                                   expected.data(),
-                                   static_cast<int>(num_heads),
-                                   static_cast<int>(q_len),
-                                   static_cast<int>(k_len),
-                                   static_cast<int>(num_buckets),
-                                   static_cast<int>(max_distance),
-                                   true);
+                                          expected.data(),
+                                          static_cast<int>(num_heads),
+                                          static_cast<int>(q_len),
+                                          static_cast<int>(k_len),
+                                          static_cast<int>(num_buckets),
+                                          static_cast<int>(max_distance),
+                                          true);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(h_bias.Data()[i],expected[i])==false)
+      if(CAIF_TestHarness::FloatEqual(h_bias.Data()[i],expected[i],g_caif_t5_test_rpb_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": gpu="<<h_bias.Data()[i]
-                 <<" cpu="<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": gpu="
+                      <<h_bias.Data()[i]
+                      <<" cpu="
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("RPB::ForwardBidirectional",passed);
+    CAIF_TestHarness::Report("RPB::ForwardBidirectional",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RPB::ForwardBidirectional")
 }
@@ -221,7 +266,7 @@ static void TestRPBForwardBidirectional()
 //------------------------------------------------------------------------------
 // Test 2: RPB forward matches CPU reference (unidirectional/causal)
 //------------------------------------------------------------------------------
-static void TestRPBForwardUnidirectional()
+void CAIF_T5AttentionTests::TestRPBForwardUnidirectional()
 {
   try
   {
@@ -232,11 +277,7 @@ static void TestRPBForwardUnidirectional()
     const uint32_t k_len=8;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t config;
-    config.num_heads=num_heads;
-    config.num_buckets=num_buckets;
-    config.max_distance=max_distance;
-    config.bidirectional=false;
+    CAIF_DeviceRelativePositionBiasConfig config(num_heads,num_buckets,max_distance,false);
 
     CAIF_DeviceRelativePositionBias<float,float> rpb(config,stream);
     CAIF_HostTensor h_emb=rpb.ParameterTensor(0).ToHost();
@@ -246,27 +287,32 @@ static void TestRPBForwardUnidirectional()
 
     std::vector<float> expected(num_heads*q_len*k_len);
     CAIF_CpuRelativePosition::BiasForward(h_emb.Data(),
-                                   expected.data(),
-                                   static_cast<int>(num_heads),
-                                   static_cast<int>(q_len),
-                                   static_cast<int>(k_len),
-                                   static_cast<int>(num_buckets),
-                                   static_cast<int>(max_distance),
-                                   false);
+                                          expected.data(),
+                                          static_cast<int>(num_heads),
+                                          static_cast<int>(q_len),
+                                          static_cast<int>(k_len),
+                                          static_cast<int>(num_buckets),
+                                          static_cast<int>(max_distance),
+                                          false);
 
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(h_bias.Data()[i],expected[i])==false)
+      if(CAIF_TestHarness::FloatEqual(h_bias.Data()[i],expected[i],g_caif_t5_test_rpb_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": gpu="<<h_bias.Data()[i]
-                 <<" cpu="<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": gpu="
+                      <<h_bias.Data()[i]
+                      <<" cpu="
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("RPB::ForwardUnidirectional",passed);
+    CAIF_TestHarness::Report("RPB::ForwardUnidirectional",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RPB::ForwardUnidirectional")
 }
@@ -274,7 +320,7 @@ static void TestRPBForwardUnidirectional()
 //------------------------------------------------------------------------------
 // Test 3: RPB output shape correctness
 //------------------------------------------------------------------------------
-static void TestRPBShape()
+void CAIF_T5AttentionTests::TestRPBShape()
 {
   try
   {
@@ -284,33 +330,31 @@ static void TestRPBShape()
     const uint32_t k_len=16;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t config;
-    config.num_heads=num_heads;
-    config.num_buckets=num_buckets;
-    config.max_distance=128;
-    config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig config(num_heads,num_buckets,128,true);
 
     CAIF_DeviceRelativePositionBias<float,float> rpb(config,stream);
     CAIF_DeviceTensor bias=rpb.ComputeBias(q_len,k_len);
 
     const auto &shape=bias.Shape();
-    bool passed=(shape.size()==3 && shape[0]==num_heads &&
-                 shape[1]==q_len && shape[2]==k_len);
+    bool passed=(shape.size()==3 &&
+                 shape[0]==num_heads &&
+                 shape[1]==q_len &&
+                 shape[2]==k_len);
     if(passed==false)
     {
-      std::cout<<"  Expected shape [8,16,16], got [";
+      ISE_Out::Out()<<"  Expected shape [8,16,16], got [";
       for(size_t i=0;i<shape.size();++i)
       {
         if(i>0)
         {
-          std::cout<<",";
+          ISE_Out::Out()<<",";
         }
-        std::cout<<shape[i];
+        ISE_Out::Out()<<shape[i];
       }
-      std::cout<<"]\n";
+      ISE_Out::Out()<<"]\n";
     }
 
-    ReportResult("RPB::Shape",passed);
+    CAIF_TestHarness::Report("RPB::Shape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RPB::Shape")
 }
@@ -318,7 +362,7 @@ static void TestRPBShape()
 //------------------------------------------------------------------------------
 // Test 4: RPB parameter count and names
 //------------------------------------------------------------------------------
-static void TestRPBParameters()
+void CAIF_T5AttentionTests::TestRPBParameters()
 {
   try
   {
@@ -326,36 +370,38 @@ static void TestRPBParameters()
     const uint32_t num_buckets=32;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t config;
-    config.num_heads=num_heads;
-    config.num_buckets=num_buckets;
-    config.max_distance=128;
-    config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig config(num_heads,num_buckets,128,true);
 
     CAIF_DeviceRelativePositionBias<float,float> rpb(config,stream);
 
     bool passed=true;
     if(rpb.ParameterTensorCount()!=1)
     {
-      std::cout<<"  Expected 1 parameter tensor, got "
-               <<rpb.ParameterTensorCount()<<"\n";
+      ISE_Out::Out()<<"  Expected 1 parameter tensor, got "
+                    <<rpb.ParameterTensorCount()
+                    <<"\n";
       passed=false;
     }
     if(rpb.TotalParameterCount()!=num_heads*num_buckets)
     {
-      std::cout<<"  Expected "<<num_heads*num_buckets<<" params, got "
-               <<rpb.TotalParameterCount()<<"\n";
+      ISE_Out::Out()<<"  Expected "
+                    <<num_heads*num_buckets
+                    <<" params, got "
+                    <<rpb.TotalParameterCount()
+                    <<"\n";
       passed=false;
     }
 
     auto names=rpb.ParameterNames("block.0.");
-    if(names.size()!=1 || names[0]!="block.0.relative_attention_bias.weight")
+    if(names.size()!=1 || names[0]!="block.0.rpb")
     {
-      std::cout<<"  Unexpected param name: "<<names[0]<<"\n";
+      ISE_Out::Out()<<"  Unexpected param name: "
+                    <<names[0]
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("RPB::Parameters",passed);
+    CAIF_TestHarness::Report("RPB::Parameters",passed);
   }
   CAIF_TEST_CATCH_BLOCK("RPB::Parameters")
 }
@@ -363,7 +409,7 @@ static void TestRPBParameters()
 //------------------------------------------------------------------------------
 // Test 5: T5 attention forward matches CPU reference with bias
 //------------------------------------------------------------------------------
-static void TestT5AttentionForward()
+void CAIF_T5AttentionTests::TestT5AttentionForward()
 {
   try
   {
@@ -380,11 +426,10 @@ static void TestT5AttentionForward()
     CAIF_DeviceT5Attention<float,float> t5attn(config,stream);
 
     // Compute position bias
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t rpb_config;
-    rpb_config.num_heads=num_heads;
-    rpb_config.num_buckets=g_caif_rpb_default_num_buckets;
-    rpb_config.max_distance=g_caif_rpb_default_max_distance;
-    rpb_config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig rpb_config(num_heads,
+                                                     g_caif_rpb_default_num_buckets,
+                                                     g_caif_rpb_default_max_distance,
+                                                     true);
     CAIF_DeviceRelativePositionBias<float,float> rpb(rpb_config,stream);
 
     CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
@@ -430,16 +475,21 @@ static void TestT5AttentionForward()
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(h_output.Data()[i],expected[i],5e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(h_output.Data()[i],expected[i],g_caif_t5_test_forward_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": gpu="<<h_output.Data()[i]
-                 <<" cpu="<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": gpu="
+                      <<h_output.Data()[i]
+                      <<" cpu="
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("T5Attention::Forward",passed);
+    CAIF_TestHarness::Report("T5Attention::Forward",passed);
   }
   CAIF_TEST_CATCH_BLOCK("T5Attention::Forward")
 }
@@ -447,7 +497,7 @@ static void TestT5AttentionForward()
 //------------------------------------------------------------------------------
 // Test 6: T5 attention forward with causal mask
 //------------------------------------------------------------------------------
-static void TestT5AttentionCausal()
+void CAIF_T5AttentionTests::TestT5AttentionCausal()
 {
   try
   {
@@ -463,11 +513,10 @@ static void TestT5AttentionCausal()
     auto config=MakeConfig(dim,num_heads,true);
     CAIF_DeviceT5Attention<float,float> t5attn(config,stream);
 
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t rpb_config;
-    rpb_config.num_heads=num_heads;
-    rpb_config.num_buckets=g_caif_rpb_default_num_buckets;
-    rpb_config.max_distance=g_caif_rpb_default_max_distance;
-    rpb_config.bidirectional=false;
+    CAIF_DeviceRelativePositionBiasConfig rpb_config(num_heads,
+                                                     g_caif_rpb_default_num_buckets,
+                                                     g_caif_rpb_default_max_distance,
+                                                     false);
     CAIF_DeviceRelativePositionBias<float,float> rpb(rpb_config,stream);
 
     CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
@@ -509,16 +558,21 @@ static void TestT5AttentionCausal()
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(h_output.Data()[i],expected[i],5e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(h_output.Data()[i],expected[i],g_caif_t5_test_forward_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": gpu="<<h_output.Data()[i]
-                 <<" cpu="<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": gpu="
+                      <<h_output.Data()[i]
+                      <<" cpu="
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("T5Attention::ForwardCausal",passed);
+    CAIF_TestHarness::Report("T5Attention::ForwardCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("T5Attention::ForwardCausal")
 }
@@ -526,7 +580,7 @@ static void TestT5AttentionCausal()
 //------------------------------------------------------------------------------
 // Test 7: T5 attention backward produces non-zero gradients
 //------------------------------------------------------------------------------
-static void TestT5AttentionBackward()
+void CAIF_T5AttentionTests::TestT5AttentionBackward()
 {
   try
   {
@@ -541,11 +595,10 @@ static void TestT5AttentionBackward()
     auto config=MakeConfig(dim,num_heads,false);
     CAIF_DeviceT5Attention<float,float> t5attn(config,stream);
 
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t rpb_config;
-    rpb_config.num_heads=num_heads;
-    rpb_config.num_buckets=g_caif_rpb_default_num_buckets;
-    rpb_config.max_distance=g_caif_rpb_default_max_distance;
-    rpb_config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig rpb_config(num_heads,
+                                                     g_caif_rpb_default_num_buckets,
+                                                     g_caif_rpb_default_max_distance,
+                                                     true);
     CAIF_DeviceRelativePositionBias<float,float> rpb(rpb_config,stream);
 
     CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
@@ -577,7 +630,7 @@ static void TestT5AttentionBackward()
     const auto &shape=h_grad_input.Shape();
     if(shape.size()!=3 || shape[0]!=batch || shape[1]!=seq_len || shape[2]!=dim)
     {
-      std::cout<<"  grad_input shape mismatch\n";
+      ISE_Out::Out()<<"  grad_input shape mismatch\n";
       passed=false;
     }
 
@@ -592,7 +645,7 @@ static void TestT5AttentionBackward()
     }
     if(any_nonzero==false)
     {
-      std::cout<<"  grad_input is all zeros\n";
+      ISE_Out::Out()<<"  grad_input is all zeros\n";
       passed=false;
     }
 
@@ -609,7 +662,7 @@ static void TestT5AttentionBackward()
     }
     if(bias_grad_nonzero==false)
     {
-      std::cout<<"  position bias gradient is all zeros\n";
+      ISE_Out::Out()<<"  position bias gradient is all zeros\n";
       passed=false;
     }
 
@@ -639,11 +692,11 @@ static void TestT5AttentionBackward()
     }
     if(weight_grad_nonzero==false)
     {
-      std::cout<<"  weight gradients are all zeros\n";
+      ISE_Out::Out()<<"  weight gradients are all zeros\n";
       passed=false;
     }
 
-    ReportResult("T5Attention::Backward",passed);
+    CAIF_TestHarness::Report("T5Attention::Backward",passed);
   }
   CAIF_TEST_CATCH_BLOCK("T5Attention::Backward")
 }
@@ -653,7 +706,7 @@ static void TestT5AttentionBackward()
 // Runs standard MHA (no T5, no position bias) and verifies it still
 // matches the same CPU reference as test_device_attention.cpp
 //------------------------------------------------------------------------------
-static void TestBaseMHARegression()
+void CAIF_T5AttentionTests::TestBaseMHARegression()
 {
   try
   {
@@ -705,16 +758,21 @@ static void TestBaseMHARegression()
     bool passed=true;
     for(size_t i=0;i<expected.size();++i)
     {
-      if(FloatEqual(h_output.Data()[i],expected[i],5e-3f)==false)
+      if(CAIF_TestHarness::FloatEqual(h_output.Data()[i],expected[i],g_caif_t5_test_forward_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": gpu="<<h_output.Data()[i]
-                 <<" cpu="<<expected[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": gpu="
+                      <<h_output.Data()[i]
+                      <<" cpu="
+                      <<expected[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
 
-    ReportResult("BaseMHA::Regression",passed);
+    CAIF_TestHarness::Report("BaseMHA::Regression",passed);
   }
   CAIF_TEST_CATCH_BLOCK("BaseMHA::Regression")
 }
@@ -722,7 +780,7 @@ static void TestBaseMHARegression()
 //------------------------------------------------------------------------------
 // Benchmark: RPB forward timing
 //------------------------------------------------------------------------------
-static void BenchmarkRPBForward()
+void CAIF_T5AttentionTests::BenchmarkRPBForward()
 {
   try
   {
@@ -730,27 +788,21 @@ static void BenchmarkRPBForward()
     const uint32_t num_buckets=32;
     const uint32_t max_distance=128;
     const uint32_t seq_len=512;
-    const int warmup_iters=10;
-    const int bench_iters=100;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t config;
-    config.num_heads=num_heads;
-    config.num_buckets=num_buckets;
-    config.max_distance=max_distance;
-    config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig config(num_heads,num_buckets,max_distance,true);
 
     CAIF_DeviceRelativePositionBias<float,float> rpb(config,stream);
 
     // Warmup
-    for(int i=0;i<warmup_iters;++i)
+    for(int i=0;i<g_caif_t5_rpb_bench_warmup;++i)
     {
       CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
     }
     cudaStreamSynchronize(stream.Handle());
 
     auto start=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<bench_iters;++i)
+    for(int i=0;i<g_caif_t5_rpb_bench_iters;++i)
     {
       CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
     }
@@ -758,28 +810,39 @@ static void BenchmarkRPBForward()
     auto end=std::chrono::high_resolution_clock::now();
 
     const double elapsed_ms=std::chrono::duration<double,std::milli>(end-start).count();
-    const double per_iter_us=elapsed_ms*1000.0/static_cast<double>(bench_iters);
+    const double per_iter_us=elapsed_ms*1000.0/static_cast<double>(g_caif_t5_rpb_bench_iters);
 
-    std::cout<<"[BENCH] RPB forward (heads="<<num_heads
-             <<",seq="<<seq_len
-             <<",buckets="<<num_buckets
-             <<"): "<<per_iter_us<<" us/iter"
-             <<" ("<<bench_iters<<" iters)\n";
+    ISE_Out::Out()<<"[BENCH] RPB forward (heads="
+                  <<num_heads
+                  <<",seq="
+                  <<seq_len
+                  <<",buckets="
+                  <<num_buckets
+                  <<"): "
+                  <<per_iter_us
+                  <<" us/iter"
+                  <<" ("
+                  <<g_caif_t5_rpb_bench_iters
+                  <<" iters)\n";
   }
   catch(const CAIF_Exception &e)
   {
-    std::cout<<"[BENCH] RPB forward: FAILED ("<<e<<")\n";
+    ISE_Out::Out()<<"[BENCH] RPB forward: FAILED ("
+                  <<e
+                  <<")\n";
   }
   catch(const std::exception &e)
   {
-    std::cout<<"[BENCH] RPB forward: FAILED ("<<e.what()<<")\n";
+    ISE_Out::Out()<<"[BENCH] RPB forward: FAILED ("
+                  <<e.what()
+                  <<")\n";
   }
 }
 
 //------------------------------------------------------------------------------
 // Benchmark: T5 attention forward vs base MHA forward
 //------------------------------------------------------------------------------
-static void BenchmarkT5vsBaseMHA()
+void CAIF_T5AttentionTests::BenchmarkT5vsBaseMHA()
 {
   try
   {
@@ -787,8 +850,6 @@ static void BenchmarkT5vsBaseMHA()
     const uint32_t seq_len=128;
     const uint32_t dim=256;
     const uint32_t num_heads=8;
-    const int warmup_iters=5;
-    const int bench_iters=50;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
@@ -802,11 +863,10 @@ static void BenchmarkT5vsBaseMHA()
 
     // T5 attention
     CAIF_DeviceT5Attention<float,float> t5attn(config,stream);
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t rpb_config;
-    rpb_config.num_heads=num_heads;
-    rpb_config.num_buckets=g_caif_rpb_default_num_buckets;
-    rpb_config.max_distance=g_caif_rpb_default_max_distance;
-    rpb_config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig rpb_config(num_heads,
+                                                     g_caif_rpb_default_num_buckets,
+                                                     g_caif_rpb_default_max_distance,
+                                                     true);
     CAIF_DeviceRelativePositionBias<float,float> rpb(rpb_config,stream);
     CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
     ctx.SetPositionBias(bias);
@@ -816,7 +876,7 @@ static void BenchmarkT5vsBaseMHA()
     auto input=CAIF_DeviceTensor::FromHostData(host_input.data(),{batch,seq_len,dim},stream);
 
     // Warmup base MHA
-    for(int i=0;i<warmup_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_warmup_iters;++i)
     {
       mha.Forward(input,ctx);
     }
@@ -824,17 +884,17 @@ static void BenchmarkT5vsBaseMHA()
 
     // Bench base MHA
     auto start=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<bench_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_iters;++i)
     {
       mha.Forward(input,ctx);
     }
     cudaStreamSynchronize(stream.Handle());
     auto end=std::chrono::high_resolution_clock::now();
     const double base_ms=std::chrono::duration<double,std::milli>(end-start).count();
-    const double base_per_iter=base_ms/static_cast<double>(bench_iters);
+    const double base_per_iter=base_ms/static_cast<double>(g_caif_t5_bench_iters);
 
     // Warmup T5
-    for(int i=0;i<warmup_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_warmup_iters;++i)
     {
       t5attn.Forward(input,ctx);
     }
@@ -842,41 +902,53 @@ static void BenchmarkT5vsBaseMHA()
 
     // Bench T5
     start=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<bench_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_iters;++i)
     {
       t5attn.Forward(input,ctx);
     }
     cudaStreamSynchronize(stream.Handle());
     end=std::chrono::high_resolution_clock::now();
     const double t5_ms=std::chrono::duration<double,std::milli>(end-start).count();
-    const double t5_per_iter=t5_ms/static_cast<double>(bench_iters);
+    const double t5_per_iter=t5_ms/static_cast<double>(g_caif_t5_bench_iters);
 
     const double overhead_pct=((t5_per_iter-base_per_iter)/base_per_iter)*100.0;
 
-    std::cout<<"[BENCH] Base MHA forward (batch="<<batch
-             <<",seq="<<seq_len
-             <<",dim="<<dim
-             <<",heads="<<num_heads
-             <<"): "<<base_per_iter<<" ms/iter\n";
-    std::cout<<"[BENCH] T5 attention forward (same config + RPB): "
-             <<t5_per_iter<<" ms/iter\n";
-    std::cout<<"[BENCH] T5 overhead vs base MHA: "
-             <<overhead_pct<<"%%\n";
+    ISE_Out::Out()<<"[BENCH] Base MHA forward (batch="
+                  <<batch
+                  <<",seq="
+                  <<seq_len
+                  <<",dim="
+                  <<dim
+                  <<",heads="
+                  <<num_heads
+                  <<"): "
+                  <<base_per_iter
+                  <<" ms/iter\n";
+    ISE_Out::Out()<<"[BENCH] T5 attention forward (same config + RPB): "
+                  <<t5_per_iter
+                  <<" ms/iter\n";
+    ISE_Out::Out()<<"[BENCH] T5 overhead vs base MHA: "
+                  <<overhead_pct
+                  <<"%%\n";
   }
   catch(const CAIF_Exception &e)
   {
-    std::cout<<"[BENCH] T5 vs Base MHA: FAILED ("<<e<<")\n";
+    ISE_Out::Out()<<"[BENCH] T5 vs Base MHA: FAILED ("
+                  <<e
+                  <<")\n";
   }
   catch(const std::exception &e)
   {
-    std::cout<<"[BENCH] T5 vs Base MHA: FAILED ("<<e.what()<<")\n";
+    ISE_Out::Out()<<"[BENCH] T5 vs Base MHA: FAILED ("
+                  <<e.what()
+                  <<")\n";
   }
 }
 
 //------------------------------------------------------------------------------
 // Benchmark: T5 attention forward+backward timing
 //------------------------------------------------------------------------------
-static void BenchmarkT5ForwardBackward()
+void CAIF_T5AttentionTests::BenchmarkT5ForwardBackward()
 {
   try
   {
@@ -884,8 +956,6 @@ static void BenchmarkT5ForwardBackward()
     const uint32_t seq_len=128;
     const uint32_t dim=256;
     const uint32_t num_heads=8;
-    const int warmup_iters=5;
-    const int bench_iters=50;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
@@ -893,11 +963,10 @@ static void BenchmarkT5ForwardBackward()
     auto config=MakeConfig(dim,num_heads,false);
 
     CAIF_DeviceT5Attention<float,float> t5attn(config,stream);
-    CAIF_DeviceRelativePositionBias<float,float>::Config_t rpb_config;
-    rpb_config.num_heads=num_heads;
-    rpb_config.num_buckets=g_caif_rpb_default_num_buckets;
-    rpb_config.max_distance=g_caif_rpb_default_max_distance;
-    rpb_config.bidirectional=true;
+    CAIF_DeviceRelativePositionBiasConfig rpb_config(num_heads,
+                                                     g_caif_rpb_default_num_buckets,
+                                                     g_caif_rpb_default_max_distance,
+                                                     true);
     CAIF_DeviceRelativePositionBias<float,float> rpb(rpb_config,stream);
     CAIF_DeviceTensor bias=rpb.ComputeBias(seq_len,seq_len);
     auto grad_bias=CAIF_DeviceTensor::Zeros({num_heads,seq_len,seq_len},stream);
@@ -910,7 +979,7 @@ static void BenchmarkT5ForwardBackward()
     auto grad_output=CAIF_DeviceTensor::FromHostData(grad_data.data(),{batch,seq_len,dim},stream);
 
     // Warmup
-    for(int i=0;i<warmup_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_warmup_iters;++i)
     {
       t5attn.ZeroGradients();
       ctx.SetTraining(true);
@@ -922,7 +991,7 @@ static void BenchmarkT5ForwardBackward()
     cudaStreamSynchronize(stream.Handle());
 
     auto start=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<bench_iters;++i)
+    for(int i=0;i<g_caif_t5_bench_iters;++i)
     {
       t5attn.ZeroGradients();
       ctx.SetTraining(true);
@@ -935,33 +1004,40 @@ static void BenchmarkT5ForwardBackward()
     auto end=std::chrono::high_resolution_clock::now();
 
     const double elapsed_ms=std::chrono::duration<double,std::milli>(end-start).count();
-    const double per_iter=elapsed_ms/static_cast<double>(bench_iters);
+    const double per_iter=elapsed_ms/static_cast<double>(g_caif_t5_bench_iters);
 
-    std::cout<<"[BENCH] T5 attention fwd+bwd (batch="<<batch
-             <<",seq="<<seq_len
-             <<",dim="<<dim
-             <<",heads="<<num_heads
-             <<"): "<<per_iter<<" ms/iter\n";
+    ISE_Out::Out()<<"[BENCH] T5 attention fwd+bwd (batch="
+                  <<batch
+                  <<",seq="
+                  <<seq_len
+                  <<",dim="
+                  <<dim
+                  <<",heads="
+                  <<num_heads
+                  <<"): "
+                  <<per_iter
+                  <<" ms/iter\n";
   }
   catch(const CAIF_Exception &e)
   {
-    std::cout<<"[BENCH] T5 fwd+bwd: FAILED ("<<e<<")\n";
+    ISE_Out::Out()<<"[BENCH] T5 fwd+bwd: FAILED ("
+                  <<e
+                  <<")\n";
   }
   catch(const std::exception &e)
   {
-    std::cout<<"[BENCH] T5 fwd+bwd: FAILED ("<<e.what()<<")\n";
+    ISE_Out::Out()<<"[BENCH] T5 fwd+bwd: FAILED ("
+                  <<e.what()
+                  <<")\n";
   }
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_T5AttentionTests::RunAll()
 {
-  std::cout<<"=== CAIF T5 Attention & RPB Tests ===\n\n";
+  ISE_Out::Out()<<"=== CAIF T5 Attention & RPB Tests ===\n\n";
 
-#ifdef USE_CAIF_CUDA
   // Correctness tests
-  std::cout<<"--- Correctness ---\n";
+  ISE_Out::Out()<<"--- Correctness ---\n";
   TestRPBForwardBidirectional();
   TestRPBForwardUnidirectional();
   TestRPBShape();
@@ -972,13 +1048,23 @@ int main()
   TestBaseMHARegression();
 
   // Benchmarks (sequential — shared GPU)
-  std::cout<<"\n--- Benchmarks ---\n";
+  ISE_Out::Out()<<"\n--- Benchmarks ---\n";
   BenchmarkRPBForward();
   BenchmarkT5vsBaseMHA();
   BenchmarkT5ForwardBackward();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_T5AttentionTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

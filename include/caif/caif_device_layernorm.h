@@ -67,7 +67,40 @@ class CAIF_DeviceLayerNorm:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     // Accessors (StorageDtype()/ComputeDtype() inherited from
     // CAIF_DeviceLayerTyped — no per-layer copy needed).
     uint32_t Dim()const{return _dim;}
+    void SetDim(uint32_t dim){_dim=dim;}
     float Epsilon()const{return _epsilon;}
+    void SetEpsilon(float epsilon){_epsilon=epsilon;}
+
+    CAIF_DeviceTensor &Gamma(){return _gamma;}
+    const CAIF_DeviceTensor &Gamma()const{return _gamma;}
+    void SetGamma(CAIF_DeviceTensor &&gamma){_gamma=std::move(gamma);}
+
+    CAIF_DeviceTensor &Beta(){return _beta;}
+    const CAIF_DeviceTensor &Beta()const{return _beta;}
+    void SetBeta(CAIF_DeviceTensor &&beta){_beta=std::move(beta);}
+
+    CAIF_DeviceTensor &GammaGrad(){return _gamma_grad;}
+    const CAIF_DeviceTensor &GammaGrad()const{return _gamma_grad;}
+    void SetGammaGrad(CAIF_DeviceTensor &&gamma_grad){_gamma_grad=std::move(gamma_grad);}
+
+    CAIF_DeviceTensor &BetaGrad(){return _beta_grad;}
+    const CAIF_DeviceTensor &BetaGrad()const{return _beta_grad;}
+    void SetBetaGrad(CAIF_DeviceTensor &&beta_grad){_beta_grad=std::move(beta_grad);}
+
+    int CachedRows()const{return _cached_rows;}
+    void SetCachedRows(int rows){_cached_rows=rows;}
+
+    CAIF_DeviceTensor &LastInput(){return _last_input;}
+    const CAIF_DeviceTensor &LastInput()const{return _last_input;}
+    void SetLastInput(CAIF_DeviceTensor &&last_input){_last_input=std::move(last_input);}
+
+    CAIF_DeviceTensor &MeanCache(){return _mean_cache;}
+    const CAIF_DeviceTensor &MeanCache()const{return _mean_cache;}
+    void SetMeanCache(CAIF_DeviceTensor &&mean_cache){_mean_cache=std::move(mean_cache);}
+
+    CAIF_DeviceTensor &RstdCache(){return _rstd_cache;}
+    const CAIF_DeviceTensor &RstdCache()const{return _rstd_cache;}
+    void SetRstdCache(CAIF_DeviceTensor &&rstd_cache){_rstd_cache=std::move(rstd_cache);}
 
     /**
      * @brief Replace gamma (scale) with a tensor of shape [dim].

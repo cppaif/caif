@@ -23,22 +23,30 @@
 // overlaps with the current stage's compute, and evicts a stage's
 // pinned-host weights as soon as that stage's backward is done.
 //
-// MVP scheduling (lookahead=1, lag=0):
-//   forward stage i  : prefetch stage i+1 (async on copy stream)
-//                      do compute on stage i (already prefetched)
-//                      compute stream waits on copy stream's i+1 event
-//                      [does not evict during forward — backward will need
-//                       these stages too]
-//   backward stage i : do compute on stage i (still prefetched from forward)
-//                      evict stage i (free GPU scratch)
-//                      prefetch stage i-1 if not already in
+// Scheduling (lookahead=1, lag=0):
+//   forward stage i  : compute stream waits on stage i's H2D event
+//                      prefetch stage i+1 (async on copy stream, event
+//                      recorded after the H2D)
+//                      do compute on stage i
+//                      on exit: evict stage i — the eviction's stream-side
+//                      frees are ordered after compute's reads via a
+//                      compute-stream event the copy stream waits on
+//                      (read-before-free guard); GPU peak stays bounded by
+//                      one stage's working set, backward re-prefetches
+//                      lazily
+//   backward stage i : compute stream waits on stage i's H2D event
+//                      (cold-started on the copy stream if forward evicted
+//                      it); prefetch stage i-1 (backward walks high -> low)
+//                      do compute on stage i; on exit: guarded evict
 //
-// Stages register themselves at block-construction time. When no
+// All synchronization is GPU-side (cudaStreamWaitEvent) — the host never
+// blocks. Stages register themselves at block-construction time. When no
 // frozen-offloadable sublayers are registered, the scheduler is a no-op.
 //------------------------------------------------------------------------------
 #pragma once
 
 #include "caif_base.h"
+#include "caif_cuda_event.h"
 #include "caif_cuda_stream.h"
 #include "caif_device_frozen_linear_base.h"
 
@@ -74,15 +82,17 @@ class CAIF_BlockOffloadScheduler:public CAIF_Base
     // compute stream sees the prefetched weight as a happens-before
     // dependency.
     void OnEnterForwardStage(const size_t stage_index,CAIF_CudaStream &compute_stream);
-    void OnExitForwardStage(const size_t stage_index);
+    void OnExitForwardStage(const size_t stage_index,CAIF_CudaStream &compute_stream);
     void OnEnterBackwardStage(const size_t stage_index,CAIF_CudaStream &compute_stream);
-    void OnExitBackwardStage(const size_t stage_index);
+    void OnExitBackwardStage(const size_t stage_index,CAIF_CudaStream &compute_stream);
 
-    // Evict every registered stage. Called at block destruction or when
-    // disabling offload.
+    // Evict every registered stage and drop pending prefetch events.
+    // Teardown path (block destruction / disabling offload) — the caller
+    // must have quiesced compute on the stages first; there is no
+    // read-before-free guard here.
     void EvictAll();
 
-    size_t StageCount()const{return _stage_layers.size();}
+    size_t StageCount()const{return StageLayers().size();}
     bool HasAnyOffloadedLayer()const;
 
     // Layer-level read accessors. The scheduler stores raw non-owning
@@ -104,6 +114,22 @@ class CAIF_BlockOffloadScheduler:public CAIF_Base
     void EvictStage(const size_t stage_index);
     CAIF_CudaStream &CopyStream();
 
+    // Issue stage `stage_index`'s H2D on the copy stream and record its
+    // completion event. No-op when the stage has no layers, is already
+    // fully prefetched, or already has a pending event.
+    void IssuePrefetch(const size_t stage_index);
+    // GPU-side wait: `compute_stream` waits on the stage's pending H2D
+    // event (consumed). Cold-starts the prefetch when none was issued
+    // (stage 0 of forward; lazy re-prefetch in backward after the forward
+    // sweep evicted the stage).
+    void AwaitPrefetch(const size_t stage_index,CAIF_CudaStream &compute_stream);
+    // Read-before-free guard: the copy stream waits on an event recorded
+    // on `compute_stream`, then the stage is evicted. The weights were
+    // allocated on the copy stream, so their cudaFreeAsync lands there —
+    // ordered after compute's reads.
+    void GuardedEvict(const size_t stage_index,CAIF_CudaStream &compute_stream);
+    bool StageFullyPrefetched(const size_t stage_index)const;
+
     // Single-purpose private setters/probes that own all direct touches
     // of `_stage_layers`. Every non-trivial method body routes through
     // these; method bodies never touch `_stage_layers` themselves.
@@ -111,7 +137,18 @@ class CAIF_BlockOffloadScheduler:public CAIF_Base
     void EnsureStageCapacity(const size_t stage_index);
     void AppendLayerAtStage(const size_t stage_index,CAIF_DeviceFrozenLinearBase &layer);
 
+    // Single point of access for the stage-layer table; every method
+    // body routes through this rather than touching `_stage_layers`.
+    const StageLayersVec_t &StageLayers()const{return _stage_layers;}
+    StageLayersVec_t &StageLayers(){return _stage_layers;}
+
+    // Single point of access for the per-stage pending H2D-complete
+    // events. A null entry means no prefetch is in flight for that stage.
+    const CAIF_CudaEvent::PtrVec_t &PrefetchEvents()const{return _prefetch_events;}
+    CAIF_CudaEvent::PtrVec_t &PrefetchEvents(){return _prefetch_events;}
+
     StageLayersVec_t _stage_layers;
+    CAIF_CudaEvent::PtrVec_t _prefetch_events;
     std::unique_ptr<CAIF_CudaStream> _copy_stream;
 };
 

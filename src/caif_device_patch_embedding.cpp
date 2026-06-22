@@ -15,8 +15,10 @@
 #include "caif_device_patch_embedding.h"
 #include "caif_device_patch_embedding_factory.h"
 #include "caif_ops.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_embeddings.cuh"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
+#include "caif_serialization_constants.h"
 #include <vector>
 #include <cmath>
 
@@ -24,14 +26,9 @@ namespace instance
 {
 
 
-// CLS-token init uses a small offset on top of the golden-ratio
-// sequence so the deterministic seed differs from the W_proj table.
-constexpr float g_caif_cls_token_init_offset=0.3f;
-
-
 template<typename ComputeT,typename StorageT>
 CAIF_DevicePatchEmbedding<ComputeT,StorageT>::CAIF_DevicePatchEmbedding(
-                                                  const Config_t &config,
+                                                  const CAIF_DevicePatchEmbeddingConfig &config,
                                                   CAIF_CudaStream &stream):
                                           CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                           _config(config),
@@ -51,61 +48,61 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::CAIF_DevicePatchEmbedding(
 {
   try
   {
-    if(config.patch_size==0)
+    if(config.PatchSize()==0)
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding: patch_size must be > 0");
     }
-    if(config.dim==0)
+    if(config.Dim()==0)
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding: dim must be > 0");
     }
-    if(config.image_height%config.patch_size!=0)
+    if(config.ImageHeight()%config.PatchSize()!=0)
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding: image_height must be divisible by patch_size");
     }
-    if(config.image_width%config.patch_size!=0)
+    if(config.ImageWidth()%config.PatchSize()!=0)
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding: image_width must be divisible by patch_size");
     }
 
-    _num_patches_h=config.image_height/config.patch_size;
-    _num_patches_w=config.image_width/config.patch_size;
-    _num_patches=_num_patches_h*_num_patches_w;
-    _patch_flat_dim=config.patch_size*config.patch_size*config.channels;
+    SetNumPatchesH(config.ImageHeight()/config.PatchSize());
+    SetNumPatchesW(config.ImageWidth()/config.PatchSize());
+    SetNumPatches(NumPatchesH()*NumPatchesW());
+    SetPatchFlatDim(config.PatchSize()*config.PatchSize()*config.Channels());
 
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
     // Xavier uniform init for W_proj.
     const float w_limit=std::sqrt(g_caif_xavier_uniform_scale/
-                                   static_cast<float>(_patch_flat_dim+config.dim));
-    const size_t w_size=static_cast<size_t>(_patch_flat_dim)*config.dim;
+                                   static_cast<float>(PatchFlatDim()+config.Dim()));
+    const size_t w_size=static_cast<size_t>(PatchFlatDim())*config.Dim();
     std::vector<float> w_init(w_size);
     for(size_t i=0;i<w_size;++i)
     {
       const float t=static_cast<float>(i)*g_caif_golden_ratio_frac;
       w_init[i]=(t-std::floor(t))*2.0f*w_limit-w_limit;
     }
-    SetWProj(CAIF_DeviceTensor::Uninitialized({PatchFlatDim(),config.dim},stream,sdt));
+    SetWProj(CAIF_DeviceTensor::Uninitialized({PatchFlatDim(),config.Dim()},stream,sdt));
     WProjMut().CopyFromHostFp32(w_init.data(),w_size);
 
-    SetBProj(CAIF_DeviceTensor::Zeros({config.dim},stream,sdt));
-    SetGradWProj(CAIF_DeviceTensor::Zeros({PatchFlatDim(),config.dim},stream,sdt));
-    SetGradBProj(CAIF_DeviceTensor::Zeros({config.dim},stream,sdt));
+    SetBProj(CAIF_DeviceTensor::Zeros({config.Dim()},stream,sdt));
+    SetGradWProj(CAIF_DeviceTensor::Zeros({PatchFlatDim(),config.Dim()},stream,sdt));
+    SetGradBProj(CAIF_DeviceTensor::Zeros({config.Dim()},stream,sdt));
 
-    if(config.use_cls_token==true)
+    if(config.UseCLSToken()==true)
     {
       const float cls_limit=std::sqrt(g_caif_xavier_uniform_scale/
-                                       static_cast<float>(1+config.dim));
-      std::vector<float> cls_init(config.dim);
-      for(uint32_t i=0;i<config.dim;++i)
+                                       static_cast<float>(1+config.Dim()));
+      std::vector<float> cls_init(config.Dim());
+      for(uint32_t i=0;i<config.Dim();++i)
       {
         const float t=static_cast<float>(i)*g_caif_golden_ratio_frac+
                        g_caif_cls_token_init_offset;
         cls_init[i]=(t-std::floor(t))*2.0f*cls_limit-cls_limit;
       }
-      SetCLSToken(CAIF_DeviceTensor::Uninitialized({1,config.dim},stream,sdt));
-      CLSTokenMut().CopyFromHostFp32(cls_init.data(),config.dim);
-      SetGradCls(CAIF_DeviceTensor::Zeros({1,config.dim},stream,sdt));
+      SetCLSToken(CAIF_DeviceTensor::Uninitialized({1,config.Dim()},stream,sdt));
+      CLSTokenMut().CopyFromHostFp32(cls_init.data(),config.Dim());
+      SetGradCls(CAIF_DeviceTensor::Zeros({1,config.Dim()},stream,sdt));
     }
   }
   CAIF_CATCH_BLOCK()
@@ -141,20 +138,20 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::operator=(CAIF_DevicePatchEmbeddin
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _config=other._config;
-      _num_patches_h=other._num_patches_h;
-      _num_patches_w=other._num_patches_w;
-      _num_patches=other._num_patches;
-      _patch_flat_dim=other._patch_flat_dim;
-      _w_proj=std::move(other._w_proj);
-      _b_proj=std::move(other._b_proj);
-      _cls_token=std::move(other._cls_token);
-      _grad_w_proj=std::move(other._grad_w_proj);
-      _grad_b_proj=std::move(other._grad_b_proj);
-      _grad_cls=std::move(other._grad_cls);
-      _cached_input=std::move(other._cached_input);
-      _cached_patches=std::move(other._cached_patches);
-      _cached_batch=other._cached_batch;
+      SetConfig(other.Config());
+      SetNumPatchesH(other.NumPatchesH());
+      SetNumPatchesW(other.NumPatchesW());
+      SetNumPatches(other.NumPatches());
+      SetPatchFlatDim(other.PatchFlatDim());
+      SetWProj(std::move(other.WProjMut()));
+      SetBProj(std::move(other.BProj()));
+      SetCLSToken(std::move(other.CLSTokenMut()));
+      SetGradWProj(std::move(other.GradWProj()));
+      SetGradBProj(std::move(other.GradBProj()));
+      SetGradCls(std::move(other.GradCls()));
+      SetCachedInput(std::move(other.CachedInput()));
+      SetCachedPatches(std::move(other.CachedPatches()));
+      SetCachedBatch(other.CachedBatch());
     }
     return *this;
   }
@@ -181,14 +178,14 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTenso
     const uint32_t w=shape[2];
     const uint32_t c=shape[3];
 
-    if(h!=_config.image_height||w!=_config.image_width||c!=_config.channels)
+    if(h!=Config().ImageHeight()||w!=Config().ImageWidth()||c!=Config().Channels())
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding::Forward: input dimensions mismatch config");
     }
 
-    const uint32_t total_patches=batch*_num_patches;
+    const uint32_t total_patches=batch*NumPatches();
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
-    CAIF_DeviceTensor patches=CAIF_DeviceTensor::Uninitialized({total_patches,_patch_flat_dim},
+    CAIF_DeviceTensor patches=CAIF_DeviceTensor::Uninitialized({total_patches,PatchFlatDim()},
                                                                 ctx.Stream(),sdt);
 
     launch_extract_patches<StorageT>(input.template DevicePtr<StorageT>(),
@@ -197,29 +194,29 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTenso
                                      static_cast<int>(h),
                                      static_cast<int>(w),
                                      static_cast<int>(c),
-                                     static_cast<int>(_config.patch_size),
-                                     static_cast<int>(_num_patches_h),
-                                     static_cast<int>(_num_patches_w),
-                                     static_cast<int>(_patch_flat_dim),
+                                     static_cast<int>(Config().PatchSize()),
+                                     static_cast<int>(NumPatchesH()),
+                                     static_cast<int>(NumPatchesW()),
+                                     static_cast<int>(PatchFlatDim()),
                                      ctx.Stream().Handle());
 
-    CAIF_DeviceTensor projected=CAIF_DeviceTensor::Uninitialized({total_patches,_config.dim},
+    CAIF_DeviceTensor projected=CAIF_DeviceTensor::Uninitialized({total_patches,Config().Dim()},
                                                                   ctx.Stream(),sdt);
-    CAIF_Ops::MatMul(patches,_w_proj,projected,ctx);
-    CAIF_Ops::BiasAdd(projected,_b_proj,projected);
-    projected.Reshape({batch,_num_patches,_config.dim});
+    CAIF_Ops::MatMul(patches,WProjMut(),projected,ctx);
+    CAIF_Ops::BiasAdd(projected,BProj(),projected);
+    projected.Reshape({batch,NumPatches(),Config().Dim()});
 
     CAIF_DeviceTensor output;
-    if(_config.use_cls_token==true)
+    if(Config().UseCLSToken()==true)
     {
-      const uint32_t out_seq=_num_patches+1;
-      output=CAIF_DeviceTensor::Uninitialized({batch,out_seq,_config.dim},ctx.Stream(),sdt);
+      const uint32_t out_seq=NumPatches()+1;
+      output=CAIF_DeviceTensor::Uninitialized({batch,out_seq,Config().Dim()},ctx.Stream(),sdt);
       launch_cls_prepend<StorageT>(projected.template DevicePtr<StorageT>(),
-                                   _cls_token.template DevicePtr<StorageT>(),
+                                   CLSToken().template DevicePtr<StorageT>(),
                                    output.template DevicePtr<StorageT>(),
                                    static_cast<int>(batch),
-                                   static_cast<int>(_num_patches),
-                                   static_cast<int>(_config.dim),
+                                   static_cast<int>(NumPatches()),
+                                   static_cast<int>(Config().Dim()),
                                    ctx.Stream().Handle());
     }
     else
@@ -229,9 +226,9 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTenso
 
     if(ctx.Training()==true)
     {
-      _cached_input=input.Clone();
-      _cached_patches=std::move(patches);
-      _cached_batch=batch;
+      SetCachedInput(input.Clone());
+      SetCachedPatches(std::move(patches));
+      SetCachedBatch(batch);
     }
 
     return output;
@@ -246,64 +243,64 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTens
 {
   try
   {
-    if(_cached_batch==0)
+    if(CachedBatch()==0)
     {
       THROW_CAIFE("CAIF_DevicePatchEmbedding::Backward: must call Forward with training=true first");
     }
 
-    const uint32_t batch=_cached_batch;
-    const uint32_t total_patches=batch*_num_patches;
+    const uint32_t batch=CachedBatch();
+    const uint32_t total_patches=batch*NumPatches();
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
     CAIF_DeviceTensor grad_patches;
-    if(_config.use_cls_token==true)
+    if(Config().UseCLSToken()==true)
     {
-      _grad_cls.FillZero();
-      grad_patches=CAIF_DeviceTensor::Uninitialized({batch,_num_patches,_config.dim},
+      GradCls().FillZero();
+      grad_patches=CAIF_DeviceTensor::Uninitialized({batch,NumPatches(),Config().Dim()},
                                                      ctx.Stream(),sdt);
       launch_cls_grad_extract<StorageT>(grad_output.template DevicePtr<StorageT>(),
-                                        _grad_cls.template DevicePtr<StorageT>(),
+                                        GradCls().template DevicePtr<StorageT>(),
                                         grad_patches.template DevicePtr<StorageT>(),
                                         static_cast<int>(batch),
-                                        static_cast<int>(_num_patches),
-                                        static_cast<int>(_config.dim),
+                                        static_cast<int>(NumPatches()),
+                                        static_cast<int>(Config().Dim()),
                                         ctx.Stream().Handle());
     }
     else
     {
       grad_patches=grad_output.Clone();
     }
-    grad_patches.Reshape({total_patches,_config.dim});
+    grad_patches.Reshape({total_patches,Config().Dim()});
 
-    _grad_b_proj.FillZero();
-    CAIF_Ops::BiasGradient(grad_patches,_grad_b_proj);
+    GradBProj().FillZero();
+    CAIF_Ops::BiasGradient(grad_patches,GradBProj());
 
-    CAIF_DeviceTensor grad_w_delta=CAIF_DeviceTensor::Uninitialized({_patch_flat_dim,_config.dim},
+    CAIF_DeviceTensor grad_w_delta=CAIF_DeviceTensor::Uninitialized({PatchFlatDim(),Config().Dim()},
                                                                      ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeA(_cached_patches,grad_patches,grad_w_delta,ctx);
-    CAIF_Ops::Add(_grad_w_proj,grad_w_delta,_grad_w_proj);
+    CAIF_Ops::MatMulTransposeA(CachedPatches(),grad_patches,grad_w_delta,ctx);
+    CAIF_Ops::Add(GradWProj(),grad_w_delta,GradWProj());
 
-    CAIF_DeviceTensor grad_flat=CAIF_DeviceTensor::Uninitialized({total_patches,_patch_flat_dim},
+    CAIF_DeviceTensor grad_flat=CAIF_DeviceTensor::Uninitialized({total_patches,PatchFlatDim()},
                                                                   ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeB(grad_patches,_w_proj,grad_flat,ctx);
+    CAIF_Ops::MatMulTransposeB(grad_patches,WProjMut(),grad_flat,ctx);
 
     CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Zeros(
                                   {batch,
-                                   _config.image_height,
-                                   _config.image_width,
-                                   _config.channels},
+                                   Config().ImageHeight(),
+                                   Config().ImageWidth(),
+                                   Config().Channels()},
                                   ctx.Stream(),sdt);
 
     launch_extract_patches_backward<StorageT>(grad_flat.template DevicePtr<StorageT>(),
                                               grad_input.template DevicePtr<StorageT>(),
                                               static_cast<int>(batch),
-                                              static_cast<int>(_config.image_height),
-                                              static_cast<int>(_config.image_width),
-                                              static_cast<int>(_config.channels),
-                                              static_cast<int>(_config.patch_size),
-                                              static_cast<int>(_num_patches_h),
-                                              static_cast<int>(_num_patches_w),
-                                              static_cast<int>(_patch_flat_dim),
+                                              static_cast<int>(Config().ImageHeight()),
+                                              static_cast<int>(Config().ImageWidth()),
+                                              static_cast<int>(Config().Channels()),
+                                              static_cast<int>(Config().PatchSize()),
+                                              static_cast<int>(NumPatchesH()),
+                                              static_cast<int>(NumPatchesW()),
+                                              static_cast<int>(PatchFlatDim()),
                                               ctx.Stream().Handle());
 
     return grad_input;
@@ -316,11 +313,11 @@ void CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_w_proj.FillZero();
-    _grad_b_proj.FillZero();
-    if(_config.use_cls_token==true)
+    GradWProj().FillZero();
+    GradBProj().FillZero();
+    if(Config().UseCLSToken()==true)
     {
-      _grad_cls.FillZero();
+      GradCls().FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
@@ -329,7 +326,7 @@ void CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ZeroGradients()
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  if(_config.use_cls_token==true)
+  if(Config().UseCLSToken()==true)
   {
     return 3;
   }
@@ -350,7 +347,7 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)
     {
       return _b_proj;
     }
-    if(index==2&&_config.use_cls_token==true)
+    if(index==2&&Config().UseCLSToken()==true)
     {
       return _cls_token;
     }
@@ -373,7 +370,7 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ParameterTensor(size_t index)const
     {
       return _b_proj;
     }
-    if(index==2&&_config.use_cls_token==true)
+    if(index==2&&Config().UseCLSToken()==true)
     {
       return _cls_token;
     }
@@ -396,7 +393,7 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)
     {
       return _grad_b_proj;
     }
-    if(index==2&&_config.use_cls_token==true)
+    if(index==2&&Config().UseCLSToken()==true)
     {
       return _grad_cls;
     }
@@ -419,7 +416,7 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)const
     {
       return _grad_b_proj;
     }
-    if(index==2&&_config.use_cls_token==true)
+    if(index==2&&Config().UseCLSToken()==true)
     {
       return _grad_cls;
     }
@@ -431,11 +428,11 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::GradientTensor(size_t index)const
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DevicePatchEmbedding<ComputeT,StorageT>::TotalParameterCount()const
 {
-  size_t total=static_cast<size_t>(_patch_flat_dim)*_config.dim;
-  total+=_config.dim;
-  if(_config.use_cls_token==true)
+  size_t total=static_cast<size_t>(PatchFlatDim())*Config().Dim();
+  total+=Config().Dim();
+  if(Config().UseCLSToken()==true)
   {
-    total+=_config.dim;
+    total+=Config().Dim();
   }
   return total;
 }
@@ -445,14 +442,21 @@ std::string CAIF_DevicePatchEmbedding<ComputeT,StorageT>::Description()const
 {
   try
   {
-    std::string desc="PatchEmbedding(patch="+std::to_string(_config.patch_size)+
-                     ",ch="+std::to_string(_config.channels)+
-                     ",dim="+std::to_string(_config.dim);
-    if(_config.use_cls_token==true)
+    std::string desc=std::string(g_serial_tag_patch_embedding)+
+                     g_serial_open_paren+
+                     g_serial_kv_patch+
+                     std::to_string(Config().PatchSize())+
+                     g_serial_comma+
+                     g_serial_kv_ch+
+                     std::to_string(Config().Channels())+
+                     g_serial_comma+
+                     g_serial_kv_dim+
+                     std::to_string(Config().Dim());
+    if(Config().UseCLSToken()==true)
     {
-      desc+=",cls=true";
+      desc+=g_serial_flag_cls_true;
     }
-    desc+=")";
+    desc+=g_serial_close_paren;
     return desc;
   }
   CAIF_CATCH_BLOCK()
@@ -464,12 +468,13 @@ CAIF_DevicePatchEmbedding<ComputeT,StorageT>::ParameterNames(const std::string &
 {
   try
   {
+    const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
     std::vector<std::string> names;
-    names.push_back(prefix+"proj.weight");
-    names.push_back(prefix+"proj.bias");
-    if(_config.use_cls_token==true)
+    names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::EmbedProjWeight_e));
+    names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::EmbedProjBias_e));
+    if(Config().UseCLSToken()==true)
     {
-      names.push_back(prefix+"cls_token");
+      names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::EmbedClsToken_e));
     }
     return names;
   }

@@ -16,6 +16,9 @@
 #include "caif_device_positional_encoding_factory.h"
 #include "caif_ops.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
+#include "caif_positional_encoding_mode.h"
+#include "caif_serialization_constants.h"
 #include <vector>
 #include <cmath>
 
@@ -24,7 +27,7 @@ namespace instance
 
 template<typename ComputeT,typename StorageT>
 CAIF_DevicePositionalEncoding<ComputeT,StorageT>::CAIF_DevicePositionalEncoding(
-                                              const Config_t &config,
+                                              const CAIF_DevicePositionalEncodingConfig &config,
                                               CAIF_CudaStream &stream):
                                           CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                           _config(config),
@@ -36,54 +39,54 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::CAIF_DevicePositionalEncoding(
 {
   try
   {
-    if(config.mode==PositionalEncodingMode_e::None)
+    if(config.Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::None)
     {
       return;
     }
 
-    if(config.max_seq_len==0)
+    if(config.MaxSeqLen()==0)
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding: max_seq_len must be > 0");
     }
-    if(config.dim==0)
+    if(config.Dim()==0)
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding: dim must be > 0");
     }
 
-    const size_t table_size=static_cast<size_t>(config.max_seq_len)*config.dim;
+    const size_t table_size=static_cast<size_t>(config.MaxSeqLen())*config.Dim();
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
-    if(config.mode==PositionalEncodingMode_e::Learned)
+    if(config.Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       const float limit=std::sqrt(g_caif_xavier_uniform_scale/
-                                   static_cast<float>(config.max_seq_len+config.dim));
+                                   static_cast<float>(config.MaxSeqLen()+config.Dim()));
       std::vector<float> init_data(table_size);
       for(size_t i=0;i<table_size;++i)
       {
         const float t=static_cast<float>(i)*g_caif_golden_ratio_frac;
         init_data[i]=(t-std::floor(t))*2.0f*limit-limit;
       }
-      SetPETable(CAIF_DeviceTensor::Uninitialized({config.max_seq_len,config.dim},stream,sdt));
+      SetPETable(CAIF_DeviceTensor::Uninitialized({config.MaxSeqLen(),config.Dim()},stream,sdt));
       PETableMut().CopyFromHostFp32(init_data.data(),table_size);
-      _pe_table_grad=CAIF_DeviceTensor::Zeros({config.max_seq_len,config.dim},stream,sdt);
+      SetPETableGrad(CAIF_DeviceTensor::Zeros({config.MaxSeqLen(),config.Dim()},stream,sdt));
     }
     else
     {
       // Sinusoidal: compute on host and upload.
       std::vector<float> table(table_size);
-      for(uint32_t s=0;s<config.max_seq_len;++s)
+      for(uint32_t s=0;s<config.MaxSeqLen();++s)
       {
-        for(uint32_t p=0;p<config.dim/2;++p)
+        for(uint32_t p=0;p<config.Dim()/2;++p)
         {
           const double freq=1.0/std::pow(g_caif_sinusoidal_base,
                                          2.0*static_cast<double>(p)/
-                                           static_cast<double>(config.dim));
+                                           static_cast<double>(config.Dim()));
           const double angle=static_cast<double>(s)*freq;
-          table[s*config.dim+2*p]=static_cast<float>(std::sin(angle));
-          table[s*config.dim+2*p+1]=static_cast<float>(std::cos(angle));
+          table[s*config.Dim()+2*p]=static_cast<float>(std::sin(angle));
+          table[s*config.Dim()+2*p+1]=static_cast<float>(std::cos(angle));
         }
       }
-      SetSinusoidalTable(CAIF_DeviceTensor::Uninitialized({config.max_seq_len,config.dim},
+      SetSinusoidalTable(CAIF_DeviceTensor::Uninitialized({config.MaxSeqLen(),config.Dim()},
                                                             stream,sdt));
       SinusoidalTableMut().CopyFromHostFp32(table.data(),table_size);
     }
@@ -113,12 +116,12 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::operator=(CAIF_DevicePositiona
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _config=other._config;
-      _pe_table=std::move(other._pe_table);
-      _pe_table_grad=std::move(other._pe_table_grad);
-      _sinusoidal_table=std::move(other._sinusoidal_table);
-      _cached_batch=other._cached_batch;
-      _cached_seq_len=other._cached_seq_len;
+      SetConfig(other.Config());
+      SetPETable(std::move(other.PETableMut()));
+      SetPETableGrad(std::move(other.PETableGrad()));
+      SetSinusoidalTable(std::move(other.SinusoidalTableMut()));
+      SetCachedBatch(other.CachedBatch());
+      SetCachedSeqLen(other.CachedSeqLen());
     }
     return *this;
   }
@@ -137,7 +140,7 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceT
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::Forward: input must be at least 2D");
     }
-    if(shape.back()!=_config.dim)
+    if(shape.back()!=Config().Dim())
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::Forward: last dim must match config.dim");
     }
@@ -159,12 +162,12 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceT
       THROW_CAIFE("CAIF_DevicePositionalEncoding::Forward: input must be 2D or 3D");
     }
 
-    if(seq_len>_config.max_seq_len)
+    if(seq_len>Config().MaxSeqLen())
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::Forward: seq_len exceeds max_seq_len");
     }
 
-    if(_config.mode==PositionalEncodingMode_e::None)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::None)
     {
       return input.Clone();
     }
@@ -172,13 +175,13 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceT
     AssertInputDtype(input);
 
     const CAIF_DeviceTensor *pe_tensor;
-    if(_config.mode==PositionalEncodingMode_e::Learned)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
-      pe_tensor=&_pe_table;
+      pe_tensor=&PETableMut();
     }
     else
     {
-      pe_tensor=&_sinusoidal_table;
+      pe_tensor=&SinusoidalTableMut();
     }
 
     CAIF_DeviceTensor output=AllocateOutput(shape,ctx);
@@ -186,8 +189,8 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceT
 
     if(ctx.Training()==true)
     {
-      _cached_batch=batch;
-      _cached_seq_len=seq_len;
+      SetCachedBatch(batch);
+      SetCachedSeqLen(seq_len);
     }
 
     return output;
@@ -203,22 +206,22 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::BackwardImpl(const CAIF_Device
   try
   {
     (void)ctx;
-    if(_cached_batch==0)
+    if(CachedBatch()==0)
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::Backward: must call Forward with training=true first");
     }
 
-    if(_config.mode==PositionalEncodingMode_e::None)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::None)
     {
       return grad_output.Clone();
     }
 
     CAIF_DeviceTensor grad_input=grad_output.Clone();
 
-    if(_config.mode==PositionalEncodingMode_e::Learned)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
-      _pe_table_grad.FillZero();
-      CAIF_Ops::PositionalEncodingBackward(grad_output,_pe_table_grad);
+      PETableGrad().FillZero();
+      CAIF_Ops::PositionalEncodingBackward(grad_output,PETableGrad());
     }
 
     return grad_input;
@@ -231,9 +234,9 @@ void CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    if(_config.mode==PositionalEncodingMode_e::Learned)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
-      _pe_table_grad.FillZero();
+      PETableGrad().FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
@@ -242,7 +245,7 @@ void CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ZeroGradients()
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  if(_config.mode==PositionalEncodingMode_e::Learned)
+  if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
   {
     return 1;
   }
@@ -255,7 +258,7 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
   try
   {
-    if(index==0&&_config.mode==PositionalEncodingMode_e::Learned)
+    if(index==0&&Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       return _pe_table;
     }
@@ -270,7 +273,7 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ParameterTensor(size_t index)c
 {
   try
   {
-    if(index==0&&_config.mode==PositionalEncodingMode_e::Learned)
+    if(index==0&&Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       return _pe_table;
     }
@@ -285,7 +288,7 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::GradientTensor(size_t index)
 {
   try
   {
-    if(index==0&&_config.mode==PositionalEncodingMode_e::Learned)
+    if(index==0&&Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       return _pe_table_grad;
     }
@@ -300,7 +303,7 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::GradientTensor(size_t index)co
 {
   try
   {
-    if(index==0&&_config.mode==PositionalEncodingMode_e::Learned)
+    if(index==0&&Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       return _pe_table_grad;
     }
@@ -312,9 +315,9 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::GradientTensor(size_t index)co
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DevicePositionalEncoding<ComputeT,StorageT>::TotalParameterCount()const
 {
-  if(_config.mode==PositionalEncodingMode_e::Learned)
+  if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
   {
-    return static_cast<size_t>(_config.max_seq_len)*_config.dim;
+    return static_cast<size_t>(Config().MaxSeqLen())*Config().Dim();
   }
   return 0;
 }
@@ -324,22 +327,17 @@ std::string CAIF_DevicePositionalEncoding<ComputeT,StorageT>::Description()const
 {
   try
   {
-    std::string mode_str;
-    if(_config.mode==PositionalEncodingMode_e::Learned)
-    {
-      mode_str="learned";
-    }
-    else if(_config.mode==PositionalEncodingMode_e::Sinusoidal)
-    {
-      mode_str="sinusoidal";
-    }
-    else
-    {
-      mode_str="none";
-    }
-    return "PositionalEncoding(max_seq="+std::to_string(_config.max_seq_len)+
-           ",dim="+std::to_string(_config.dim)+
-           ",mode="+mode_str+")";
+    return std::string(g_serial_tag_positional_encoding)+
+           g_serial_open_paren+
+           g_serial_kv_max_seq+
+           std::to_string(Config().MaxSeqLen())+
+           g_serial_comma+
+           g_serial_kv_dim+
+           std::to_string(Config().Dim())+
+           g_serial_comma+
+           g_serial_kv_mode+
+           CAIF_PositionalEncodingMode::Name(Mode())+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -351,9 +349,9 @@ CAIF_DevicePositionalEncoding<ComputeT,StorageT>::ParameterNames(const std::stri
   try
   {
     std::vector<std::string> names;
-    if(_config.mode==PositionalEncodingMode_e::Learned)
+    if(Mode()==CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
-      names.push_back(prefix+"weight");
+      names.push_back(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PositionEmbeddingTable_e));
     }
     return names;
   }
@@ -365,18 +363,18 @@ void CAIF_DevicePositionalEncoding<ComputeT,StorageT>::LoadPETable(CAIF_DeviceTe
 {
   try
   {
-    if(_config.mode!=PositionalEncodingMode_e::Learned)
+    if(Mode()!=CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned)
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::LoadPETable: only valid in Learned mode");
     }
     const std::vector<uint32_t> &shape=table.Shape();
     if(shape.size()!=2||
-       shape[0]!=_config.max_seq_len||
-       shape[1]!=_config.dim)
+       shape[0]!=Config().MaxSeqLen()||
+       shape[1]!=Config().Dim())
     {
       THROW_CAIFE("CAIF_DevicePositionalEncoding::LoadPETable: shape mismatch");
     }
-    _pe_table=std::move(table);
+    SetPETable(std::move(table));
   }
   CAIF_CATCH_BLOCK()
 }

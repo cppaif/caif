@@ -21,6 +21,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -31,11 +32,10 @@
 namespace instance
 {
 
-class CAIF_DeviceTokenEmbeddingFactory
+class CAIF_DeviceTokenEmbeddingFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceTokenEmbeddingFactory()=delete;
-    ~CAIF_DeviceTokenEmbeddingFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t vocab_size,
@@ -43,6 +43,24 @@ class CAIF_DeviceTokenEmbeddingFactory
            CAIF_CudaStream &stream,
            CAIF_DataType::CAIF_DataType_e compute_dtype,
            CAIF_DataType::CAIF_DataType_e storage_dtype);
+
+    /**
+     * @brief Build a CAIF_DeviceSharedTokenEmbedding pointing at a donor
+     * instance's table + gradient (T5-style shared encoder/decoder
+     * embeddings). The donor owns the storage; this layer borrows it via
+     * the inherited pointer. Same (compute, storage) dispatch as Create();
+     * the resulting (ComputeT, StorageT) must match the donor's
+     * instantiation or backward atomicAdd into the shared grad will write
+     * via the wrong dtype.
+     */
+    static std::unique_ptr<CAIF_DeviceLayer>
+    CreateShared(uint32_t vocab_size,
+                 uint32_t dim,
+                 CAIF_DeviceTensor &donor_table,
+                 CAIF_DeviceTensor &donor_grad,
+                 CAIF_CudaStream &stream,
+                 CAIF_DataType::CAIF_DataType_e compute_dtype,
+                 CAIF_DataType::CAIF_DataType_e storage_dtype);
 
   protected:
 

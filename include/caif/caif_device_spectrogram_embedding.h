@@ -25,6 +25,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_spectrogram_embedding_config.h"
 #include "caif_run_context.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
@@ -39,14 +40,8 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t freq_bins;
-      uint32_t dim;
-      bool use_cls_token;
-    };
 
-    CAIF_DeviceSpectrogramEmbedding(const Config_t &config,
+    CAIF_DeviceSpectrogramEmbedding(const CAIF_DeviceSpectrogramEmbeddingConfig &config,
                                     CAIF_CudaStream &stream);
     ~CAIF_DeviceSpectrogramEmbedding()override=default;
 
@@ -69,9 +64,9 @@ class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayerTyped<ComputeT,Stor
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    uint32_t FreqBins()const{return _config.freq_bins;}
-    uint32_t Dim()const{return _config.dim;}
-    bool UseCLSToken()const{return _config.use_cls_token;}
+    uint32_t FreqBins()const{return Config().FreqBins();}
+    uint32_t Dim()const{return Config().Dim();}
+    bool UseCLSToken()const{return Config().UseCLSToken();}
 
     void InitializeWeights(uint32_t seed=0)override;
 
@@ -87,11 +82,43 @@ class CAIF_DeviceSpectrogramEmbedding:public CAIF_DeviceLayerTyped<ComputeT,Stor
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
-    const Config_t &Config()const{return _config;}
-    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
-    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
+    const CAIF_DeviceSpectrogramEmbeddingConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceSpectrogramEmbeddingConfig &c){_config=c;}
 
-    Config_t _config;
+    const CAIF_DeviceTensor &WProj()const{return _w_proj;}
+    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
+    void SetWProj(CAIF_DeviceTensor &&t){_w_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &BProj()const{return _b_proj;}
+    CAIF_DeviceTensor &BProj(){return _b_proj;}
+    void SetBProj(CAIF_DeviceTensor &&t){_b_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &CLSToken()const{return _cls_token;}
+    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
+    void SetCLSToken(CAIF_DeviceTensor &&t){_cls_token=std::move(t);}
+
+    const CAIF_DeviceTensor &GradWProj()const{return _grad_w_proj;}
+    CAIF_DeviceTensor &GradWProj(){return _grad_w_proj;}
+    void SetGradWProj(CAIF_DeviceTensor &&t){_grad_w_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &GradBProj()const{return _grad_b_proj;}
+    CAIF_DeviceTensor &GradBProj(){return _grad_b_proj;}
+    void SetGradBProj(CAIF_DeviceTensor &&t){_grad_b_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &GradCLS()const{return _grad_cls;}
+    CAIF_DeviceTensor &GradCLS(){return _grad_cls;}
+    void SetGradCLS(CAIF_DeviceTensor &&t){_grad_cls=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    uint32_t CachedBatch()const{return _cached_batch;}
+    void SetCachedBatch(const uint32_t v){_cached_batch=v;}
+    uint32_t CachedTimeFrames()const{return _cached_time_frames;}
+    void SetCachedTimeFrames(const uint32_t v){_cached_time_frames=v;}
+
+    CAIF_DeviceSpectrogramEmbeddingConfig _config;
 
     CAIF_DeviceTensor _w_proj;
     CAIF_DeviceTensor _b_proj;

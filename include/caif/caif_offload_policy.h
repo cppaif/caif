@@ -25,16 +25,16 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include <cstdint>
 
 namespace instance
 {
 
-class CAIF_OffloadPolicy
+class CAIF_OffloadPolicy:public CAIF_Base
 {
   public:
     CAIF_OffloadPolicy()=delete;
-    ~CAIF_OffloadPolicy()=delete;
 
     enum class CAIF_OffloadPolicy_e:uint8_t
     {

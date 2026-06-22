@@ -79,7 +79,7 @@ class CAIF_DeviceNetwork:public CAIF_DeviceContainer
      */
     void AddDenseLayer(uint32_t input_size,
                        uint32_t output_size,
-                       CAIF_DeviceActivation_e activation,
+                       CAIF_DeviceActivation::CAIF_DeviceActivation_e activation,
                        bool use_bias=true);
 
     /**
@@ -210,6 +210,15 @@ class CAIF_DeviceNetwork:public CAIF_DeviceContainer
     void OptimizerStep();
 
     /**
+     * @brief Loss-scaler hook: unscale every trainable gradient in
+     * place by inv_scale and OR overflow into found_inf (a 1-element fp32
+     * tensor on this network's stream). Delegates to the active optimizer's
+     * trainable-parameter walk. Throws if no optimizer is initialized. Driven
+     * by CAIF_LossScaler between Backward() and the conditional OptimizerStep().
+     */
+    void UnscaleGradsCheckInf(float inv_scale,CAIF_DeviceTensor &found_inf);
+
+    /**
      * @brief Backwards-compatible alias for OptimizerStep().
      * @deprecated Use OptimizerStep().
      */
@@ -267,7 +276,20 @@ class CAIF_DeviceNetwork:public CAIF_DeviceContainer
      * update these. Returns 0 when the dense chain is empty.
      */
     uint32_t InputSize()const{return _input_size;}
+    void SetInputSize(const uint32_t v){_input_size=v;}
     uint32_t OutputSize()const{return _output_size;}
+    void SetOutputSize(const uint32_t v){_output_size=v;}
+
+    const CAIF_DeviceTensor *PendingPrefixLengths()const{return _pending_prefix_lengths;}
+    void SetPendingPrefixLengths(const CAIF_DeviceTensor *p){_pending_prefix_lengths=p;}
+    const CAIF_DeviceTensor *PendingEncoderContext()const{return _pending_encoder_context;}
+    void SetPendingEncoderContext(const CAIF_DeviceTensor *p){_pending_encoder_context=p;}
+    CAIF_DeviceTensor *PendingGradEncoderContext()const{return _pending_grad_encoder_context;}
+    void SetPendingGradEncoderContext(CAIF_DeviceTensor *p){_pending_grad_encoder_context=p;}
+    const CAIF_DeviceTensor *PendingPositionBias()const{return _pending_position_bias;}
+    void SetPendingPositionBias(const CAIF_DeviceTensor *p){_pending_position_bias=p;}
+    CAIF_DeviceTensor *PendingGradPositionBias()const{return _pending_grad_position_bias;}
+    void SetPendingGradPositionBias(CAIF_DeviceTensor *p){_pending_grad_position_bias=p;}
 
     /**
      * @brief Save network parameters to SafeTensors format.
@@ -325,6 +347,21 @@ class CAIF_DeviceNetwork:public CAIF_DeviceContainer
     CAIF_Optimizer &Optimizer(){return *_optimizer;}
     void ClearOptimizer();
     void SetOptimizer(std::unique_ptr<CAIF_Optimizer> optimizer);
+    std::unique_ptr<CAIF_Optimizer> ReleaseOptimizer();
+
+    // True iff `dt` is one of the float-family dtypes the SafeTensors loader
+    // accepts when reconciling on-disk parameter dtype with the model's.
+    static bool IsFloatDtype(const CAIF_DataType::CAIF_DataType_e dt)
+    {
+      return dt==CAIF_DataType::CAIF_DataType_e::Float32
+           ||dt==CAIF_DataType::CAIF_DataType_e::Float16
+           ||dt==CAIF_DataType::CAIF_DataType_e::BFloat16;
+    }
+
+    // Legacy dense-only binary save format — file-header magic ("AIFN")
+    // and version, written by SaveModel and validated by LoadModel.
+    static constexpr uint32_t _legacy_format_magic=0x4149464E;
+    static constexpr uint32_t _legacy_format_version=1;
 
     // Active optimizer.  Set by Initialize{Adam,Sgd,Momentum,Rmsprop,
     // AdaGrad}; null until then.  Owns its own state (m/v for Adam,

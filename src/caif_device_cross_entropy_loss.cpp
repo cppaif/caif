@@ -16,7 +16,7 @@
 // CAIF - AI Framework
 // Cross-entropy loss from logits implementation (templated).
 //
-// Per-site dispositions per the type-dispatch full plan (Phase 2):
+// Per-site dispositions:
 //   - `targets` are float-encoded target indices (CE kernel signature
 //     contract; kernel casts them to int internally) —
 //     `DevicePtr<float>()`.
@@ -27,7 +27,7 @@
 //------------------------------------------------------------------------------
 #include "caif_device_cross_entropy_loss.h"
 #include "caif_host_tensor.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_loss.cuh"
 #include "caif_storage_dtype.h"
 #include "caif_storage_dtype_float.h"
 #ifdef USE_CAIF_CUDA

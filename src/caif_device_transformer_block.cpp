@@ -14,12 +14,14 @@
 
 #include "caif_device_transformer_block.h"
 #include "caif_ops.h"
+#include "caif_role_registry.h"
 #include "caif_device_swiglu_activation.h"
 #include "caif_device_geglu_activation.h"
 #include "caif_device_reglu_activation.h"
 #include "caif_device_glu_activation.h"
 #include "caif_device_bilinear_activation.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 #include <cstdint>
@@ -29,7 +31,7 @@ namespace instance
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
-                                                  const TransformerBlockConfig_t &config,
+                                                  const CAIF_DeviceTransformerBlockConfig &config,
                                                   std::unique_ptr<CAIF_DeviceActivation> activation,
                                                   CAIF_CudaStream &stream):CAIF_DeviceContainer(stream),
                                                                            _config(config),
@@ -41,61 +43,59 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
 {
   try
   {
-    if(config.dim==0)
+    if(config.Dim()==0)
     {
       THROW_CAIFE("TransformerBlock: dim must be > 0");
     }
-    if(config.num_heads==0)
+    if(config.NumHeads()==0)
     {
       THROW_CAIFE("TransformerBlock: num_heads must be > 0");
     }
-    if(config.num_kv_heads==0)
+    if(config.NumKvHeads()==0)
     {
       THROW_CAIFE("TransformerBlock: num_kv_heads must be > 0");
     }
-    if(config.dim%config.num_heads!=0)
+    if(config.Dim()%config.NumHeads()!=0)
     {
       THROW_CAIFE("TransformerBlock: dim must be divisible by num_heads");
     }
 
-    if(config.ffn_dim==0)
+    if(config.FfnDim()==0)
     {
-      _effective_ffn_dim=ComputeDefaultFFNDim(config.dim);
+      SetEffectiveFFNDim(ComputeDefaultFFNDim(config.Dim()));
     }
     else
     {
-      _effective_ffn_dim=config.ffn_dim;
+      SetEffectiveFFNDim(config.FfnDim());
     }
 
-    auto norm1=std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.dim,stream);
-    _norm1=norm1.get();
+    auto norm1=std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.Dim(),stream);
+    SetNorm1Ptr(norm1.get());
     AddLayer(std::move(norm1));
 
-    typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::AttentionConfig_t attn_config;
-    attn_config.dim=config.dim;
-    attn_config.num_heads=config.num_heads;
-    attn_config.num_kv_heads=config.num_kv_heads;
-    attn_config.head_dim=config.dim/config.num_heads;
-    attn_config.causal=config.causal;
-    attn_config.use_rope=config.use_rope;
-    attn_config.rope_base=config.rope_base;
-    attn_config.rope_style=config.rope_style;
-    attn_config.dropout_rate=config.dropout_rate;
-    auto attention=std::make_unique<CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>>(attn_config,stream);
-    _attention=attention.get();
+    CAIF_DeviceMultiHeadAttentionConfig attn_config(config.Dim(),
+                                                    config.NumHeads(),
+                                                    config.NumKvHeads(),
+                                                    config.Dim()/config.NumHeads(),
+                                                    config.Causal(),
+                                                    config.UseRope(),
+                                                    config.RopeBase(),
+                                                    config.DropoutRate());
+    attn_config.SetRopeStyle(config.RopeStyle());
+    auto attention=std::make_unique<CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>>(attn_config,
+                                                                                     stream);
+    SetAttentionPtr(attention.get());
     AddLayer(std::move(attention));
 
-    auto norm2=std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.dim,stream);
-    _norm2=norm2.get();
+    auto norm2=std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.Dim(),stream);
+    SetNorm2Ptr(norm2.get());
     AddLayer(std::move(norm2));
 
-    typename CAIF_DeviceFFN<ComputeT,StorageT>::FFNConfig_t ffn_config;
-    ffn_config.dim=config.dim;
-    ffn_config.ffn_dim=_effective_ffn_dim;
+    CAIF_DeviceFFNConfig ffn_config(config.Dim(),EffectiveFFNDim());
     auto ffn=std::make_unique<CAIF_DeviceFFN<ComputeT,StorageT>>(ffn_config,
                                                                  std::move(activation),
                                                                  stream);
-    _ffn=ffn.get();
+    SetFFNPtr(ffn.get());
     AddLayer(std::move(ffn));
   }
   CAIF_CATCH_BLOCK()
@@ -103,7 +103,7 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
-                                                  const TransformerBlockConfig_t &config,
+                                                  const CAIF_DeviceTransformerBlockConfig &config,
                                                   CAIF_CudaStream &stream):
                   CAIF_DeviceTransformerBlock(config,
                                               std::make_unique<CAIF_DeviceSwiGLUActivation<ComputeT,StorageT>>(),
@@ -114,17 +114,17 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTransformerBlock<ComputeT,StorageT>::CAIF_DeviceTransformerBlock(
                               CAIF_DeviceTransformerBlock &&other):CAIF_DeviceContainer(std::move(other)),
-                                                                   _config(other._config),
-                                                                   _effective_ffn_dim(other._effective_ffn_dim),
-                                                                   _norm1(other._norm1),
-                                                                   _attention(other._attention),
-                                                                   _norm2(other._norm2),
-                                                                   _ffn(other._ffn)
+                                                                   _config(other.Config()),
+                                                                   _effective_ffn_dim(other.EffectiveFFNDim()),
+                                                                   _norm1(other.Norm1Ptr()),
+                                                                   _attention(other.AttentionPtr()),
+                                                                   _norm2(other.Norm2Ptr()),
+                                                                   _ffn(other.FFNPtr())
 {
-  other._norm1=nullptr;
-  other._attention=nullptr;
-  other._norm2=nullptr;
-  other._ffn=nullptr;
+  other.SetNorm1Ptr(nullptr);
+  other.SetAttentionPtr(nullptr);
+  other.SetNorm2Ptr(nullptr);
+  other.SetFFNPtr(nullptr);
 }
 
 template<typename ComputeT,typename StorageT>
@@ -136,16 +136,16 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::operator=(CAIF_DeviceTransformer
     if(this!=&other)
     {
       CAIF_DeviceContainer::operator=(std::move(other));
-      _config=other._config;
-      _effective_ffn_dim=other._effective_ffn_dim;
-      _norm1=other._norm1;
-      _attention=other._attention;
-      _norm2=other._norm2;
-      _ffn=other._ffn;
-      other._norm1=nullptr;
-      other._attention=nullptr;
-      other._norm2=nullptr;
-      other._ffn=nullptr;
+      SetConfig(other.Config());
+      SetEffectiveFFNDim(other.EffectiveFFNDim());
+      SetNorm1Ptr(other.Norm1Ptr());
+      SetAttentionPtr(other.AttentionPtr());
+      SetNorm2Ptr(other.Norm2Ptr());
+      SetFFNPtr(other.FFNPtr());
+      other.SetNorm1Ptr(nullptr);
+      other.SetAttentionPtr(nullptr);
+      other.SetNorm2Ptr(nullptr);
+      other.SetFFNPtr(nullptr);
     }
     return *this;
   }
@@ -167,14 +167,14 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTen
     constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
 
     // Pre-norm residual 1: h = x + attention(norm1(x))
-    CAIF_DeviceTensor norm1_out=_norm1->Forward(input,ctx);
-    CAIF_DeviceTensor attn_out=_attention->Forward(norm1_out,ctx);
+    CAIF_DeviceTensor norm1_out=Norm1().Forward(input,ctx);
+    CAIF_DeviceTensor attn_out=Attention().Forward(norm1_out,ctx);
     CAIF_DeviceTensor h=CAIF_DeviceTensor::Uninitialized(input.Shape(),Stream(),sd);
     CAIF_Ops::Add(input,attn_out,h);
 
     // Pre-norm residual 2: out = h + ffn(norm2(h))
-    CAIF_DeviceTensor norm2_out=_norm2->Forward(h,ctx);
-    CAIF_DeviceTensor ffn_out=_ffn->Forward(norm2_out,ctx);
+    CAIF_DeviceTensor norm2_out=Norm2().Forward(h,ctx);
+    CAIF_DeviceTensor ffn_out=FFN().Forward(norm2_out,ctx);
     CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(h.Shape(),Stream(),sd);
     CAIF_Ops::Add(h,ffn_out,output);
 
@@ -198,14 +198,14 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTe
     constexpr CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
 
     // Backward through residual 2.
-    CAIF_DeviceTensor d_norm2_out=_ffn->Backward(grad_output,ctx);
-    CAIF_DeviceTensor d_h_from_ffn=_norm2->Backward(d_norm2_out,ctx);
+    CAIF_DeviceTensor d_norm2_out=FFN().Backward(grad_output,ctx);
+    CAIF_DeviceTensor d_h_from_ffn=Norm2().Backward(d_norm2_out,ctx);
     CAIF_DeviceTensor d_h=CAIF_DeviceTensor::Uninitialized(grad_output.Shape(),Stream(),sd);
     CAIF_Ops::Add(grad_output,d_h_from_ffn,d_h);
 
     // Backward through residual 1.
-    CAIF_DeviceTensor d_norm1_out=_attention->Backward(d_h,ctx);
-    CAIF_DeviceTensor d_x_from_attn=_norm1->Backward(d_norm1_out,ctx);
+    CAIF_DeviceTensor d_norm1_out=Attention().Backward(d_h,ctx);
+    CAIF_DeviceTensor d_x_from_attn=Norm1().Backward(d_norm1_out,ctx);
     CAIF_DeviceTensor d_x=CAIF_DeviceTensor::Uninitialized(d_h.Shape(),Stream(),sd);
     CAIF_Ops::Add(d_h,d_x_from_attn,d_x);
 
@@ -220,20 +220,31 @@ std::string CAIF_DeviceTransformerBlock<ComputeT,StorageT>::Description()const
   try
   {
     std::string causal_str;
-    if(_config.causal==true)
+    if(Config().Causal()==true)
     {
-      causal_str="true";
+      causal_str=g_serial_json_true;
     }
     else
     {
-      causal_str="false";
+      causal_str=g_serial_json_false;
     }
-    return std::string(g_caif_description_transformer_block_prefix)+
-           "(dim="+std::to_string(_config.dim)+
-           ",heads="+std::to_string(_config.num_heads)+
-           ",kv_heads="+std::to_string(_config.num_kv_heads)+
-           ",ffn_dim="+std::to_string(_effective_ffn_dim)+
-           ",causal="+causal_str+")";
+    return std::string(g_serial_tag_transformer_block)+
+           g_serial_open_paren+
+           g_serial_kv_dim+
+           std::to_string(Config().Dim())+
+           g_serial_comma+
+           g_serial_kv_heads+
+           std::to_string(Config().NumHeads())+
+           g_serial_comma+
+           g_serial_kv_kv_heads+
+           std::to_string(Config().NumKvHeads())+
+           g_serial_comma+
+           g_serial_kv_ffn_dim+
+           std::to_string(EffectiveFFNDim())+
+           g_serial_comma+
+           g_serial_kv_causal+
+           causal_str+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -245,16 +256,16 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::ParameterNames(const std::string
   try
   {
     std::vector<std::string> names;
-    auto norm1_names=Norm1().ParameterNames(prefix+g_caif_name_input_layernorm);
+    auto norm1_names=Norm1().ParameterNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathAttnNorm_e));
     names.insert(names.end(),norm1_names.begin(),norm1_names.end());
 
-    auto attn_names=Attention().ParameterNames(prefix+g_caif_name_self_attn);
+    auto attn_names=Attention().ParameterNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathAttn_e));
     names.insert(names.end(),attn_names.begin(),attn_names.end());
 
-    auto norm2_names=Norm2().ParameterNames(prefix+g_caif_name_post_attention_layernorm);
+    auto norm2_names=Norm2().ParameterNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathFFNNorm_e));
     names.insert(names.end(),norm2_names.begin(),norm2_names.end());
 
-    auto ffn_names=FFN().ParameterNames(prefix+g_caif_name_mlp);
+    auto ffn_names=FFN().ParameterNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathFFN_e));
     names.insert(names.end(),ffn_names.begin(),ffn_names.end());
 
     return names;
@@ -318,13 +329,13 @@ CAIF_DeviceTransformerBlock<ComputeT,StorageT>::FrozenTensorNames(const std::str
   {
     std::vector<std::string> names;
     std::vector<std::string> sub;
-    sub=Norm1().FrozenTensorNames(prefix+g_caif_name_input_layernorm);
+    sub=Norm1().FrozenTensorNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathAttnNorm_e));
     names.insert(names.end(),sub.begin(),sub.end());
-    sub=Attention().FrozenTensorNames(prefix+g_caif_name_self_attn);
+    sub=Attention().FrozenTensorNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathAttn_e));
     names.insert(names.end(),sub.begin(),sub.end());
-    sub=Norm2().FrozenTensorNames(prefix+g_caif_name_post_attention_layernorm);
+    sub=Norm2().FrozenTensorNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathFFNNorm_e));
     names.insert(names.end(),sub.begin(),sub.end());
-    sub=FFN().FrozenTensorNames(prefix+g_caif_name_mlp);
+    sub=FFN().FrozenTensorNames(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathFFN_e));
     names.insert(names.end(),sub.begin(),sub.end());
     return names;
   }

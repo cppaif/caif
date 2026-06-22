@@ -33,9 +33,16 @@ std::unique_ptr<CAIF_DeviceLayer> MakeMHA(uint32_t dim,
                                            float dropout_rate,
                                            CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::AttentionConfig_t cfg{
-      dim,num_heads,num_kv_heads,head_dim,
-      causal,use_rope,rope_base,rope_style,rope_dim,dropout_rate};
+  CAIF_DeviceMultiHeadAttentionConfig cfg(dim,
+                                          num_heads,
+                                          num_kv_heads,
+                                          head_dim,
+                                          causal,
+                                          use_rope,
+                                          rope_base,
+                                          dropout_rate);
+  cfg.SetRopeStyle(rope_style);
+  cfg.SetRopeDim(rope_dim);
   return std::make_unique<CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>>(cfg,stream);
 }
 
@@ -56,9 +63,16 @@ std::unique_ptr<CAIF_DeviceLayer> MakeMHAWithProjections(uint32_t dim,
                                                           std::unique_ptr<CAIF_DeviceLayer> o_proj,
                                                           CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::AttentionConfig_t cfg{
-      dim,num_heads,num_kv_heads,head_dim,
-      causal,use_rope,rope_base,rope_style,rope_dim,dropout_rate};
+  CAIF_DeviceMultiHeadAttentionConfig cfg(dim,
+                                          num_heads,
+                                          num_kv_heads,
+                                          head_dim,
+                                          causal,
+                                          use_rope,
+                                          rope_base,
+                                          dropout_rate);
+  cfg.SetRopeStyle(rope_style);
+  cfg.SetRopeDim(rope_dim);
   typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::MHAProjections_t proj;
   proj.q_proj=std::move(q_proj);
   proj.k_proj=std::move(k_proj);

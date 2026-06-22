@@ -20,6 +20,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_multi_head_attention_config.h"
 #include "caif_device_tensor.h"
 #include "caif_constants.h"
 #include "caif_run_context.h"
@@ -49,29 +50,6 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
       WO_e=3
     };
 
-    struct AttentionConfig_t
-    {
-      uint32_t dim;
-      uint32_t num_heads;
-      uint32_t num_kv_heads;
-      uint32_t head_dim;
-      bool causal;
-      bool use_rope;
-      float rope_base;
-      int rope_style=0;
-      // Number of leading dims of each head to rotate. 0 means
-      // "same as head_dim" (full rotation, the legacy behavior).
-      // For partial-rotary models like Glm4Moe (partial_rotary_factor
-      // 0.5) set rope_dim = head_dim/2; the kernel rotates only the
-      // first rope_dim dims and passes the trailing (head_dim - rope_dim)
-      // dims through untouched.  Must be even when nonzero.
-      int rope_dim=0;
-      float dropout_rate;
-      // RMSNorm epsilon used when QK-norm gammas are loaded. Default
-      // matches HF's conventional 1e-5 (OLMoE / Olmo2 / Qwen3). No
-      // effect when q_norm_gamma / k_norm_gamma are empty.
-      float qk_norm_eps=1.0e-5f;
-    };
 
     struct MHAProjections_t
     {
@@ -94,9 +72,9 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
       CAIF_DeviceTensor k_norm_gamma;
     };
 
-    CAIF_DeviceMultiHeadAttention(const AttentionConfig_t &config,
+    CAIF_DeviceMultiHeadAttention(const CAIF_DeviceMultiHeadAttentionConfig &config,
                                   CAIF_CudaStream &stream);
-    CAIF_DeviceMultiHeadAttention(const AttentionConfig_t &config,
+    CAIF_DeviceMultiHeadAttention(const CAIF_DeviceMultiHeadAttentionConfig &config,
                                   MHAProjections_t projections,
                                   CAIF_CudaStream &stream);
     ~CAIF_DeviceMultiHeadAttention()override=default;
@@ -123,7 +101,7 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
     CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
     std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    const AttentionConfig_t &Config()const{return _config;}
+    const CAIF_DeviceMultiHeadAttentionConfig &Config()const{return _config;}
     CAIF_DeviceTensor &QBias(){return _projections.q_bias;}
     const CAIF_DeviceTensor &QBias()const{return _projections.q_bias;}
     CAIF_DeviceTensor &KBias(){return _projections.k_bias;}
@@ -137,67 +115,67 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
 
     CAIF_DeviceLayer &QProj()
     {
-      if(_projections.q_proj==nullptr)
+      if(ProjectionsMut().q_proj==nullptr)
       {
         THROW_CAIFE("MHA: q_proj is null");
       }
-      return *_projections.q_proj;
+      return *ProjectionsMut().q_proj;
     }
     const CAIF_DeviceLayer &QProj()const
     {
-      if(_projections.q_proj==nullptr)
+      if(Projections().q_proj==nullptr)
       {
         THROW_CAIFE("MHA: q_proj is null");
       }
-      return *_projections.q_proj;
+      return *Projections().q_proj;
     }
     CAIF_DeviceLayer &KProj()
     {
-      if(_projections.k_proj==nullptr)
+      if(ProjectionsMut().k_proj==nullptr)
       {
         THROW_CAIFE("MHA: k_proj is null");
       }
-      return *_projections.k_proj;
+      return *ProjectionsMut().k_proj;
     }
     const CAIF_DeviceLayer &KProj()const
     {
-      if(_projections.k_proj==nullptr)
+      if(Projections().k_proj==nullptr)
       {
         THROW_CAIFE("MHA: k_proj is null");
       }
-      return *_projections.k_proj;
+      return *Projections().k_proj;
     }
     CAIF_DeviceLayer &VProj()
     {
-      if(_projections.v_proj==nullptr)
+      if(ProjectionsMut().v_proj==nullptr)
       {
         THROW_CAIFE("MHA: v_proj is null");
       }
-      return *_projections.v_proj;
+      return *ProjectionsMut().v_proj;
     }
     const CAIF_DeviceLayer &VProj()const
     {
-      if(_projections.v_proj==nullptr)
+      if(Projections().v_proj==nullptr)
       {
         THROW_CAIFE("MHA: v_proj is null");
       }
-      return *_projections.v_proj;
+      return *Projections().v_proj;
     }
     CAIF_DeviceLayer &OProj()
     {
-      if(_projections.o_proj==nullptr)
+      if(ProjectionsMut().o_proj==nullptr)
       {
         THROW_CAIFE("MHA: o_proj is null");
       }
-      return *_projections.o_proj;
+      return *ProjectionsMut().o_proj;
     }
     const CAIF_DeviceLayer &OProj()const
     {
-      if(_projections.o_proj==nullptr)
+      if(Projections().o_proj==nullptr)
       {
         THROW_CAIFE("MHA: o_proj is null");
       }
-      return *_projections.o_proj;
+      return *Projections().o_proj;
     }
 
     void InitializeWeights(uint32_t seed=0)override;
@@ -268,6 +246,13 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
   private:
     void BuildFusedWqkv();
 
+    // ALiBi per-head slopes. AlibiSlopesPow2 returns the exact geometric
+    // sequence (2^(-8/m))^(i+1) for a power-of-two head count m; the public
+    // ComputeAlibiSlopes handles non-power-of-two counts with the standard
+    // MPT/BLOOM interpolation from the next power of two.
+    static std::vector<float> AlibiSlopesPow2(const uint32_t m);
+    static std::vector<float> ComputeAlibiSlopes(const uint32_t num_heads);
+
     // Internal accessors — single point of access for every member, even
     // from inside this class's own methods. See CODING_GUIDELINES.md
     // §Member Access. *Mut() forms hand out a non-const reference for
@@ -324,10 +309,27 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
     void SetCachedBatch(const uint32_t v){_cached_batch=v;}
     uint32_t CachedSeqLen()const{return _cached_seq_len;}
     void SetCachedSeqLen(const uint32_t v){_cached_seq_len=v;}
+    bool CachedUseFlash()const{return _cached_use_flash;}
+    void SetCachedUseFlash(const bool v){_cached_use_flash=v;}
     const CAIF_DeviceTensor &KVCacheK()const{return _kv_cache_k;}
     CAIF_DeviceTensor &KVCacheKMut(){return _kv_cache_k;}
     const CAIF_DeviceTensor &KVCacheV()const{return _kv_cache_v;}
     CAIF_DeviceTensor &KVCacheVMut(){return _kv_cache_v;}
+    const CAIF_DeviceTensor &AlibiSlopes()const{return _alibi_slopes;}
+    CAIF_DeviceTensor &AlibiSlopesMut(){return _alibi_slopes;}
+    void SetAlibiSlopes(CAIF_DeviceTensor &&v){_alibi_slopes=std::move(v);}
+    const CAIF_DeviceTensor &CachedAttnDropoutMask()const{return _cached_attn_dropout_mask;}
+    CAIF_DeviceTensor &CachedAttnDropoutMaskMut(){return _cached_attn_dropout_mask;}
+    void SetCachedAttnDropoutMask(CAIF_DeviceTensor &&v){_cached_attn_dropout_mask=std::move(v);}
+    bool CachedAttnDropoutActive()const{return _cached_attn_dropout_active;}
+    void SetCachedAttnDropoutActive(const bool v){_cached_attn_dropout_active=v;}
+    // Build, cache, and apply the attention-dropout mask to the softmax weights
+    // in place (training only). No-op caller-side when dropout is disabled.
+    void ApplyAttentionDropout(CAIF_DeviceTensor &attn,CAIF_RunContext &ctx);
+    // Device pointer to the per-head ALiBi slopes, computing and uploading them
+    // on first use. Returns nullptr when ALiBi is disabled (the kernels read a
+    // null pointer as "no bias").
+    const float *AlibiSlopesPtr(CAIF_RunContext &ctx);
     uint32_t KVCacheMaxLen()const{return _kv_cache_max_len;}
     void SetKVCacheMaxLen(const uint32_t v){_kv_cache_max_len=v;}
     uint32_t KVCacheBatch()const{return _kv_cache_batch;}
@@ -365,8 +367,13 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
     void SetCachedKRms(CAIF_DeviceTensor &&v){_cached_k_rms=std::move(v);}
     void SetKVCacheK(CAIF_DeviceTensor &&v){_kv_cache_k=std::move(v);}
     void SetKVCacheV(CAIF_DeviceTensor &&v){_kv_cache_v=std::move(v);}
+    void SetConfig(const CAIF_DeviceMultiHeadAttentionConfig &c){_config=c;}
+    void SetProjections(MHAProjections_t &&v){_projections=std::move(v);}
+    void SetUseProjections(const bool v){_use_projections=v;}
+    uint32_t KVCacheLen()const{return _kv_cache_len;}
+    bool KVCacheEnabled()const{return _kv_cache_enabled;}
 
-    AttentionConfig_t _config;
+    CAIF_DeviceMultiHeadAttentionConfig _config;
 
     MHAProjections_t _projections;
     bool _use_projections;
@@ -401,6 +408,7 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
     CAIF_DeviceTensor _cached_k_rms;
     uint32_t _cached_batch;
     uint32_t _cached_seq_len;
+    bool _cached_use_flash;
 
     CAIF_DeviceTensor _kv_cache_k;
     CAIF_DeviceTensor _kv_cache_v;
@@ -410,6 +418,20 @@ class CAIF_DeviceMultiHeadAttention:public CAIF_DeviceLayerTyped<ComputeT,Storag
     bool _kv_cache_enabled;
 
     bool _use_flash_attention;
+
+    // ALiBi per-head slopes [num_heads], fp32, computed lazily on first use
+    // (empty until then). Owned device buffer so the pointer outlives the
+    // stream-ordered kernel launches that read it.
+    CAIF_DeviceTensor _alibi_slopes;
+
+    // Attention-dropout mask [bh, seq, seq] from the most recent training
+    // forward (values 1/keep where kept, 0 where dropped). The backward reuses
+    // it so the dropped attention weights and their gradients match. Only the
+    // explicit path applies attention dropout; training with dropout>0 routes
+    // away from flash. _active guards against a stale mask after an eval
+    // forward.
+    CAIF_DeviceTensor _cached_attn_dropout_mask;
+    bool _cached_attn_dropout_active;
 };
 
 #ifdef USE_CAIF_CUDA

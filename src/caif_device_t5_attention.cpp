@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_t5_attention.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_elementwise.cuh"
 #include "caif_exception.h"
+#include "caif_serialization_constants.h"
 #include <string>
 
 namespace instance
@@ -79,7 +80,7 @@ void CAIF_DeviceT5Attention<ComputeT,StorageT>::ApplyScoreBias(
     {
       THROW_CAIFE("CAIF_DeviceT5Attention::ApplyScoreBias: scores/bias dtype mismatch");
     }
-    const uint32_t num_heads=this->Config().num_heads;
+    const uint32_t num_heads=this->Config().NumHeads();
     const size_t head_elements=static_cast<size_t>(seq_len)*seq_len;
     const int n=static_cast<int>(head_elements);
     const cudaStream_t stream=ctx.Stream().Handle();
@@ -119,7 +120,7 @@ void CAIF_DeviceT5Attention<ComputeT,StorageT>::BackwardScoreBias(
     {
       THROW_CAIFE("CAIF_DeviceT5Attention::BackwardScoreBias: grad_scores/grad_bias dtype mismatch");
     }
-    const uint32_t num_heads=this->Config().num_heads;
+    const uint32_t num_heads=this->Config().NumHeads();
     const size_t head_elements=static_cast<size_t>(seq_len)*seq_len;
     const int n=static_cast<int>(head_elements);
     const cudaStream_t stream=ctx.Stream().Handle();
@@ -145,7 +146,10 @@ std::string CAIF_DeviceT5Attention<ComputeT,StorageT>::Description()const
 {
   try
   {
-    return "T5Attention("+CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::Description()+")";
+    return std::string(g_serial_tag_t5_attention)+
+           g_serial_open_paren+
+           CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::Description()+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }

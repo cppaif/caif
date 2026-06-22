@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Test: CAIF_DeviceTransformerModel<float,float> end-to-end correctness.
+//
+// Tests cover forward shape, non-zero output, causal/non-causal difference,
+// RoPE vs no-RoPE difference, backward input gradient (empty for discrete
+// tokens), backward weight gradient via finite difference, parameter tensor
+// count, total parameter count, gradient zeroing, and description string.
+//------------------------------------------------------------------------------
 #include "caif_device_transformer_model.h"
 #include "caif_test_harness.h"
 #include "caif_device_network.h"
@@ -19,100 +28,132 @@
 #include "caif_settings.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
-#include <iostream>
+#include "caif_grad_mode.h"
+#include "ise_lib/ise_out.h"
+
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-struct GradMode_t
+namespace instance
 {
-  bool precise;
-  float tol;
-  const char *label;
-};
-
-static const GradMode_t kGradModePrecise={true, 8e-2f, "Precise"};
-static const GradMode_t kGradModeTF32=   {false,1.5e-1f,"TF32"};
-
-static void ReportResult(const char *test_name,bool passed)
-{
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
 #ifdef USE_CAIF_CUDA
 
-// Helper to create a basic transformer model config
-static CAIF_DeviceTransformerModel<float,float>::Config_t CreateTestConfig(bool causal,bool use_rope)
+constexpr uint32_t g_caif_tmodel_test_vocab=32;
+constexpr uint32_t g_caif_tmodel_test_max_seq=16;
+constexpr uint32_t g_caif_tmodel_test_dim=16;
+constexpr uint32_t g_caif_tmodel_test_heads=2;
+constexpr uint32_t g_caif_tmodel_test_kv_heads=2;
+constexpr uint32_t g_caif_tmodel_test_layers=2;
+constexpr uint32_t g_caif_tmodel_test_batch=2;
+constexpr uint32_t g_caif_tmodel_test_seq=8;
+constexpr uint32_t g_caif_tmodel_test_small_batch=1;
+constexpr uint32_t g_caif_tmodel_test_small_seq=4;
+constexpr float g_caif_tmodel_test_nonzero_tol=0.01f;
+constexpr float g_caif_tmodel_test_diff_tol=0.001f;
+constexpr float g_caif_tmodel_test_fd_h=1e-3f;
+constexpr int g_caif_tmodel_test_fd_count=4;
+constexpr size_t g_caif_tmodel_test_param_idx=0;
+// Expected parameter tensor count for the standard 2-layer test config:
+// embedding:1 + pe(learned):1 + 2*(norm1:1+attn:4+norm2:1+ffn:3) + finalnorm:1 + head:1 = 22
+constexpr size_t g_caif_tmodel_test_expected_param_count=22;
+// Expected total param count for the small 1-layer RoPE config (see test body for derivation)
+constexpr size_t g_caif_tmodel_test_expected_total_params=1304;
+
+//------------------------------------------------------------------------------
+// Transformer model tests.
+//------------------------------------------------------------------------------
+class CAIF_TransformerModelTests
 {
-  CAIF_DeviceTransformerModel<float,float>::Config_t config;
-  config.vocab_size=32;
-  config.max_seq_len=16;
-  config.dim=16;
-  config.num_heads=2;
-  config.num_kv_heads=2;
-  config.num_layers=2;
-  config.ffn_dim=0;  // Auto-compute
-  config.causal=causal;
-  config.use_rope=use_rope;
-  config.pe_mode=PositionalEncodingMode_e::Learned;
-  config.output_dim=0;  // Use vocab_size
-  config.tie_weights=false;
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static CAIF_DeviceTransformerModelConfig CreateTestConfig(const bool causal,const bool use_rope);
+
+    static void TestForwardShape();
+    static void TestForwardNonZero();
+    static void TestCausalDifference();
+    static void TestRoPEDifference();
+    static void TestBackwardInputGrad();
+    static void TestBackwardWeightGrad(const GradMode_t &mode);
+    static void TestParameterTensorCount();
+    static void TestTotalParameterCount();
+    static void TestZeroGradients();
+    static void TestDescription();
+};
+
+CAIF_DeviceTransformerModelConfig CAIF_TransformerModelTests::CreateTestConfig(
+  const bool causal,
+  const bool use_rope)
+{
+  // ffn_dim defaults to 0 (auto-compute) and output_dim to 0 (== vocab_size);
+  // num_kv_heads is the only optional architecture field this test overrides.
+  CAIF_DeviceTransformerModelConfig config(g_caif_tmodel_test_vocab,
+                                           g_caif_tmodel_test_max_seq,
+                                           g_caif_tmodel_test_dim,
+                                           g_caif_tmodel_test_heads,
+                                           g_caif_tmodel_test_layers,
+                                           CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned,
+                                           causal,
+                                           use_rope,
+                                           false);
+  config.SetNumKvHeads(g_caif_tmodel_test_kv_heads);
   return config;
 }
 
 //------------------------------------------------------------------------------
 // Test 1: Forward output shape
 //------------------------------------------------------------------------------
-static void TestForwardShape()
+void CAIF_TransformerModelTests::TestForwardShape()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=8;
-    constexpr uint32_t vocab_size=32;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
-    // Create token IDs as float [batch, seq_len]
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_batch*g_caif_tmodel_test_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
-      token_ids[i]=static_cast<float>(i%vocab_size);
+      token_ids[i]=static_cast<float>(i%g_caif_tmodel_test_vocab);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_batch,g_caif_tmodel_test_seq},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=model.Forward(input,ctx);
     const auto &shape=output.Shape();
 
-    bool passed=(shape.size()==3&&
-                 shape[0]==batch&&
-                 shape[1]==seq_len&&
-                 shape[2]==vocab_size);
+    bool passed=(shape.size()==3 &&
+                 shape[0]==g_caif_tmodel_test_batch &&
+                 shape[1]==g_caif_tmodel_test_seq &&
+                 shape[2]==g_caif_tmodel_test_vocab);
 
     if(passed==false)
     {
-      std::cout<<"  Expected shape [2,8,32], got [";
+      ISE_Out::Out()<<"  Expected shape [2,8,32], got [";
       for(size_t i=0;i<shape.size();++i)
       {
         if(i>0)
         {
-          std::cout<<",";
+          ISE_Out::Out()<<",";
         }
-        std::cout<<shape[i];
+        ISE_Out::Out()<<shape[i];
       }
-      std::cout<<"]\n";
+      ISE_Out::Out()<<"]\n";
     }
 
-    ReportResult("TransformerModel::ForwardShape",passed);
+    CAIF_TestHarness::Report("TransformerModel::ForwardShape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::ForwardShape")
 }
@@ -120,26 +161,26 @@ static void TestForwardShape()
 //------------------------------------------------------------------------------
 // Test 2: Forward output is non-zero
 //------------------------------------------------------------------------------
-static void TestForwardNonZero()
+void CAIF_TransformerModelTests::TestForwardNonZero()
 {
   try
   {
-    constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
       token_ids[i]=static_cast<float>(i);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -153,13 +194,15 @@ static void TestForwardNonZero()
       sum_abs+=std::fabs(host_output.Data()[i]);
     }
 
-    bool passed=(sum_abs>0.01f);
+    bool passed=(sum_abs>g_caif_tmodel_test_nonzero_tol);
     if(passed==false)
     {
-      std::cout<<"  Output sum_abs too small: "<<sum_abs<<"\n";
+      ISE_Out::Out()<<"  Output sum_abs too small: "
+                   <<sum_abs
+                   <<"\n";
     }
 
-    ReportResult("TransformerModel::ForwardNonZero",passed);
+    CAIF_TestHarness::Report("TransformerModel::ForwardNonZero",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::ForwardNonZero")
 }
@@ -167,20 +210,17 @@ static void TestForwardNonZero()
 //------------------------------------------------------------------------------
 // Test 3: Causal vs non-causal produces different output
 //------------------------------------------------------------------------------
-static void TestCausalDifference()
+void CAIF_TransformerModelTests::TestCausalDifference()
 {
   try
   {
-    constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
     // Create two models with same weights but different causal setting
-    auto config_causal=CreateTestConfig(true,false);
-    auto config_noncausal=CreateTestConfig(false,false);
+    const auto config_causal=CreateTestConfig(true,false);
+    const auto config_noncausal=CreateTestConfig(false,false);
 
     CAIF_DeviceTransformerModel<float,float> model_causal(config_causal,stream);
     CAIF_DeviceTransformerModel<float,float> model_noncausal(config_noncausal,stream);
@@ -193,13 +233,16 @@ static void TestCausalDifference()
       model_noncausal.ParameterTensor(i).CopyFromHost(weights.data(),weights.size());
     }
 
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
       token_ids[i]=static_cast<float>(i);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -216,13 +259,15 @@ static void TestCausalDifference()
       diff_sum+=std::fabs(host_causal.Data()[i]-host_noncausal.Data()[i]);
     }
 
-    bool passed=(diff_sum>0.001f);
+    bool passed=(diff_sum>g_caif_tmodel_test_diff_tol);
     if(passed==false)
     {
-      std::cout<<"  Causal and non-causal outputs are identical (diff_sum="<<diff_sum<<")\n";
+      ISE_Out::Out()<<"  Causal and non-causal outputs are identical (diff_sum="
+                   <<diff_sum
+                   <<")\n";
     }
 
-    ReportResult("TransformerModel::CausalDifference",passed);
+    CAIF_TestHarness::Report("TransformerModel::CausalDifference",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::CausalDifference")
 }
@@ -230,19 +275,16 @@ static void TestCausalDifference()
 //------------------------------------------------------------------------------
 // Test 4: RoPE vs no RoPE produces different output
 //------------------------------------------------------------------------------
-static void TestRoPEDifference()
+void CAIF_TransformerModelTests::TestRoPEDifference()
 {
   try
   {
-    constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    auto config_rope=CreateTestConfig(true,true);
-    auto config_no_rope=CreateTestConfig(true,false);
+    const auto config_rope=CreateTestConfig(true,true);
+    const auto config_no_rope=CreateTestConfig(true,false);
 
     CAIF_DeviceTransformerModel<float,float> model_rope(config_rope,stream);
     CAIF_DeviceTransformerModel<float,float> model_no_rope(config_no_rope,stream);
@@ -250,13 +292,16 @@ static void TestRoPEDifference()
     // Note: Parameter counts differ (RoPE has no positional encoding params)
     // so we can't copy weights directly. Just verify outputs differ.
 
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
       token_ids[i]=static_cast<float>(i);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -273,13 +318,15 @@ static void TestRoPEDifference()
       diff_sum+=std::fabs(host_rope.Data()[i]-host_no_rope.Data()[i]);
     }
 
-    bool passed=(diff_sum>0.001f);
+    bool passed=(diff_sum>g_caif_tmodel_test_diff_tol);
     if(passed==false)
     {
-      std::cout<<"  RoPE and non-RoPE outputs are identical (diff_sum="<<diff_sum<<")\n";
+      ISE_Out::Out()<<"  RoPE and non-RoPE outputs are identical (diff_sum="
+                   <<diff_sum
+                   <<")\n";
     }
 
-    ReportResult("TransformerModel::RoPEDifference",passed);
+    CAIF_TestHarness::Report("TransformerModel::RoPEDifference",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::RoPEDifference")
 }
@@ -287,36 +334,38 @@ static void TestRoPEDifference()
 //------------------------------------------------------------------------------
 // Test 5: Backward produces correct gradient shape (empty for token embedding)
 //------------------------------------------------------------------------------
-static void TestBackwardInputGrad()
+void CAIF_TransformerModelTests::TestBackwardInputGrad()
 {
   try
   {
-    constexpr uint32_t batch=2;
-    constexpr uint32_t seq_len=4;
-    constexpr uint32_t vocab_size=32;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
-      token_ids[i]=static_cast<float>(i%vocab_size);
+      token_ids[i]=static_cast<float>(i%g_caif_tmodel_test_vocab);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output=model.Forward(input,ctx);
 
     // Create grad_output
-    std::vector<float> grad_data(batch*seq_len*vocab_size,1.0f);
+    const size_t n_grad=g_caif_tmodel_test_batch*g_caif_tmodel_test_small_seq*g_caif_tmodel_test_vocab;
+    std::vector<float> grad_data(n_grad,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_data.data(),{batch,seq_len,vocab_size},stream);
+      grad_data.data(),
+      {g_caif_tmodel_test_batch,g_caif_tmodel_test_small_seq,g_caif_tmodel_test_vocab},
+      stream);
 
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     CAIF_DeviceTensor grad_input=model.Backward(grad_output,ctx);
@@ -325,10 +374,12 @@ static void TestBackwardInputGrad()
     bool passed=(grad_input.TotalElements()==0);
     if(passed==false)
     {
-      std::cout<<"  Expected empty grad_input, got "<<grad_input.TotalElements()<<" elements\n";
+      ISE_Out::Out()<<"  Expected empty grad_input, got "
+                   <<grad_input.TotalElements()
+                   <<" elements\n";
     }
 
-    ReportResult("TransformerModel::BackwardInputGrad",passed);
+    CAIF_TestHarness::Report("TransformerModel::BackwardInputGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::BackwardInputGrad")
 }
@@ -336,36 +387,38 @@ static void TestBackwardInputGrad()
 //------------------------------------------------------------------------------
 // Test 6: Backward weight gradient (finite-difference on one weight)
 //------------------------------------------------------------------------------
-static void TestBackwardWeightGrad(const GradMode_t &mode)
+void CAIF_TransformerModelTests::TestBackwardWeightGrad(const GradMode_t &mode)
 {
-  const std::string test_name=std::string("TransformerModel::BackwardWeightGrad::")+mode.label;
-  const bool _prev_precise=CAIF_Settings::PreciseGradients();
+  const std::string test_name=std::string("TransformerModel::BackwardWeightGrad::")+mode.Label();
+  const bool prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
-    CAIF_Settings::SetPreciseGradients(mode.precise);
+    CAIF_Settings::SetPreciseGradients(mode.Precise());
 
-    constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
-    constexpr uint32_t vocab_size=32;
-    constexpr float h=1e-3f;
-    const float tolerance=mode.tol;
+    const float tolerance=mode.Tol();
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
 
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
       token_ids[i]=static_cast<float>(i);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
-    std::vector<float> grad_ones(batch*seq_len*vocab_size,1.0f);
+    const size_t n_grad=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq*g_caif_tmodel_test_vocab;
+    std::vector<float> grad_ones(n_grad,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_ones.data(),{batch,seq_len,vocab_size},stream);
+      grad_ones.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq,g_caif_tmodel_test_vocab},
+      stream);
 
     // Get analytical gradient
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
@@ -377,12 +430,11 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
     model.Backward(grad_output,ctx);
 
     // Pick a parameter tensor to check (use embedding table = index 0)
-    constexpr size_t param_idx=0;
-    CAIF_HostTensor host_grad=model.GradientTensor(param_idx).ToHost();
+    CAIF_HostTensor host_grad=model.GradientTensor(g_caif_tmodel_test_param_idx).ToHost();
 
     // Get current weights
-    std::vector<float> weights(model.ParameterTensor(param_idx).TotalElements());
-    model.ParameterTensor(param_idx).CopyToHost(weights.data());
+    std::vector<float> weights(model.ParameterTensor(g_caif_tmodel_test_param_idx).TotalElements());
+    model.ParameterTensor(g_caif_tmodel_test_param_idx).CopyToHost(weights.data());
 
     // FD reference must be high-precision regardless of outer mode
     // (TF32 FD = catastrophic cancellation).
@@ -391,14 +443,13 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
 
     // Finite-difference check on a few elements
     bool passed=true;
-    constexpr int num_checks=4;
-    for(int idx=0;idx<num_checks&&passed==true;++idx)
+    for(int idx=0;idx<g_caif_tmodel_test_fd_count && passed==true;++idx)
     {
       // f(w+h)
       std::vector<float> w_plus(weights);
-      w_plus[idx]+=h;
+      w_plus[idx]+=g_caif_tmodel_test_fd_h;
       CAIF_DeviceTransformerModel<float,float> model_p(config,stream);
-      model_p.ParameterTensor(param_idx).CopyFromHost(w_plus.data(),w_plus.size());
+      model_p.ParameterTensor(g_caif_tmodel_test_param_idx).CopyFromHost(w_plus.data(),w_plus.size());
       ctx.SetTraining(false);
       CAIF_DeviceTensor out_p=model_p.Forward(input,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
@@ -410,9 +461,9 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
 
       // f(w-h)
       std::vector<float> w_minus(weights);
-      w_minus[idx]-=h;
+      w_minus[idx]-=g_caif_tmodel_test_fd_h;
       CAIF_DeviceTransformerModel<float,float> model_m(config,stream);
-      model_m.ParameterTensor(param_idx).CopyFromHost(w_minus.data(),w_minus.size());
+      model_m.ParameterTensor(g_caif_tmodel_test_param_idx).CopyFromHost(w_minus.data(),w_minus.size());
       CAIF_DeviceTensor out_m=model_m.Forward(input,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
@@ -421,54 +472,56 @@ static void TestBackwardWeightGrad(const GradMode_t &mode)
         sum_minus+=hout_m.Data()[j];
       }
 
-      float numerical=(sum_plus-sum_minus)/(2.0f*h);
-      float analytical=host_grad.Data()[idx];
-      float diff=std::fabs(numerical-analytical);
+      const float numerical=(sum_plus-sum_minus)/(2.0f*g_caif_tmodel_test_fd_h);
+      const float analytical=host_grad.Data()[idx];
+      const float diff=std::fabs(numerical-analytical);
 
       if(diff>tolerance*std::max(1.0f,std::fabs(analytical)))
       {
-        std::cout<<"  Weight grad mismatch at "<<idx<<": analytical="<<analytical
-                 <<", numerical="<<numerical<<", diff="<<diff<<"\n";
+        ISE_Out::Out()<<"  Weight grad mismatch at "
+                     <<idx
+                     <<": analytical="
+                     <<analytical
+                     <<", numerical="
+                     <<numerical
+                     <<", diff="
+                     <<diff
+                     <<"\n";
         passed=false;
       }
     }
     CAIF_Settings::SetPreciseGradients(fd_prev_precise);
 
-    ReportResult(test_name.c_str(),passed);
+    CAIF_TestHarness::Report(test_name.c_str(),passed);
   }
-  CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
-  CAIF_Settings::SetPreciseGradients(_prev_precise);
+  CAIF_TEST_CATCH_BLOCK("TransformerModel::BackwardWeightGrad")
+  CAIF_Settings::SetPreciseGradients(prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 7: Parameter tensor count
 //------------------------------------------------------------------------------
-static void TestParameterTensorCount()
+void CAIF_TransformerModelTests::TestParameterTensorCount()
 {
   try
   {
     CAIF_CudaStream stream;
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
-    // Expected counts:
-    // - Embedding: 1 (table)
-    // - Positional encoding (learned): 1 (pe_table)
-    // - Per block: 9 (norm1:1 + attn:4 + norm2:1 + ffn:3 for SwiGLU)
-    // - Final norm: 1 (gamma)
-    // - Head (untied, no bias): 1 (weight)
-    // Total = 1 + 1 + 2*9 + 1 + 1 = 22
+    const size_t actual=model.ParameterTensorCount();
 
-    constexpr size_t expected=22;
-    size_t actual=model.ParameterTensorCount();
-
-    bool passed=(actual==expected);
+    bool passed=(actual==g_caif_tmodel_test_expected_param_count);
     if(passed==false)
     {
-      std::cout<<"  Expected "<<expected<<" param tensors, got "<<actual<<"\n";
+      ISE_Out::Out()<<"  Expected "
+                   <<g_caif_tmodel_test_expected_param_count
+                   <<" param tensors, got "
+                   <<actual
+                   <<"\n";
     }
 
-    ReportResult("TransformerModel::ParameterTensorCount",passed);
+    CAIF_TestHarness::Report("TransformerModel::ParameterTensorCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::ParameterTensorCount")
 }
@@ -476,51 +529,44 @@ static void TestParameterTensorCount()
 //------------------------------------------------------------------------------
 // Test 8: Total parameter count
 //------------------------------------------------------------------------------
-static void TestTotalParameterCount()
+void CAIF_TransformerModelTests::TestTotalParameterCount()
 {
   try
   {
     CAIF_CudaStream stream;
 
-    // Use smaller config for easier calculation
-    CAIF_DeviceTransformerModel<float,float>::Config_t config;
-    config.vocab_size=16;
-    config.max_seq_len=8;
-    config.dim=8;
-    config.num_heads=2;
-    config.num_kv_heads=2;
-    config.num_layers=1;
-    config.ffn_dim=32;  // Explicit
-    config.causal=true;
-    config.use_rope=true;  // No positional encoding params
-    config.pe_mode=PositionalEncodingMode_e::Learned;
-    config.output_dim=0;
-    config.tie_weights=false;
+    // Use smaller config for easier calculation:
+    // Embedding: 16*8=128, Pos enc: 0 (RoPE)
+    // Block (1 layer): norm1:8 + attn:W_q(64)+W_k(64)+W_v(64)+W_o(64)=256 + norm2:8 + ffn:768
+    // Final norm: 8, Head: 8*16=128  => total=1304
+    CAIF_DeviceTransformerModelConfig config(16,
+                                             8,
+                                             8,
+                                             2,
+                                             1,
+                                             CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Learned,
+                                             true,
+                                             true,
+                                             false);
+    config.SetNumKvHeads(2);
+    // Explicit FFN dim
+    config.SetFfnDim(32);
 
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
-    // Calculate expected:
-    // Embedding: vocab_size * dim = 16 * 8 = 128
-    // Pos enc: 0 (RoPE)
-    // Block (1 layer):
-    //   norm1: dim = 8
-    //   attn: W_q(8*8) + W_k(8*8) + W_v(8*8) + W_o(8*8) = 256
-    //   norm2: dim = 8
-    //   ffn (SwiGLU): W_gate(8*32) + W_up(8*32) + W_down(32*8) = 768
-    // Final norm: dim = 8
-    // Head: dim * vocab_size = 8 * 16 = 128
-    // Total = 128 + 0 + 8 + 256 + 8 + 768 + 8 + 128 = 1304
+    const size_t actual=model.TotalParameterCount();
 
-    constexpr size_t expected=1304;
-    size_t actual=model.TotalParameterCount();
-
-    bool passed=(actual==expected);
+    bool passed=(actual==g_caif_tmodel_test_expected_total_params);
     if(passed==false)
     {
-      std::cout<<"  Expected "<<expected<<" params, got "<<actual<<"\n";
+      ISE_Out::Out()<<"  Expected "
+                   <<g_caif_tmodel_test_expected_total_params
+                   <<" params, got "
+                   <<actual
+                   <<"\n";
     }
 
-    ReportResult("TransformerModel::TotalParameterCount",passed);
+    CAIF_TestHarness::Report("TransformerModel::TotalParameterCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::TotalParameterCount")
 }
@@ -528,36 +574,38 @@ static void TestTotalParameterCount()
 //------------------------------------------------------------------------------
 // Test 9: Zero gradients
 //------------------------------------------------------------------------------
-static void TestZeroGradients()
+void CAIF_TransformerModelTests::TestZeroGradients()
 {
   try
   {
-    constexpr uint32_t batch=1;
-    constexpr uint32_t seq_len=4;
-    constexpr uint32_t vocab_size=32;
-
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
     // Forward + backward to create non-zero gradients
-    std::vector<float> token_ids(batch*seq_len);
+    const size_t n_tokens=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq;
+    std::vector<float> token_ids(n_tokens);
     for(size_t i=0;i<token_ids.size();++i)
     {
       token_ids[i]=static_cast<float>(i);
     }
     CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             token_ids.data(),{batch,seq_len},stream);
+      token_ids.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq},
+      stream);
 
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     model.Forward(input,ctx);
 
-    std::vector<float> grad_ones(batch*seq_len*vocab_size,1.0f);
+    const size_t n_grad=g_caif_tmodel_test_small_batch*g_caif_tmodel_test_small_seq*g_caif_tmodel_test_vocab;
+    std::vector<float> grad_ones(n_grad,1.0f);
     CAIF_DeviceTensor grad_output=CAIF_DeviceTensor::FromHostData(
-                                   grad_ones.data(),{batch,seq_len,vocab_size},stream);
+      grad_ones.data(),
+      {g_caif_tmodel_test_small_batch,g_caif_tmodel_test_small_seq,g_caif_tmodel_test_vocab},
+      stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     model.Backward(grad_output,ctx);
 
@@ -566,22 +614,27 @@ static void TestZeroGradients()
 
     // Check that all gradients are zero
     bool passed=true;
-    for(size_t i=0;i<model.ParameterTensorCount()&&passed==true;++i)
+    for(size_t i=0;i<model.ParameterTensorCount() && passed==true;++i)
     {
       CAIF_HostTensor grad=model.GradientTensor(i).ToHost();
       for(size_t j=0;j<grad.TotalElements();++j)
       {
         if(grad.Data()[j]!=0.0f)
         {
-          std::cout<<"  Gradient not zeroed at param "<<i<<" element "<<j
-                   <<": "<<grad.Data()[j]<<"\n";
+          ISE_Out::Out()<<"  Gradient not zeroed at param "
+                       <<i
+                       <<" element "
+                       <<j
+                       <<": "
+                       <<grad.Data()[j]
+                       <<"\n";
           passed=false;
           break;
         }
       }
     }
 
-    ReportResult("TransformerModel::ZeroGradients",passed);
+    CAIF_TestHarness::Report("TransformerModel::ZeroGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::ZeroGradients")
 }
@@ -589,12 +642,12 @@ static void TestZeroGradients()
 //------------------------------------------------------------------------------
 // Test 10: Description string
 //------------------------------------------------------------------------------
-static void TestDescription()
+void CAIF_TransformerModelTests::TestDescription()
 {
   try
   {
     CAIF_CudaStream stream;
-    auto config=CreateTestConfig(true,false);
+    const auto config=CreateTestConfig(true,false);
     CAIF_DeviceTransformerModel<float,float> model(config,stream);
 
     const std::string desc=model.Description();
@@ -603,39 +656,47 @@ static void TestDescription()
     bool passed=(desc==expected);
     if(passed==false)
     {
-      std::cout<<"  Expected '"<<expected<<"', got '"<<desc<<"'\n";
+      ISE_Out::Out()<<"  Expected '"
+                   <<expected
+                   <<"', got '"
+                   <<desc
+                   <<"'\n";
     }
 
-    ReportResult("TransformerModel::Description",passed);
+    CAIF_TestHarness::Report("TransformerModel::Description",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerModel::Description")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_TransformerModelTests::RunAll()
 {
-  std::cout<<"=== CAIF DeviceTransformerModel Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF DeviceTransformerModel Tests ==="
+               <<"\n\n";
   TestForwardShape();
   TestForwardNonZero();
   TestCausalDifference();
   TestRoPEDifference();
   TestBackwardInputGrad();
-  TestBackwardWeightGrad(kGradModePrecise);
-  TestBackwardWeightGrad(kGradModeTF32);
+  TestBackwardWeightGrad(g_caif_grad_mode_precise);
+  TestBackwardWeightGrad(g_caif_grad_mode_tf32);
   TestParameterTensorCount();
   TestTotalParameterCount();
   TestZeroGradients();
   TestDescription();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_TransformerModelTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 #else
-  std::cout<<"CUDA not enabled, skipping GPU tests\n";
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+               <<"\n";
+  return 0;
 #endif
-
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
-  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
-
-  return (CAIF_TestHarness::FailedCount()==0)?0:1;
 }

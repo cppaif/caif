@@ -73,6 +73,11 @@ class CAIF_DeviceFlatten:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
+    std::vector<uint32_t> &CachedInputShape(){return _cached_input_shape;}
+    const std::vector<uint32_t> &CachedInputShape()const{return _cached_input_shape;}
+    void SetCachedInputShape(const std::vector<uint32_t> &shape){_cached_input_shape=shape;}
+    void SetCachedInputShape(std::vector<uint32_t> &&shape){_cached_input_shape=std::move(shape);}
+
   protected:
 
   private:

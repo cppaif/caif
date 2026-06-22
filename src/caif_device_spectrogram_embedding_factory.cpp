@@ -33,19 +33,18 @@ CAIF_DeviceSpectrogramEmbeddingFactory::Create(uint32_t freq_bins,
     (void)compute_dtype;
     if(storage_dtype==Dtype_e::Float32)
     {
-      CAIF_DeviceSpectrogramEmbedding<float,float>::Config_t cfg{freq_bins,dim,use_cls_token};
+      CAIF_DeviceSpectrogramEmbeddingConfig cfg{freq_bins,dim,use_cls_token};
       return std::make_unique<CAIF_DeviceSpectrogramEmbedding<float,float>>(cfg,stream);
     }
 #ifdef USE_CAIF_CUDA
     if(storage_dtype==Dtype_e::Float16)
     {
-      CAIF_DeviceSpectrogramEmbedding<__half,__half>::Config_t cfg{freq_bins,dim,use_cls_token};
+      CAIF_DeviceSpectrogramEmbeddingConfig cfg{freq_bins,dim,use_cls_token};
       return std::make_unique<CAIF_DeviceSpectrogramEmbedding<__half,__half>>(cfg,stream);
     }
     if(storage_dtype==Dtype_e::BFloat16)
     {
-      CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,__nv_bfloat16>::Config_t
-                                            cfg{freq_bins,dim,use_cls_token};
+      CAIF_DeviceSpectrogramEmbeddingConfig cfg{freq_bins,dim,use_cls_token};
       return std::make_unique<CAIF_DeviceSpectrogramEmbedding<__nv_bfloat16,
                                                                __nv_bfloat16>>(cfg,stream);
     }

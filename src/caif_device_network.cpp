@@ -18,16 +18,18 @@
 //------------------------------------------------------------------------------
 
 #include "caif_device_network.h"
+#include "caif_constants.h"
 #include "caif_ops.h"
+#include "caif_role_registry.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_safetensors_format.h"
-#include "caif_cuda_kernels.h"
+#include "caif_serialization_constants.h"
+#include "caif_cuda_kernels_elementwise.cuh"
 #include "caif_host_tensor.h"
 #include "caif_exception.h"
 // `total_sq` is the fp32 gradient-L2 reduction accumulator. Per-site
-// `total_sq.DevicePtr<float>()` reads name this contract inline, per
-// the type-dispatch full plan (Phase 2).
+// `total_sq.DevicePtr<float>()` reads name this contract inline.
 
 #include "caif_adam_optimizer.h"
 #include "caif_offloaded_adam.h"
@@ -61,23 +63,29 @@ void CAIF_DeviceNetwork::SetOptimizer(std::unique_ptr<CAIF_Optimizer> optimizer)
   _optimizer=std::move(optimizer);
 }
 
-CAIF_DeviceNetwork::CAIF_DeviceNetwork(CAIF_DeviceNetwork &&other):CAIF_DeviceContainer(std::move(other)),
-                                                                   _input_size(other._input_size),
-                                                                   _output_size(other._output_size),
-                                                                   _optimizer(std::move(other._optimizer)),
-                                                                   _pending_prefix_lengths(other._pending_prefix_lengths),
-                                                                   _pending_encoder_context(other._pending_encoder_context),
-                                                                   _pending_grad_encoder_context(other._pending_grad_encoder_context),
-                                                                   _pending_position_bias(other._pending_position_bias),
-                                                                   _pending_grad_position_bias(other._pending_grad_position_bias)
+std::unique_ptr<CAIF_Optimizer> CAIF_DeviceNetwork::ReleaseOptimizer()
 {
-  other._input_size=0;
-  other._output_size=0;
-  other._pending_prefix_lengths=nullptr;
-  other._pending_encoder_context=nullptr;
-  other._pending_grad_encoder_context=nullptr;
-  other._pending_position_bias=nullptr;
-  other._pending_grad_position_bias=nullptr;
+  return std::move(_optimizer);
+}
+
+CAIF_DeviceNetwork::CAIF_DeviceNetwork(CAIF_DeviceNetwork &&other):
+                                            CAIF_DeviceContainer(std::move(other)),
+                                            _input_size(other.InputSize()),
+                                            _output_size(other.OutputSize()),
+                                            _optimizer(other.ReleaseOptimizer()),
+                                            _pending_prefix_lengths(other.PendingPrefixLengths()),
+                                            _pending_encoder_context(other.PendingEncoderContext()),
+                                            _pending_grad_encoder_context(other.PendingGradEncoderContext()),
+                                            _pending_position_bias(other.PendingPositionBias()),
+                                            _pending_grad_position_bias(other.PendingGradPositionBias())
+{
+  other.SetInputSize(0);
+  other.SetOutputSize(0);
+  other.SetPendingPrefixLengths(nullptr);
+  other.SetPendingEncoderContext(nullptr);
+  other.SetPendingGradEncoderContext(nullptr);
+  other.SetPendingPositionBias(nullptr);
+  other.SetPendingGradPositionBias(nullptr);
 }
 
 CAIF_DeviceNetwork &CAIF_DeviceNetwork::operator=(CAIF_DeviceNetwork &&other)
@@ -87,21 +95,21 @@ CAIF_DeviceNetwork &CAIF_DeviceNetwork::operator=(CAIF_DeviceNetwork &&other)
     if(this!=&other)
     {
       CAIF_DeviceContainer::operator=(std::move(other));
-      _input_size=other._input_size;
-      _output_size=other._output_size;
-      SetOptimizer(std::move(other._optimizer));
-      _pending_prefix_lengths=other._pending_prefix_lengths;
-      _pending_encoder_context=other._pending_encoder_context;
-      _pending_grad_encoder_context=other._pending_grad_encoder_context;
-      _pending_position_bias=other._pending_position_bias;
-      _pending_grad_position_bias=other._pending_grad_position_bias;
-      other._input_size=0;
-      other._output_size=0;
-      other._pending_prefix_lengths=nullptr;
-      other._pending_encoder_context=nullptr;
-      other._pending_grad_encoder_context=nullptr;
-      other._pending_position_bias=nullptr;
-      other._pending_grad_position_bias=nullptr;
+      SetInputSize(other.InputSize());
+      SetOutputSize(other.OutputSize());
+      SetOptimizer(other.ReleaseOptimizer());
+      SetPendingPrefixLengths(other.PendingPrefixLengths());
+      SetPendingEncoderContext(other.PendingEncoderContext());
+      SetPendingGradEncoderContext(other.PendingGradEncoderContext());
+      SetPendingPositionBias(other.PendingPositionBias());
+      SetPendingGradPositionBias(other.PendingGradPositionBias());
+      other.SetInputSize(0);
+      other.SetOutputSize(0);
+      other.SetPendingPrefixLengths(nullptr);
+      other.SetPendingEncoderContext(nullptr);
+      other.SetPendingGradEncoderContext(nullptr);
+      other.SetPendingPositionBias(nullptr);
+      other.SetPendingGradPositionBias(nullptr);
     }
     return *this;
   }
@@ -110,7 +118,7 @@ CAIF_DeviceNetwork &CAIF_DeviceNetwork::operator=(CAIF_DeviceNetwork &&other)
 
 void CAIF_DeviceNetwork::AddDenseLayer(uint32_t input_size,
                                        uint32_t output_size,
-                                       CAIF_DeviceActivation_e activation,
+                                       CAIF_DeviceActivation::CAIF_DeviceActivation_e activation,
                                        bool use_bias)
 {
   try
@@ -121,12 +129,12 @@ void CAIF_DeviceNetwork::AddDenseLayer(uint32_t input_size,
       {
         THROW_CAIFE("DeviceNetwork: first layer must specify input_size");
       }
-      input_size=_output_size;
+      input_size=OutputSize();
     }
 
     if(LayerCount()!=0)
     {
-      if(input_size!=_output_size)
+      if(input_size!=OutputSize())
       {
         THROW_CAIFE("DeviceNetwork: layer input_size must match previous output_size");
       }
@@ -134,17 +142,17 @@ void CAIF_DeviceNetwork::AddDenseLayer(uint32_t input_size,
 
     std::unique_ptr<CAIF_DeviceDenseLayer<float,float>> layer=
       std::make_unique<CAIF_DeviceDenseLayer<float,float>>(input_size,
-                                              output_size,
-                                              activation,
-                                              Stream(),
-                                              use_bias);
+                                                           output_size,
+                                                           activation,
+                                                           Stream(),
+                                                           use_bias);
     CAIF_DeviceContainer::AddLayer(std::move(layer));
 
     if(LayerCount()==1)
     {
-      _input_size=input_size;
+      SetInputSize(input_size);
     }
-    _output_size=output_size;
+    SetOutputSize(output_size);
 
     ClearOptimizer();
   }
@@ -175,25 +183,25 @@ void CAIF_DeviceNetwork::StashSidebandIntoContext(CAIF_RunContext &ctx)const
 {
   try
   {
-    if(_pending_prefix_lengths!=nullptr)
+    if(PendingPrefixLengths()!=nullptr)
     {
-      ctx.SetPrefixLengths(*_pending_prefix_lengths);
+      ctx.SetPrefixLengths(*PendingPrefixLengths());
     }
-    if(_pending_encoder_context!=nullptr)
+    if(PendingEncoderContext()!=nullptr)
     {
-      ctx.SetEncoderContext(*_pending_encoder_context);
+      ctx.SetEncoderContext(*PendingEncoderContext());
     }
-    if(_pending_grad_encoder_context!=nullptr)
+    if(PendingGradEncoderContext()!=nullptr)
     {
-      ctx.SetGradEncoderContext(*_pending_grad_encoder_context);
+      ctx.SetGradEncoderContext(*PendingGradEncoderContext());
     }
-    if(_pending_position_bias!=nullptr)
+    if(PendingPositionBias()!=nullptr)
     {
-      ctx.SetPositionBias(*_pending_position_bias);
+      ctx.SetPositionBias(*PendingPositionBias());
     }
-    if(_pending_grad_position_bias!=nullptr)
+    if(PendingGradPositionBias()!=nullptr)
     {
-      ctx.SetGradPositionBias(*_pending_grad_position_bias);
+      ctx.SetGradPositionBias(*PendingGradPositionBias());
     }
   }
   CAIF_CATCH_BLOCK()
@@ -243,7 +251,10 @@ std::string CAIF_DeviceNetwork::Description()const
 {
   try
   {
-    return "Network("+std::to_string(LayerCount())+" layers)";
+    return std::string(g_serial_tag_network)+
+           g_serial_open_paren+
+           std::to_string(LayerCount())+
+           g_serial_suffix_layers;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -264,15 +275,15 @@ void CAIF_DeviceNetwork::InitializeAdam(float lr,
 }
 
 void CAIF_DeviceNetwork::InitializeOffloadedAdam(float lr,
-                                                  float beta1,
-                                                  float beta2,
-                                                  float epsilon,
-                                                  float weight_decay)
+                                                 float beta1,
+                                                 float beta2,
+                                                 float epsilon,
+                                                 float weight_decay)
 {
   try
   {
     SetOptimizer(std::make_unique<CAIF_OffloadedAdam>(lr,beta1,beta2,epsilon,
-                                                       weight_decay,Stream()));
+                                                      weight_decay,Stream()));
     Optimizer().Initialize(*this);
   }
   CAIF_CATCH_BLOCK()
@@ -342,6 +353,21 @@ void CAIF_DeviceNetwork::OptimizerStep()
   CAIF_CATCH_BLOCK()
 }
 
+void CAIF_DeviceNetwork::UnscaleGradsCheckInf(float inv_scale,
+                                              CAIF_DeviceTensor &found_inf)
+{
+  try
+  {
+    if(HasOptimizer()==false)
+    {
+      THROW_CAIFE("DeviceNetwork: must call Initialize{Adam,Sgd,Momentum,"
+                  "Rmsprop,AdaGrad} before UnscaleGradsCheckInf");
+    }
+    Optimizer().UnscaleGradsCheckInf(*this,inv_scale,found_inf);
+  }
+  CAIF_CATCH_BLOCK()
+}
+
 void CAIF_DeviceNetwork::SetLearningRate(float lr)
 {
   try
@@ -373,7 +399,7 @@ float CAIF_DeviceNetwork::GradientNormSquared()
       for(size_t p=0;p<layer.ParameterTensorCount();++p)
       {
         const CAIF_DeviceTensor &grad=layer.GradientTensor(p);
-        const int n=static_cast<int>(grad.TotalElements());
+        const int64_t n=static_cast<int64_t>(grad.TotalElements());
         if(n>0)
         {
           // Per-layer gradient dtype follows that layer's template
@@ -384,15 +410,15 @@ float CAIF_DeviceNetwork::GradientNormSquared()
           {
             case CAIF_DataType::CAIF_DataType_e::Float32:
               launch_sum_of_squares<float>(grad.DevicePtr<float>(),
-                                            total_sq.DevicePtr<float>(),  // fp32: gradient-L2 accumulator
-                                            n,
-                                            Stream().Handle());
+                                           total_sq.DevicePtr<float>(),  // fp32: gradient-L2 accumulator
+                                           n,
+                                           Stream().Handle());
               break;
             case CAIF_DataType::CAIF_DataType_e::Float16:
               launch_sum_of_squares<__half>(grad.DevicePtr<__half>(),
-                                             total_sq.DevicePtr<float>(),  // fp32: gradient-L2 accumulator
-                                             n,
-                                             Stream().Handle());
+                                            total_sq.DevicePtr<float>(),  // fp32: gradient-L2 accumulator
+                                            n,
+                                            Stream().Handle());
               break;
             case CAIF_DataType::CAIF_DataType_e::BFloat16:
               launch_sum_of_squares<__nv_bfloat16>(
@@ -437,7 +463,7 @@ void CAIF_DeviceNetwork::ScaleGradients(float coef)
       for(size_t p=0;p<layer.ParameterTensorCount();++p)
       {
         CAIF_DeviceTensor &grad=layer.GradientTensor(p);
-        const int n=static_cast<int>(grad.TotalElements());
+        const int64_t n=static_cast<int64_t>(grad.TotalElements());
         if(n>0)
         {
           CAIF_Ops::Scale(grad,coef);
@@ -542,7 +568,9 @@ void CAIF_DeviceNetwork::Save(const std::string &path,const CAIF_ModelFormat &fo
     {
       const CAIF_DeviceLayer &layer=Layer(layer_idx);
 
-      std::string prefix="layers."+std::to_string(layer_idx)+".";
+      std::string prefix=CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathGenericContainerLayer_e)
+                         +std::to_string(layer_idx)
+                         +".";
       std::vector<std::string> param_names=layer.ParameterNames(prefix);
 
       if(param_names.size()!=layer.ParameterTensorCount())
@@ -557,8 +585,10 @@ void CAIF_DeviceNetwork::Save(const std::string &path,const CAIF_ModelFormat &fo
     }
 
     std::map<std::string, std::string> metadata;
-    metadata["format"]="aif_device_network";
-    metadata["layer_count"]=std::to_string(LayerCount());
+    metadata[g_serial_meta_key_format]=
+                                g_serial_meta_format_value;
+    metadata[g_serial_meta_key_layer_count]=
+                                                            std::to_string(LayerCount());
 
     std::ostringstream layer_desc;
     for(size_t i=0;i<LayerCount();++i)
@@ -569,18 +599,12 @@ void CAIF_DeviceNetwork::Save(const std::string &path,const CAIF_ModelFormat &fo
       }
       layer_desc<<Layer(i).Description();
     }
-    metadata["layer_descriptions"]=layer_desc.str();
+    metadata[g_serial_meta_key_layer_descriptions]=
+                                                                       layer_desc.str();
 
     format.Save(path,tensors,metadata);
   }
   CAIF_CATCH_BLOCK()
-}
-
-static bool IsFloatDtype(CAIF_DataType::CAIF_DataType_e dt)
-{
-  return dt==CAIF_DataType::CAIF_DataType_e::Float32
-       ||dt==CAIF_DataType::CAIF_DataType_e::Float16
-       ||dt==CAIF_DataType::CAIF_DataType_e::BFloat16;
 }
 
 void CAIF_DeviceNetwork::Load(const std::string &path,const CAIF_ModelFormat &format)
@@ -601,7 +625,9 @@ void CAIF_DeviceNetwork::Load(const std::string &path,const CAIF_ModelFormat &fo
     {
       CAIF_DeviceLayer &layer=Layer(layer_idx);
 
-      std::string prefix="layers."+std::to_string(layer_idx)+".";
+      std::string prefix=CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::PathGenericContainerLayer_e)
+                         +std::to_string(layer_idx)
+                         +".";
       std::vector<std::string> param_names=layer.ParameterNames(prefix);
 
       for(size_t p=0;p<layer.ParameterTensorCount();++p)
@@ -682,9 +708,6 @@ void CAIF_DeviceNetwork::Load(const std::string &path,const CAIF_ModelFormat &fo
 // Legacy Binary Format Support (Dense Layers Only)
 //------------------------------------------------------------------------------
 
-static constexpr uint32_t g_caif_device_network_magic=0x4149464E;  // "AIFN"
-static constexpr uint32_t g_caif_device_network_version=1;
-
 void CAIF_DeviceNetwork::SaveModel(const std::string &filepath,bool save_optimizer_state)const
 {
   try
@@ -700,8 +723,8 @@ void CAIF_DeviceNetwork::SaveModel(const std::string &filepath,bool save_optimiz
       THROW_CAIFE("DeviceNetwork: cannot open file for writing: "+filepath);
     }
 
-    out.write(reinterpret_cast<const char *>(&g_caif_device_network_magic),sizeof(uint32_t));
-    out.write(reinterpret_cast<const char *>(&g_caif_device_network_version),sizeof(uint32_t));
+    out.write(reinterpret_cast<const char *>(&_legacy_format_magic),sizeof(uint32_t));
+    out.write(reinterpret_cast<const char *>(&_legacy_format_version),sizeof(uint32_t));
 
     const uint32_t layer_count=static_cast<uint32_t>(LayerCount());
     out.write(reinterpret_cast<const char *>(&layer_count),sizeof(uint32_t));
@@ -781,11 +804,11 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
     in.read(reinterpret_cast<char *>(&magic),sizeof(uint32_t));
     in.read(reinterpret_cast<char *>(&version),sizeof(uint32_t));
 
-    if(magic!=g_caif_device_network_magic)
+    if(magic!=_legacy_format_magic)
     {
       THROW_CAIFE("DeviceNetwork: invalid file format (bad magic number)");
     }
-    if(version!=g_caif_device_network_version)
+    if(version!=_legacy_format_version)
     {
       THROW_CAIFE("DeviceNetwork: unsupported file version");
     }
@@ -805,16 +828,16 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
       in.read(reinterpret_cast<char *>(&activation_int),sizeof(int32_t));
       in.read(reinterpret_cast<char *>(&use_bias),sizeof(uint8_t));
 
-      const CAIF_DeviceActivation_e activation=
-        static_cast<CAIF_DeviceActivation_e>(activation_int);
+      const CAIF_DeviceActivation::CAIF_DeviceActivation_e activation=
+        static_cast<CAIF_DeviceActivation::CAIF_DeviceActivation_e>(activation_int);
       const bool has_bias=(use_bias!=0);
 
       std::unique_ptr<CAIF_DeviceDenseLayer<float,float>> layer=
         std::make_unique<CAIF_DeviceDenseLayer<float,float>>(input_size,
-                                                output_size,
-                                                activation,
-                                                Stream(),
-                                                has_bias);
+                                                             output_size,
+                                                             activation,
+                                                             Stream(),
+                                                             has_bias);
 
       const size_t weight_count=
         static_cast<size_t>(input_size)*static_cast<size_t>(output_size);
@@ -834,9 +857,9 @@ void CAIF_DeviceNetwork::LoadModel(const std::string &filepath,bool load_optimiz
 
       if(i==0)
       {
-        _input_size=input_size;
+        SetInputSize(input_size);
       }
-      _output_size=output_size;
+      SetOutputSize(output_size);
 
       CAIF_DeviceContainer::AddLayer(std::move(layer));
     }

@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -28,11 +29,10 @@
 namespace instance
 {
 
-class CAIF_DeviceConv2DFactory
+class CAIF_DeviceConv2DFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceConv2DFactory()=delete;
-    ~CAIF_DeviceConv2DFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t in_channels,

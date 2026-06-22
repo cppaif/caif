@@ -29,7 +29,7 @@ class CAIF_DeviceMaxPooling2D:public CAIF_DevicePooling2D<ComputeT,StorageT>
 {
   public:
     typedef CAIF_DevicePooling2D<ComputeT,StorageT> Base_t;
-    typedef typename Base_t::Config_t Config_t;
+    typedef CAIF_DevicePooling2DConfig Config_t;
 
     CAIF_DeviceMaxPooling2D(const Config_t &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceMaxPooling2D()override=default;
@@ -54,8 +54,8 @@ class CAIF_DeviceMaxPooling2D:public CAIF_DevicePooling2D<ComputeT,StorageT>
 
   private:
     const std::vector<int32_t> &CachedMaxIndices()const{return _cached_max_indices;}
-    std::vector<int32_t> &CachedMaxIndices(){return _cached_max_indices;}
-    void SetCachedMaxIndices(std::vector<int32_t> &&v){_cached_max_indices=std::move(v);}
+    std::vector<int32_t> &CachedMaxIndicesMutable(){return _cached_max_indices;}
+    void SetCachedMaxIndices(std::vector<int32_t> v){_cached_max_indices=std::move(v);}
 
     std::vector<int32_t> _cached_max_indices;
 };

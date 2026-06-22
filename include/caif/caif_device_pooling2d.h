@@ -25,6 +25,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_pooling2d_config.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -36,20 +37,16 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DevicePooling2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t pool_height;
-      uint32_t pool_width;
-      uint32_t stride_height;
-      uint32_t stride_width;
-    };
 
     ~CAIF_DevicePooling2D()override=default;
 
-    const Config_t &Config()const{return _config;}
+    const CAIF_DevicePooling2DConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DevicePooling2DConfig &c){_config=c;}
 
     const std::vector<uint32_t> &CachedInputShape()const{return _cached_input_shape;}
+    std::vector<uint32_t> &CachedInputShape(){return _cached_input_shape;}
     void SetCachedInputShape(const std::vector<uint32_t> &shape){_cached_input_shape=shape;}
+    void SetCachedInputShape(std::vector<uint32_t> &&shape){_cached_input_shape=std::move(shape);}
 
     const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
     CAIF_DeviceTensor &CachedInput(){return _cached_input;}
@@ -82,11 +79,11 @@ class CAIF_DevicePooling2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::AllocateOutput;
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
-    CAIF_DevicePooling2D(const Config_t &config,CAIF_CudaStream &stream);
+    CAIF_DevicePooling2D(const CAIF_DevicePooling2DConfig &config,CAIF_CudaStream &stream);
     CAIF_DevicePooling2D(CAIF_DevicePooling2D &&other);
     CAIF_DevicePooling2D &operator=(CAIF_DevicePooling2D &&other);
 
-    Config_t _config;
+    CAIF_DevicePooling2DConfig _config;
     std::vector<uint32_t> _cached_input_shape;
     // Cached input/output tensors for backward. cuDNN's pooling backward
     // signature needs both forward operands; the host path leaves these

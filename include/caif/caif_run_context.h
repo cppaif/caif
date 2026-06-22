@@ -119,10 +119,11 @@ class CAIF_RunContext:public CAIF_Base
     // Subsystem tag stack. Pushed/popped by the CAIF_DeviceLayer base-class
     // scaffolding via RAII scopes; subclasses never touch this directly.
     Subsystem_e CurrentSubsystem()const;
-    uint32_t SubsystemDepth()const{return static_cast<uint32_t>(_subsystem_stack.size());}
-    void PushSubsystem(const Subsystem_e s){_subsystem_stack.push_back(s);}
+    uint32_t SubsystemDepth()const{return static_cast<uint32_t>(SubsystemStack().size());}
+    void PushSubsystem(const Subsystem_e s){SubsystemStack().push_back(s);}
     void PopSubsystem();
     const SubsystemStackVec_t &SubsystemStack()const{return _subsystem_stack;}
+    SubsystemStackVec_t &SubsystemStack(){return _subsystem_stack;}
 
     // Stream hoisted off every layer. Ops read ctx.Stream() rather than
     // reaching through the layer that owns them.

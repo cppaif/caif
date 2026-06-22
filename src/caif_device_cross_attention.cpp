@@ -14,8 +14,11 @@
 
 #include "caif_device_cross_attention.h"
 #include "caif_ops.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_attention_support.cuh"
+#include "caif_cuda_kernels_flash_cross.cuh"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
+#include "caif_serialization_constants.h"
 #include <cmath>
 #include <random>
 
@@ -24,7 +27,7 @@ namespace instance
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceCrossAttention<ComputeT,StorageT>::CAIF_DeviceCrossAttention(
-                           const CrossAttentionConfig_t &config,
+                           const CAIF_DeviceCrossAttentionConfig &config,
                            CAIF_CudaStream &stream):
                            CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                            _config(config),
@@ -52,39 +55,48 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::CAIF_DeviceCrossAttention(
 {
   try
   {
-    if(config.dim==0)
+    if(config.Dim()==0)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention: dim must be > 0");
     }
-    if(config.num_heads==0)
+    if(config.KvInputDim()==0)
+    {
+      THROW_CAIFE("CAIF_DeviceCrossAttention: kv_input_dim must be > 0");
+    }
+    if(config.NumHeads()==0)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention: num_heads must be > 0");
     }
-    if(config.num_kv_heads==0)
+    if(config.NumKvHeads()==0)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention: num_kv_heads must be > 0");
     }
-    if(config.dim%config.num_heads!=0)
+    if(config.Dim()%config.NumHeads()!=0)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention: dim must be divisible by num_heads");
     }
-    if(config.num_heads%config.num_kv_heads!=0)
+    if(config.NumHeads()%config.NumKvHeads()!=0)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention: num_heads must be divisible by num_kv_heads");
     }
-    const uint32_t qk_dim=_config.num_heads*_config.head_dim;
-    const uint32_t kv_dim=_config.num_kv_heads*_config.head_dim;
+    const uint32_t qk_dim=Config().NumHeads()*Config().HeadDim();
+    const uint32_t kv_dim=Config().NumKvHeads()*Config().HeadDim();
+    const uint32_t kv_input_dim=Config().KvInputDim();
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
 
-    _w_q=CAIF_DeviceTensor::Uninitialized({_config.dim,qk_dim},stream,sdt);
-    _w_k=CAIF_DeviceTensor::Uninitialized({_config.dim,kv_dim},stream,sdt);
-    _w_v=CAIF_DeviceTensor::Uninitialized({_config.dim,kv_dim},stream,sdt);
-    _w_o=CAIF_DeviceTensor::Uninitialized({qk_dim,_config.dim},stream,sdt);
+    // W_Q / W_O are sized by the decoder-stream width (Config().Dim());
+    // W_K / W_V are sized by the encoder-output width (kv_input_dim),
+    // which differs from dim when a frozen pretrained encoder of one
+    // hidden size feeds a decoder of another.
+    SetWQ(CAIF_DeviceTensor::Uninitialized({Config().Dim(),qk_dim},stream,sdt));
+    SetWK(CAIF_DeviceTensor::Uninitialized({kv_input_dim,kv_dim},stream,sdt));
+    SetWV(CAIF_DeviceTensor::Uninitialized({kv_input_dim,kv_dim},stream,sdt));
+    SetWO(CAIF_DeviceTensor::Uninitialized({qk_dim,Config().Dim()},stream,sdt));
 
-    _grad_w_q=CAIF_DeviceTensor::Zeros({_config.dim,qk_dim},stream,sdt);
-    _grad_w_k=CAIF_DeviceTensor::Zeros({_config.dim,kv_dim},stream,sdt);
-    _grad_w_v=CAIF_DeviceTensor::Zeros({_config.dim,kv_dim},stream,sdt);
-    _grad_w_o=CAIF_DeviceTensor::Zeros({qk_dim,_config.dim},stream,sdt);
+    SetGradWQ(CAIF_DeviceTensor::Zeros({Config().Dim(),qk_dim},stream,sdt));
+    SetGradWK(CAIF_DeviceTensor::Zeros({kv_input_dim,kv_dim},stream,sdt));
+    SetGradWV(CAIF_DeviceTensor::Zeros({kv_input_dim,kv_dim},stream,sdt));
+    SetGradWO(CAIF_DeviceTensor::Zeros({qk_dim,Config().Dim()},stream,sdt));
 
     InitializeWeights(0);
   }
@@ -129,28 +141,28 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::operator=(CAIF_DeviceCrossAttentio
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _config=other._config;
-      _w_q=std::move(other._w_q);
-      _w_k=std::move(other._w_k);
-      _w_v=std::move(other._w_v);
-      _w_o=std::move(other._w_o);
-      _grad_w_q=std::move(other._grad_w_q);
-      _grad_w_k=std::move(other._grad_w_k);
-      _grad_w_v=std::move(other._grad_w_v);
-      _grad_w_o=std::move(other._grad_w_o);
-      _cached_decoder_input=std::move(other._cached_decoder_input);
-      _cached_encoder_input=std::move(other._cached_encoder_input);
-      _cached_q_heads=std::move(other._cached_q_heads);
-      _cached_k_heads=std::move(other._cached_k_heads);
-      _cached_v_heads=std::move(other._cached_v_heads);
-      _cached_concat=std::move(other._cached_concat);
-      _cached_logsumexp=std::move(other._cached_logsumexp);
-      _cached_output=std::move(other._cached_output);
-      _cached_batch=other._cached_batch;
-      _cached_dec_seq_len=other._cached_dec_seq_len;
-      _cached_enc_seq_len=other._cached_enc_seq_len;
-      _use_flash_attention=other._use_flash_attention;
-      _cached_use_flash=other._cached_use_flash;
+      SetConfig(other.Config());
+      SetWQ(std::move(other.WQ()));
+      SetWK(std::move(other.WK()));
+      SetWV(std::move(other.WV()));
+      SetWO(std::move(other.WO()));
+      SetGradWQ(std::move(other.GradWQ()));
+      SetGradWK(std::move(other.GradWK()));
+      SetGradWV(std::move(other.GradWV()));
+      SetGradWO(std::move(other.GradWO()));
+      SetCachedDecoderInput(std::move(other.CachedDecoderInput()));
+      SetCachedEncoderInput(std::move(other.CachedEncoderInput()));
+      SetCachedQHeads(std::move(other.CachedQHeads()));
+      SetCachedKHeads(std::move(other.CachedKHeads()));
+      SetCachedVHeads(std::move(other.CachedVHeads()));
+      SetCachedConcat(std::move(other.CachedConcat()));
+      SetCachedLogsumexp(std::move(other.CachedLogsumexp()));
+      SetCachedOutput(std::move(other.CachedOutput()));
+      SetCachedBatch(other.CachedBatch());
+      SetCachedDecSeqLen(other.CachedDecSeqLen());
+      SetCachedEncSeqLen(other.CachedEncSeqLen());
+      SetUseFlashAttention(other.UseFlashAttention());
+      SetCachedUseFlash(other.CachedUseFlash());
     }
     return *this;
   }
@@ -172,7 +184,7 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::ForwardCross(
       THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: "
                   "decoder_input must be 3D [batch,seq_len,dim]");
     }
-    if(dec_shape[2]!=_config.dim)
+    if(dec_shape[2]!=Config().Dim())
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: "
                   "decoder_input last dim must match config dim");
@@ -181,15 +193,16 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::ForwardCross(
     if(enc_shape.size()!=3)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: "
-                  "encoder_output must be 3D [batch,seq_len,dim]");
+                  "encoder_output must be 3D [batch,seq_len,kv_input_dim]");
     }
     if(enc_shape[0]!=dec_shape[0])
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: batch mismatch");
     }
-    if(enc_shape[2]!=_config.dim)
+    if(enc_shape[2]!=Config().KvInputDim())
     {
-      THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: encoder last dim mismatch");
+      THROW_CAIFE("CAIF_DeviceCrossAttention::ForwardCross: "
+                  "encoder last dim must match config kv_input_dim");
     }
     AssertInputDtype(decoder_input);
     AssertInputDtype(encoder_output);
@@ -197,10 +210,11 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::ForwardCross(
     const uint32_t batch=dec_shape[0];
     const uint32_t dec_seq_len=dec_shape[1];
     const uint32_t enc_seq_len=enc_shape[1];
-    const uint32_t dim=_config.dim;
-    const uint32_t num_heads=_config.num_heads;
-    const uint32_t num_kv_heads=_config.num_kv_heads;
-    const uint32_t head_dim=_config.head_dim;
+    const uint32_t dim=Config().Dim();
+    const uint32_t kv_input_dim=Config().KvInputDim();
+    const uint32_t num_heads=Config().NumHeads();
+    const uint32_t num_kv_heads=Config().NumKvHeads();
+    const uint32_t head_dim=Config().HeadDim();
     const uint32_t bs_dec=batch*dec_seq_len;
     const uint32_t bs_enc=batch*enc_seq_len;
     const uint32_t bh=batch*num_heads;
@@ -213,14 +227,14 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::ForwardCross(
     CAIF_DeviceTensor flat_dec=decoder_input.Clone();
     flat_dec.Reshape({bs_dec,dim});
     CAIF_DeviceTensor flat_enc=encoder_output.Clone();
-    flat_enc.Reshape({bs_enc,dim});
+    flat_enc.Reshape({bs_enc,kv_input_dim});
 
     CAIF_DeviceTensor q_proj=CAIF_DeviceTensor::Uninitialized({bs_dec,qk_dim},ctx.Stream(),sdt);
     CAIF_DeviceTensor k_proj=CAIF_DeviceTensor::Uninitialized({bs_enc,kv_dim},ctx.Stream(),sdt);
     CAIF_DeviceTensor v_proj=CAIF_DeviceTensor::Uninitialized({bs_enc,kv_dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMul(flat_dec,_w_q,q_proj,ctx,cdt);
-    CAIF_Ops::MatMul(flat_enc,_w_k,k_proj,ctx,cdt);
-    CAIF_Ops::MatMul(flat_enc,_w_v,v_proj,ctx,cdt);
+    CAIF_Ops::MatMul(flat_dec,WQ(),q_proj,ctx,cdt);
+    CAIF_Ops::MatMul(flat_enc,WK(),k_proj,ctx,cdt);
+    CAIF_Ops::MatMul(flat_enc,WV(),v_proj,ctx,cdt);
 
     CAIF_DeviceTensor q_transposed=CAIF_DeviceTensor::Uninitialized(
                                     {bh*dec_seq_len*head_dim},ctx.Stream(),sdt);
@@ -359,34 +373,34 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::ForwardCross(
 
     CAIF_DeviceTensor output_flat=CAIF_DeviceTensor::Uninitialized(
                                    {bs_dec,dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMul(merged,_w_o,output_flat,ctx,cdt);
+    CAIF_Ops::MatMul(merged,WO(),output_flat,ctx,cdt);
     output_flat.Reshape({batch,dec_seq_len,dim});
 
     if(ctx.Training()==true)
     {
-      _cached_decoder_input=std::move(flat_dec);
-      _cached_encoder_input=std::move(flat_enc);
-      _cached_q_heads=std::move(q_transposed);
+      SetCachedDecoderInput(std::move(flat_dec));
+      SetCachedEncoderInput(std::move(flat_enc));
+      SetCachedQHeads(std::move(q_transposed));
       if(num_kv_heads!=num_heads)
       {
-        _cached_k_heads=std::move(k_transposed);
-        _cached_v_heads=std::move(v_transposed);
+        SetCachedKHeads(std::move(k_transposed));
+        SetCachedVHeads(std::move(v_transposed));
       }
       else
       {
-        _cached_k_heads=std::move(k_expanded);
-        _cached_v_heads=std::move(v_expanded);
+        SetCachedKHeads(std::move(k_expanded));
+        SetCachedVHeads(std::move(v_expanded));
       }
-      _cached_use_flash=use_flash;
+      SetCachedUseFlash(use_flash);
       if(use_flash==true)
       {
-        _cached_logsumexp=std::move(logsumexp);
-        _cached_output=std::move(context);
+        SetCachedLogsumexp(std::move(logsumexp));
+        SetCachedOutput(std::move(context));
       }
-      _cached_concat=std::move(merged);
-      _cached_batch=batch;
-      _cached_dec_seq_len=dec_seq_len;
-      _cached_enc_seq_len=enc_seq_len;
+      SetCachedConcat(std::move(merged));
+      SetCachedBatch(batch);
+      SetCachedDecSeqLen(dec_seq_len);
+      SetCachedEncSeqLen(enc_seq_len);
     }
 
     return output_flat;
@@ -420,18 +434,19 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
 {
   try
   {
-    if(_cached_decoder_input.IsEmpty()==true)
+    if(CachedDecoderInput().IsEmpty()==true)
     {
       THROW_CAIFE("CAIF_DeviceCrossAttention::BackwardCross: must call ForwardCross with training=true first");
     }
 
-    const uint32_t batch=_cached_batch;
-    const uint32_t dec_seq_len=_cached_dec_seq_len;
-    const uint32_t enc_seq_len=_cached_enc_seq_len;
-    const uint32_t dim=_config.dim;
-    const uint32_t num_heads=_config.num_heads;
-    const uint32_t num_kv_heads=_config.num_kv_heads;
-    const uint32_t head_dim=_config.head_dim;
+    const uint32_t batch=CachedBatch();
+    const uint32_t dec_seq_len=CachedDecSeqLen();
+    const uint32_t enc_seq_len=CachedEncSeqLen();
+    const uint32_t dim=Config().Dim();
+    const uint32_t kv_input_dim=Config().KvInputDim();
+    const uint32_t num_heads=Config().NumHeads();
+    const uint32_t num_kv_heads=Config().NumKvHeads();
+    const uint32_t head_dim=Config().HeadDim();
     const uint32_t bs_dec=batch*dec_seq_len;
     const uint32_t bs_enc=batch*enc_seq_len;
     const uint32_t bh=batch*num_heads;
@@ -450,11 +465,11 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
 
     CAIF_DeviceTensor grad_concat=CAIF_DeviceTensor::Uninitialized(
                                    {bs_dec,qk_dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeB(grad_out_flat,_w_o,grad_concat,ctx,cdt);
+    CAIF_Ops::MatMulTransposeB(grad_out_flat,WO(),grad_concat,ctx,cdt);
     CAIF_DeviceTensor grad_wo_delta=CAIF_DeviceTensor::Uninitialized(
                                      {qk_dim,dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeA(_cached_concat,grad_out_flat,grad_wo_delta,ctx,cdt);
-    CAIF_Ops::Add(_grad_w_o,grad_wo_delta,_grad_w_o);
+    CAIF_Ops::MatMulTransposeA(CachedConcat(),grad_out_flat,grad_wo_delta,ctx,cdt);
+    CAIF_Ops::Add(GradWO(),grad_wo_delta,GradWO());
 
     CAIF_DeviceTensor grad_context=CAIF_DeviceTensor::Uninitialized(
                                     {bh*dec_seq_len*head_dim},ctx.Stream(),sdt);
@@ -475,7 +490,7 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
                            {bh,enc_seq_len,head_dim},ctx.Stream(),sdt);
       v_expanded_storage=CAIF_DeviceTensor::Uninitialized(
                            {bh,enc_seq_len,head_dim},ctx.Stream(),sdt);
-      launch_gqa_repeat_kv<StorageT>(_cached_k_heads.template DevicePtr<StorageT>(),
+      launch_gqa_repeat_kv<StorageT>(CachedKHeads().template DevicePtr<StorageT>(),
                                       k_expanded_storage.template DevicePtr<StorageT>(),
                                       static_cast<int>(batch),
                                       static_cast<int>(num_kv_heads),
@@ -483,7 +498,7 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
                                       static_cast<int>(enc_seq_len),
                                       static_cast<int>(head_dim),
                                       ctx.Stream().Handle());
-      launch_gqa_repeat_kv<StorageT>(_cached_v_heads.template DevicePtr<StorageT>(),
+      launch_gqa_repeat_kv<StorageT>(CachedVHeads().template DevicePtr<StorageT>(),
                                       v_expanded_storage.template DevicePtr<StorageT>(),
                                       static_cast<int>(batch),
                                       static_cast<int>(num_kv_heads),
@@ -493,9 +508,9 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
                                       ctx.Stream().Handle());
     }
     const CAIF_DeviceTensor &k_expanded=(num_kv_heads!=num_heads)?
-                                        k_expanded_storage:_cached_k_heads;
+                                        k_expanded_storage:CachedKHeads();
     const CAIF_DeviceTensor &v_expanded=(num_kv_heads!=num_heads)?
-                                        v_expanded_storage:_cached_v_heads;
+                                        v_expanded_storage:CachedVHeads();
 
     const float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
     CAIF_DeviceTensor grad_q_heads;
@@ -512,13 +527,13 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
     (void)total_mem;
 #endif
     const bool use_naive_backward=(attn_matrix_bytes*2<=free_mem)||
-                                  (_cached_use_flash==false);
+                                  (CachedUseFlash()==false);
 
     if(use_naive_backward==true)
     {
       CAIF_DeviceTensor scores=CAIF_DeviceTensor::Uninitialized(
                                 {bh,dec_seq_len,enc_seq_len},ctx.Stream(),sdt);
-      CAIF_Ops::BatchedMatMulTransposeB(_cached_q_heads,k_expanded,scores,
+      CAIF_Ops::BatchedMatMulTransposeB(CachedQHeads(),k_expanded,scores,
                                         static_cast<int>(dec_seq_len),
                                         static_cast<int>(head_dim),
                                         static_cast<int>(enc_seq_len),
@@ -574,7 +589,7 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
 
       grad_k_heads=CAIF_DeviceTensor::Uninitialized(
                      {bh,enc_seq_len,head_dim},ctx.Stream(),sdt);
-      CAIF_Ops::BatchedMatMulTransposeA(grad_scores,_cached_q_heads,
+      CAIF_Ops::BatchedMatMulTransposeA(grad_scores,CachedQHeads(),
                                         grad_k_heads,
                                         static_cast<int>(dec_seq_len),
                                         static_cast<int>(enc_seq_len),
@@ -592,12 +607,12 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
                      {bh,enc_seq_len,head_dim},ctx.Stream(),sdt);
 
       launch_flash_attention_backward_cross<StorageT>(
-                                  _cached_q_heads.template DevicePtr<StorageT>(),
+                                  CachedQHeads().template DevicePtr<StorageT>(),
                                   k_expanded.template DevicePtr<StorageT>(),
                                   v_expanded.template DevicePtr<StorageT>(),
-                                  _cached_output.template DevicePtr<StorageT>(),
+                                  CachedOutput().template DevicePtr<StorageT>(),
                                   grad_context.template DevicePtr<StorageT>(),
-                                  _cached_logsumexp.DevicePtr<float>(),
+                                  CachedLogsumexp().template DevicePtr<float>(),
                                   grad_q_heads.template DevicePtr<StorageT>(),
                                   grad_k_heads.template DevicePtr<StorageT>(),
                                   grad_v_heads.template DevicePtr<StorageT>(),
@@ -674,31 +689,37 @@ CAIF_DeviceCrossAttention<ComputeT,StorageT>::BackwardCross(
 
     CAIF_DeviceTensor grad_wq_delta=CAIF_DeviceTensor::Uninitialized(
                                      {dim,qk_dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeA(_cached_decoder_input,grad_q_flat,grad_wq_delta,ctx,cdt);
-    CAIF_Ops::Add(_grad_w_q,grad_wq_delta,_grad_w_q);
+    CAIF_Ops::MatMulTransposeA(CachedDecoderInput(),grad_q_flat,grad_wq_delta,ctx,cdt);
+    CAIF_Ops::Add(GradWQ(),grad_wq_delta,GradWQ());
 
+    // W_K / W_V gradients project against the encoder-output width, so
+    // their deltas and the gradient flowing back into the encoder output
+    // (gi_k / gi_v / grad_enc) are kv_input_dim-wide, not dim-wide.
     CAIF_DeviceTensor grad_wk_delta=CAIF_DeviceTensor::Uninitialized(
-                                     {dim,kv_dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeA(_cached_encoder_input,grad_k_flat,grad_wk_delta,ctx,cdt);
-    CAIF_Ops::Add(_grad_w_k,grad_wk_delta,_grad_w_k);
+                                     {kv_input_dim,kv_dim},ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeA(CachedEncoderInput(),grad_k_flat,grad_wk_delta,ctx,cdt);
+    CAIF_Ops::Add(GradWK(),grad_wk_delta,GradWK());
 
     CAIF_DeviceTensor grad_wv_delta=CAIF_DeviceTensor::Uninitialized(
-                                     {dim,kv_dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeA(_cached_encoder_input,grad_v_flat,grad_wv_delta,ctx,cdt);
-    CAIF_Ops::Add(_grad_w_v,grad_wv_delta,_grad_w_v);
+                                     {kv_input_dim,kv_dim},ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeA(CachedEncoderInput(),grad_v_flat,grad_wv_delta,ctx,cdt);
+    CAIF_Ops::Add(GradWV(),grad_wv_delta,GradWV());
 
     CAIF_DeviceTensor grad_dec_input=CAIF_DeviceTensor::Uninitialized(
                                       {bs_dec,dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeB(grad_q_flat,_w_q,grad_dec_input,ctx,cdt);
+    CAIF_Ops::MatMulTransposeB(grad_q_flat,WQ(),grad_dec_input,ctx,cdt);
     grad_dec_input.Reshape({batch,dec_seq_len,dim});
 
-    CAIF_DeviceTensor gi_k=CAIF_DeviceTensor::Uninitialized({bs_enc,dim},ctx.Stream(),sdt);
-    CAIF_DeviceTensor gi_v=CAIF_DeviceTensor::Uninitialized({bs_enc,dim},ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeB(grad_k_flat,_w_k,gi_k,ctx,cdt);
-    CAIF_Ops::MatMulTransposeB(grad_v_flat,_w_v,gi_v,ctx,cdt);
-    CAIF_DeviceTensor grad_enc=CAIF_DeviceTensor::Uninitialized({bs_enc,dim},ctx.Stream(),sdt);
+    CAIF_DeviceTensor gi_k=CAIF_DeviceTensor::Uninitialized({bs_enc,kv_input_dim},
+                                                            ctx.Stream(),sdt);
+    CAIF_DeviceTensor gi_v=CAIF_DeviceTensor::Uninitialized({bs_enc,kv_input_dim},
+                                                            ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeB(grad_k_flat,WK(),gi_k,ctx,cdt);
+    CAIF_Ops::MatMulTransposeB(grad_v_flat,WV(),gi_v,ctx,cdt);
+    CAIF_DeviceTensor grad_enc=CAIF_DeviceTensor::Uninitialized({bs_enc,kv_input_dim},
+                                                               ctx.Stream(),sdt);
     CAIF_Ops::Add(gi_k,gi_v,grad_enc);
-    grad_enc.Reshape({batch,enc_seq_len,dim});
+    grad_enc.Reshape({batch,enc_seq_len,kv_input_dim});
 
     if(grad_encoder_output.IsEmpty()==true)
     {
@@ -736,10 +757,10 @@ void CAIF_DeviceCrossAttention<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _grad_w_q.FillZero();
-    _grad_w_k.FillZero();
-    _grad_w_v.FillZero();
-    _grad_w_o.FillZero();
+    GradWQ().FillZero();
+    GradWK().FillZero();
+    GradWV().FillZero();
+    GradWO().FillZero();
   }
   CAIF_CATCH_BLOCK()
 }
@@ -768,15 +789,16 @@ void CAIF_DeviceCrossAttention<ComputeT,StorageT>::InitializeWeights(uint32_t se
 {
   try
   {
-    const uint32_t dim=_config.dim;
-    const uint32_t qk_dim=_config.num_heads*_config.head_dim;
-    const uint32_t kv_dim=_config.num_kv_heads*_config.head_dim;
+    const uint32_t dim=Config().Dim();
+    const uint32_t kv_input_dim=Config().KvInputDim();
+    const uint32_t qk_dim=Config().NumHeads()*Config().HeadDim();
+    const uint32_t kv_dim=Config().NumKvHeads()*Config().HeadDim();
 
     std::mt19937 gen(seed);
-    XavierInit(_w_q,gen,dim,qk_dim);
-    XavierInit(_w_k,gen,dim,kv_dim);
-    XavierInit(_w_v,gen,dim,kv_dim);
-    XavierInit(_w_o,gen,qk_dim,dim);
+    XavierInit(WQ(),gen,dim,qk_dim);
+    XavierInit(WK(),gen,kv_input_dim,kv_dim);
+    XavierInit(WV(),gen,kv_input_dim,kv_dim);
+    XavierInit(WO(),gen,qk_dim,dim);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -899,9 +921,9 @@ template<typename ComputeT,typename StorageT>
 size_t CAIF_DeviceCrossAttention<ComputeT,StorageT>::TotalParameterCount()const
 {
   return _w_q.TotalElements()+
-         _w_k.TotalElements()+
-         _w_v.TotalElements()+
-         _w_o.TotalElements();
+         WK().TotalElements()+
+         WV().TotalElements()+
+         WO().TotalElements();
 }
 
 template<typename ComputeT,typename StorageT>
@@ -909,14 +931,23 @@ std::string CAIF_DeviceCrossAttention<ComputeT,StorageT>::Description()const
 {
   try
   {
-    std::string desc="CrossAttention(dim="+std::to_string(_config.dim)+
-                     ",heads="+std::to_string(_config.num_heads)+
-                     ",head_dim="+std::to_string(_config.head_dim);
-    if(_config.num_kv_heads!=_config.num_heads)
+    std::string desc=std::string(g_serial_tag_cross_attention)+
+                     g_serial_open_paren+
+                     g_serial_kv_dim+
+                     std::to_string(Config().Dim())+
+                     g_serial_comma+
+                     g_serial_kv_heads+
+                     std::to_string(Config().NumHeads())+
+                     g_serial_comma+
+                     g_serial_kv_head_dim+
+                     std::to_string(Config().HeadDim());
+    if(Config().NumKvHeads()!=Config().NumHeads())
     {
-      desc+=",kv_heads="+std::to_string(_config.num_kv_heads);
+      desc+=g_serial_comma;
+      desc+=g_serial_kv_kv_heads;
+      desc+=std::to_string(Config().NumKvHeads());
     }
-    desc+=")";
+    desc+=g_serial_close_paren;
     return desc;
   }
   CAIF_CATCH_BLOCK()
@@ -926,10 +957,11 @@ template<typename ComputeT,typename StorageT>
 std::vector<std::string>
 CAIF_DeviceCrossAttention<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
-  return {prefix+"q_proj.weight",
-          prefix+"k_proj.weight",
-          prefix+"v_proj.weight",
-          prefix+"o_proj.weight"};
+  const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
+  return {prefix+reg.Name(CAIF_ParamRole::Role_e::AttnWQ_e),
+          prefix+reg.Name(CAIF_ParamRole::Role_e::AttnWK_e),
+          prefix+reg.Name(CAIF_ParamRole::Role_e::AttnWV_e),
+          prefix+reg.Name(CAIF_ParamRole::Role_e::AttnWO_e)};
 }
 
 // Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.

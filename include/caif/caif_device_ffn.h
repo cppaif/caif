@@ -36,6 +36,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_ffn_config.h"
 #include "caif_device_activation.h"
 #include "caif_device_pointwise_activation.h"
 #include "caif_device_gated_activation.h"
@@ -53,12 +54,6 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceFFN:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct FFNConfig_t
-    {
-      uint32_t dim;
-      uint32_t ffn_dim;
-    };
-
     struct FFNProjections_t
     {
       std::unique_ptr<CAIF_DeviceLayer> gate;
@@ -66,10 +61,10 @@ class CAIF_DeviceFFN:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
       std::unique_ptr<CAIF_DeviceLayer> down;
     };
 
-    CAIF_DeviceFFN(const FFNConfig_t &config,
+    CAIF_DeviceFFN(const CAIF_DeviceFFNConfig &config,
                    std::unique_ptr<CAIF_DeviceActivation> activation,
                    CAIF_CudaStream &stream);
-    CAIF_DeviceFFN(const FFNConfig_t &config,
+    CAIF_DeviceFFN(const CAIF_DeviceFFNConfig &config,
                    FFNProjections_t projections,
                    std::unique_ptr<CAIF_DeviceActivation> activation,
                    CAIF_CudaStream &stream);
@@ -94,7 +89,7 @@ class CAIF_DeviceFFN:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const FFNConfig_t &Config()const{return _config;}
+    const CAIF_DeviceFFNConfig &Config()const{return _config;}
     bool IsGated()const{return _is_gated;}
 
     void InitializeWeights(uint32_t seed=0)override;
@@ -131,7 +126,92 @@ class CAIF_DeviceFFN:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     void UploadAtStorage(CAIF_DeviceTensor &dst,const std::vector<float> &host_data);
 
   private:
-    FFNConfig_t _config;
+    // Internal accessor / setter pairs for every member. Method bodies
+    // route through these per CODING_GUIDELINES.md §Member Access.
+    void SetConfig(const CAIF_DeviceFFNConfig &c){_config=c;}
+    void SetIsGated(const bool v){_is_gated=v;}
+    void SetUseProjections(const bool v){_use_projections=v;}
+    bool UseProjections()const{return _use_projections;}
+
+    CAIF_DeviceActivation &Activation()
+    {
+      if(_activation==nullptr)
+      {
+        THROW_CAIFE("CAIF_DeviceFFN::Activation: activation is null");
+      }
+      return *_activation;
+    }
+    const CAIF_DeviceActivation &Activation()const
+    {
+      if(_activation==nullptr)
+      {
+        THROW_CAIFE("CAIF_DeviceFFN::Activation: activation is null");
+      }
+      return *_activation;
+    }
+
+    const FFNProjections_t &Projections()const{return _projections;}
+    FFNProjections_t &ProjectionsMut(){return _projections;}
+    void SetProjections(FFNProjections_t &&v){_projections=std::move(v);}
+
+    CAIF_DeviceTensor &W1Mut(){return _w1;}
+    void SetW1(CAIF_DeviceTensor &&t){_w1=std::move(t);}
+    CAIF_DeviceTensor &W2Mut(){return _w2;}
+    void SetW2(CAIF_DeviceTensor &&t){_w2=std::move(t);}
+
+    const CAIF_DeviceTensor &GradW1()const{return _grad_w1;}
+    CAIF_DeviceTensor &GradW1(){return _grad_w1;}
+    void SetGradW1(CAIF_DeviceTensor &&t){_grad_w1=std::move(t);}
+    const CAIF_DeviceTensor &GradW2()const{return _grad_w2;}
+    CAIF_DeviceTensor &GradW2(){return _grad_w2;}
+    void SetGradW2(CAIF_DeviceTensor &&t){_grad_w2=std::move(t);}
+
+    CAIF_DeviceTensor &WGateMut(){return _w_gate;}
+    void SetWGate(CAIF_DeviceTensor &&t){_w_gate=std::move(t);}
+    CAIF_DeviceTensor &WUpMut(){return _w_up;}
+    void SetWUp(CAIF_DeviceTensor &&t){_w_up=std::move(t);}
+    CAIF_DeviceTensor &WDownMut(){return _w_down;}
+    void SetWDown(CAIF_DeviceTensor &&t){_w_down=std::move(t);}
+
+    const CAIF_DeviceTensor &GradWGate()const{return _grad_w_gate;}
+    CAIF_DeviceTensor &GradWGate(){return _grad_w_gate;}
+    void SetGradWGate(CAIF_DeviceTensor &&t){_grad_w_gate=std::move(t);}
+    const CAIF_DeviceTensor &GradWUp()const{return _grad_w_up;}
+    CAIF_DeviceTensor &GradWUp(){return _grad_w_up;}
+    void SetGradWUp(CAIF_DeviceTensor &&t){_grad_w_up=std::move(t);}
+    const CAIF_DeviceTensor &GradWDown()const{return _grad_w_down;}
+    CAIF_DeviceTensor &GradWDown(){return _grad_w_down;}
+    void SetGradWDown(CAIF_DeviceTensor &&t){_grad_w_down=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedPreActivation()const{return _cached_pre_activation;}
+    CAIF_DeviceTensor &CachedPreActivation(){return _cached_pre_activation;}
+    void SetCachedPreActivation(CAIF_DeviceTensor &&t){_cached_pre_activation=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedPostActivation()const{return _cached_post_activation;}
+    CAIF_DeviceTensor &CachedPostActivation(){return _cached_post_activation;}
+    void SetCachedPostActivation(CAIF_DeviceTensor &&t){_cached_post_activation=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedGateInput()const{return _cached_gate_input;}
+    CAIF_DeviceTensor &CachedGateInput(){return _cached_gate_input;}
+    void SetCachedGateInput(CAIF_DeviceTensor &&t){_cached_gate_input=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedUpInput()const{return _cached_up_input;}
+    CAIF_DeviceTensor &CachedUpInput(){return _cached_up_input;}
+    void SetCachedUpInput(CAIF_DeviceTensor &&t){_cached_up_input=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedActOutput()const{return _cached_act_output;}
+    CAIF_DeviceTensor &CachedActOutput(){return _cached_act_output;}
+    void SetCachedActOutput(CAIF_DeviceTensor &&t){_cached_act_output=std::move(t);}
+
+    const std::vector<uint32_t> &CachedInputShape()const{return _cached_input_shape;}
+    std::vector<uint32_t> &CachedInputShape(){return _cached_input_shape;}
+    void SetCachedInputShape(std::vector<uint32_t> &&v){_cached_input_shape=std::move(v);}
+
+    CAIF_DeviceFFNConfig _config;
     std::unique_ptr<CAIF_DeviceActivation> _activation;
     bool _is_gated;
     FFNProjections_t _projections;

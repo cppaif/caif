@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -24,7 +25,7 @@
 namespace instance
 {
 
-class CAIF_DeviceMoELayerFactory
+class CAIF_DeviceMoELayerFactory:public CAIF_Base
 {
   public:
     // Gating-math selector for the MoE router.  Default `SoftmaxTopK_e`
@@ -45,7 +46,6 @@ class CAIF_DeviceMoELayerFactory
     };
 
     CAIF_DeviceMoELayerFactory()=delete;
-    ~CAIF_DeviceMoELayerFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t input_dim,

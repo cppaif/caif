@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_relu_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -30,7 +31,7 @@ void CAIF_DeviceReLUActivation<ComputeT,StorageT>::Forward(const CAIF_DeviceTens
     {
       THROW_CAIFE("CAIF_DeviceReLUActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(input.TotalElements());
+    const int64_t n=static_cast<int64_t>(input.TotalElements());
     launch_relu_forward<StorageT>(input.template DevicePtr<StorageT>(),
                                    output.template DevicePtr<StorageT>(),
                                    n,
@@ -52,7 +53,7 @@ void CAIF_DeviceReLUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTen
     {
       THROW_CAIFE("CAIF_DeviceReLUActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
     launch_relu_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
                                     pre_activation.template DevicePtr<StorageT>(),
                                     grad_input.template DevicePtr<StorageT>(),
@@ -65,7 +66,7 @@ void CAIF_DeviceReLUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTen
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceReLUActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_relu;
+  return g_serial_tag_relu;
 }
 
 template<typename ComputeT,typename StorageT>

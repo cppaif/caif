@@ -15,7 +15,7 @@
 // Per-site `tensor.DevicePtr<float>()` reads in this file are all on
 // `fp32_view`, which is built one line above each call via
 // `.To(Float32)` / `.Clone()`. Comments at each call site name this
-// explicitly per the type-dispatch full plan (Phase 2).
+// explicitly.
 
 #include "caif_sys_debug.h"
 #include <vector>
@@ -44,7 +44,7 @@ bool CAIF_SysDebug::CheckTensor(const std::string &label,
                                const CAIF_DeviceTensor &tensor,
                                bool print_summary)
 {
-  if(_enabled==false)
+  if(IsEnabled()==false)
   {
     return false;
   }
@@ -143,7 +143,7 @@ void CAIF_SysDebug::PrintRawValues(const std::string &label,
                                   const CAIF_DeviceTensor &tensor,
                                   uint32_t count)
 {
-  if(_enabled==false)
+  if(IsEnabled()==false)
   {
     return;
   }
@@ -196,7 +196,7 @@ void CAIF_SysDebug::PrintRawValues(const std::string &label,
 
 void CAIF_SysDebug::DebugLog(const std::string &message)
 {
-  if(_enabled==true)
+  if(IsEnabled()==true)
   {
     SDbgLog()<<"[CAIF_SysDebug] "<<message<<std::endl;
   }

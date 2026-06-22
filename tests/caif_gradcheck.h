@@ -31,6 +31,7 @@
 #ifndef CAIF_GRADCHECK_H
 #define CAIF_GRADCHECK_H
 
+#include "caif_gradcheck_target_functor.h"
 #include "caif_device_tensor.h"
 #include "caif_run_context.h"
 #include <cstdint>
@@ -38,16 +39,6 @@
 
 namespace instance
 {
-
-class CAIF_GradCheckTargetFunctor
-{
-  public:
-    virtual ~CAIF_GradCheckTargetFunctor()=default;
-    virtual CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                          CAIF_RunContext &ctx)=0;
-  protected:
-  private:
-};
 
 class CAIF_GradCheck
 {

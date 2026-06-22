@@ -14,6 +14,7 @@
 
 #include "caif_device_linear_activation.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -40,7 +41,7 @@ void CAIF_DeviceLinearActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceT
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceLinearActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_linear;
+  return g_serial_tag_linear;
 }
 
 template<typename ComputeT,typename StorageT>

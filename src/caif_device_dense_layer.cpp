@@ -16,6 +16,8 @@
 #include "caif_ops.h"
 #include "caif_host_tensor.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
+#include "caif_serialization_constants.h"
 #include <random>
 #include <cmath>
 #include <ctime>
@@ -24,11 +26,12 @@ namespace instance
 {
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(uint32_t input_size,
-                                                                uint32_t output_size,
-                                                                CAIF_DeviceActivation_e activation,
-                                                                CAIF_CudaStream &stream,
-                                                                bool use_bias):
+CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(
+                                                  uint32_t input_size,
+                                                  uint32_t output_size,
+                                                  CAIF_DeviceActivation::CAIF_DeviceActivation_e activation,
+                                                  CAIF_CudaStream &stream,
+                                                  bool use_bias):
                                             CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                             _input_size(input_size),
                                             _output_size(output_size),
@@ -52,13 +55,13 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(uint32_t input_s
     }
 
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
-    _weights=CAIF_DeviceTensor::Uninitialized({input_size,output_size},stream,sdt);
-    _weight_grads=CAIF_DeviceTensor::Zeros({input_size,output_size},stream,sdt);
+    SetWeights(CAIF_DeviceTensor::Uninitialized({input_size,output_size},stream,sdt));
+    SetWeightGradients(CAIF_DeviceTensor::Zeros({input_size,output_size},stream,sdt));
 
-    if(_use_bias==true)
+    if(UseBias()==true)
     {
-      _bias=CAIF_DeviceTensor::Zeros({output_size},stream,sdt);
-      _bias_grads=CAIF_DeviceTensor::Zeros({output_size},stream,sdt);
+      SetBias(CAIF_DeviceTensor::Zeros({output_size},stream,sdt));
+      SetBiasGradients(CAIF_DeviceTensor::Zeros({output_size},stream,sdt));
     }
 
     InitializeWeights(0);
@@ -69,19 +72,19 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(uint32_t input_s
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceDenseLayer<ComputeT,StorageT>::CAIF_DeviceDenseLayer(CAIF_DeviceDenseLayer &&other):
                               CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
-                              _input_size(other._input_size),
-                              _output_size(other._output_size),
-                              _activation(other._activation),
-                              _use_bias(other._use_bias),
-                              _weights(std::move(other._weights)),
-                              _bias(std::move(other._bias)),
-                              _weight_grads(std::move(other._weight_grads)),
-                              _bias_grads(std::move(other._bias_grads)),
-                              _output_buffer(std::move(other._output_buffer)),
-                              _output_batch(other._output_batch),
-                              _last_input(std::move(other._last_input)),
-                              _last_preactivation(std::move(other._last_preactivation)),
-                              _last_output(std::move(other._last_output))
+                              _input_size(other.InputSize()),
+                              _output_size(other.OutputSize()),
+                              _activation(other.Activation()),
+                              _use_bias(other.UseBias()),
+                              _weights(std::move(other.Weights())),
+                              _bias(std::move(other.Bias())),
+                              _weight_grads(std::move(other.WeightGradients())),
+                              _bias_grads(std::move(other.BiasGradients())),
+                              _output_buffer(std::move(other.OutputBuffer())),
+                              _output_batch(other.OutputBatch()),
+                              _last_input(std::move(other.LastInput())),
+                              _last_preactivation(std::move(other.LastPreactivation())),
+                              _last_output(std::move(other.LastOutput()))
 {
 }
 
@@ -94,19 +97,19 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::operator=(CAIF_DeviceDenseLayer &&othe
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _input_size=other._input_size;
-      _output_size=other._output_size;
-      _activation=other._activation;
-      _use_bias=other._use_bias;
-      _weights=std::move(other._weights);
-      _bias=std::move(other._bias);
-      _weight_grads=std::move(other._weight_grads);
-      _bias_grads=std::move(other._bias_grads);
-      _output_buffer=std::move(other._output_buffer);
-      _output_batch=other._output_batch;
-      _last_input=std::move(other._last_input);
-      _last_preactivation=std::move(other._last_preactivation);
-      _last_output=std::move(other._last_output);
+      SetInputSize(other.InputSize());
+      SetOutputSize(other.OutputSize());
+      SetActivation(other.Activation());
+      SetUseBias(other.UseBias());
+      SetWeights(std::move(other.Weights()));
+      SetBias(std::move(other.Bias()));
+      SetWeightGradients(std::move(other.WeightGradients()));
+      SetBiasGradients(std::move(other.BiasGradients()));
+      SetOutputBuffer(std::move(other.OutputBuffer()));
+      SetOutputBatch(other.OutputBatch());
+      SetLastInput(std::move(other.LastInput()));
+      SetLastPreactivation(std::move(other.LastPreactivation()));
+      SetLastOutput(std::move(other.LastOutput()));
     }
     return *this;
   }
@@ -123,11 +126,11 @@ void CAIF_DeviceDenseLayer<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
       seed=static_cast<uint32_t>(std::time(nullptr));
     }
 
-    const float scale=std::sqrt(2.0f/static_cast<float>(_input_size+_output_size));
+    const float scale=std::sqrt(2.0f/static_cast<float>(InputSize()+OutputSize()));
     std::mt19937 gen(seed);
     std::normal_distribution<float> dist(0.0f,scale);
 
-    const size_t weight_count=static_cast<size_t>(_input_size)*_output_size;
+    const size_t weight_count=static_cast<size_t>(InputSize())*OutputSize();
     std::vector<float> host_weights(weight_count);
     for(size_t i=0;i<weight_count;++i)
     {
@@ -135,9 +138,9 @@ void CAIF_DeviceDenseLayer<ComputeT,StorageT>::InitializeWeights(uint32_t seed)
     }
     Weights().CopyFromHostFp32(host_weights.data(),weight_count);
 
-    if(_use_bias==true)
+    if(UseBias()==true)
     {
-      _bias.FillZero();
+      Bias().FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
@@ -148,10 +151,10 @@ void CAIF_DeviceDenseLayer<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _weight_grads.FillZero();
-    if(_use_bias==true)
+    WeightGradients().FillZero();
+    if(UseBias()==true)
     {
-      _bias_grads.FillZero();
+      BiasGradients().FillZero();
     }
   }
   CAIF_CATCH_BLOCK()
@@ -162,10 +165,10 @@ size_t CAIF_DeviceDenseLayer<ComputeT,StorageT>::TotalParameterCount()const
 {
   try
   {
-    size_t count=static_cast<size_t>(_input_size)*_output_size;
-    if(_use_bias==true)
+    size_t count=static_cast<size_t>(InputSize())*OutputSize();
+    if(UseBias()==true)
     {
-      count+=_output_size;
+      count+=OutputSize();
     }
     return count;
   }
@@ -177,7 +180,7 @@ size_t CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensorCount()const
 {
   try
   {
-    if(_use_bias==true)
+    if(UseBias()==true)
     {
       return 2;
     }
@@ -193,11 +196,11 @@ CAIF_DeviceTensor &CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensor(siz
   {
     if(index==0)
     {
-      return _weights;
+      return Weights();
     }
-    if(index==1&&_use_bias==true)
+    if(index==1&&UseBias()==true)
     {
-      return _bias;
+      return Bias();
     }
     THROW_CAIFE("CAIF_DeviceDenseLayer::ParameterTensor: index out of range");
   }
@@ -212,11 +215,11 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterTensor(size_t index)const
   {
     if(index==0)
     {
-      return _weights;
+      return Weights();
     }
-    if(index==1&&_use_bias==true)
+    if(index==1&&UseBias()==true)
     {
-      return _bias;
+      return Bias();
     }
     THROW_CAIFE("CAIF_DeviceDenseLayer::ParameterTensor: index out of range");
   }
@@ -230,11 +233,11 @@ CAIF_DeviceTensor &CAIF_DeviceDenseLayer<ComputeT,StorageT>::GradientTensor(size
   {
     if(index==0)
     {
-      return _weight_grads;
+      return WeightGradients();
     }
-    if(index==1&&_use_bias==true)
+    if(index==1&&UseBias()==true)
     {
-      return _bias_grads;
+      return BiasGradients();
     }
     THROW_CAIFE("CAIF_DeviceDenseLayer::GradientTensor: index out of range");
   }
@@ -249,11 +252,11 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::GradientTensor(size_t index)const
   {
     if(index==0)
     {
-      return _weight_grads;
+      return WeightGradients();
     }
-    if(index==1&&_use_bias==true)
+    if(index==1&&UseBias()==true)
     {
-      return _bias_grads;
+      return BiasGradients();
     }
     THROW_CAIFE("CAIF_DeviceDenseLayer::GradientTensor: index out of range");
   }
@@ -265,7 +268,12 @@ std::string CAIF_DeviceDenseLayer<ComputeT,StorageT>::Description()const
 {
   try
   {
-    return "Dense("+std::to_string(_input_size)+","+std::to_string(_output_size)+")";
+    return g_serial_tag_dense+
+           g_serial_open_paren+
+           std::to_string(InputSize())+
+           g_serial_comma+
+           std::to_string(OutputSize())+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -276,11 +284,12 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::ParameterNames(const std::string &pref
 {
   try
   {
+    const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
     std::vector<std::string> names;
-    names.push_back(prefix+"weight");
-    if(_use_bias==true)
+    names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::GenericWeight_e));
+    if(UseBias()==true)
     {
-      names.push_back(prefix+"bias");
+      names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::GenericBias_e));
     }
     return names;
   }
@@ -299,7 +308,7 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &i
     {
       THROW_CAIFE("CAIF_DeviceDenseLayer::Forward: input must be 2D [batch x features]");
     }
-    if(shape[1]!=_input_size)
+    if(shape[1]!=InputSize())
     {
       THROW_CAIFE("CAIF_DeviceDenseLayer::Forward: input features must match input_size");
     }
@@ -310,74 +319,83 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &i
     const CAIF_DataType::CAIF_DataType_e sdt=StorageDtype();
     const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
-    if(batch_size!=_output_batch)
+    if(batch_size!=OutputBatch())
     {
-      _output_buffer=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},ctx.Stream(),sdt);
-      _output_batch=batch_size;
+      SetOutputBuffer(CAIF_DeviceTensor::Uninitialized({batch_size,OutputSize()},
+                                                       ctx.Stream(),sdt));
+      SetOutputBatch(batch_size);
     }
 
-    if(_use_bias==true)
+    if(UseBias()==true)
     {
-      CAIF_Ops::MatMulBias(input,_weights,_bias,_output_buffer,ctx.Stream().Handle(),ctx,cdt);
+      CAIF_Ops::MatMulBias(input,Weights(),Bias(),OutputBuffer(),
+                           ctx.Stream().Handle(),ctx,cdt);
     }
     else
     {
-      CAIF_Ops::MatMul(input,_weights,_output_buffer,ctx,cdt);
+      CAIF_Ops::MatMul(input,Weights(),OutputBuffer(),ctx,cdt);
     }
 
     if(ctx.Training()==true)
     {
-      _last_input=input.Clone();
-      _last_preactivation=_output_buffer.Clone();
+      SetLastInput(input.Clone());
+      SetLastPreactivation(OutputBuffer().Clone());
     }
 
-    if(_activation==CAIF_DeviceActivation_e::None)
+    if(Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::None)
     {
-      return _output_buffer.Clone();
+      return OutputBuffer().Clone();
     }
 
-    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},
+    CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized({batch_size,OutputSize()},
                                                               ctx.Stream(),sdt);
 
-    switch(_activation)
+    switch(Activation())
     {
-      case CAIF_DeviceActivation_e::None:
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::None:
         break;
-      case CAIF_DeviceActivation_e::ReLU:
-        CAIF_Ops::ReLU(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::ReLU:
+        CAIF_Ops::ReLU(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::Sigmoid:
-        CAIF_Ops::Sigmoid(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Sigmoid:
+        CAIF_Ops::Sigmoid(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::Tanh:
-        CAIF_Ops::Tanh(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Tanh:
+        CAIF_Ops::Tanh(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::Softmax:
-        CAIF_Ops::Softmax(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Softmax:
+        CAIF_Ops::Softmax(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::LeakyReLU:
-        CAIF_Ops::LeakyReLU(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::LeakyReLU:
+        CAIF_Ops::LeakyReLU(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::ELU:
-        CAIF_Ops::ELU(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::ELU:
+        CAIF_Ops::ELU(OutputBuffer(),output);
         break;
-      case CAIF_DeviceActivation_e::GELU:
-        CAIF_Ops::GELU(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::GELU:
+        CAIF_Ops::GELU(OutputBuffer(),
+                       output,
+                       CAIF_GELUApproximation::CAIF_GELUApproximation_e::Tanh);
         break;
-      case CAIF_DeviceActivation_e::Swish:
-        CAIF_Ops::Swish(_output_buffer,output);
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Swish:
+        CAIF_Ops::Swish(OutputBuffer(),output);
+        break;
+      case CAIF_DeviceActivation::CAIF_DeviceActivation_e::GELUExact:
+        CAIF_Ops::GELU(OutputBuffer(),
+                       output,
+                       CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact);
         break;
     }
 
     if(ctx.Training()==true)
     {
-      if(_activation==CAIF_DeviceActivation_e::Sigmoid||
-         _activation==CAIF_DeviceActivation_e::Tanh||
-         _activation==CAIF_DeviceActivation_e::Softmax||
-         _activation==CAIF_DeviceActivation_e::ELU||
-         _activation==CAIF_DeviceActivation_e::Swish)
+      if(Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::Sigmoid||
+         Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::Tanh||
+         Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::Softmax||
+         Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::ELU||
+         Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::Swish)
       {
-        _last_output=output.Clone();
+        SetLastOutput(output.Clone());
       }
     }
 
@@ -393,7 +411,7 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &
 {
   try
   {
-    if(_last_input.IsEmpty()==true)
+    if(LastInput().IsEmpty()==true)
     {
       THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: must call Forward with training=true first");
     }
@@ -403,7 +421,7 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &
     {
       THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: grad_output must be 2D");
     }
-    if(shape[1]!=_output_size)
+    if(shape[1]!=OutputSize())
     {
       THROW_CAIFE("CAIF_DeviceDenseLayer::Backward: grad_output must match output_size");
     }
@@ -413,58 +431,76 @@ CAIF_DeviceDenseLayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &
     const CAIF_DataType::CAIF_DataType_e cdt=ComputeDtype();
 
     CAIF_DeviceTensor linear_grad;
-    if(_activation==CAIF_DeviceActivation_e::None)
+    if(Activation()==CAIF_DeviceActivation::CAIF_DeviceActivation_e::None)
     {
       linear_grad=CAIF_DeviceTensor::WrapView(
                    const_cast<void *>(grad_output.DeviceDataRaw()),
-                   {batch_size,_output_size},
+                   {batch_size,OutputSize()},
                    ctx.Stream(),
                    grad_output.Dtype());
     }
     else
     {
-      linear_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_output_size},ctx.Stream(),sdt);
-      switch(_activation)
+      linear_grad=CAIF_DeviceTensor::Uninitialized({batch_size,OutputSize()},ctx.Stream(),sdt);
+      switch(Activation())
       {
-        case CAIF_DeviceActivation_e::None:
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::None:
           break;
-        case CAIF_DeviceActivation_e::ReLU:
-          CAIF_Ops::ReLUBackward(grad_output,_last_preactivation,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::ReLU:
+          CAIF_Ops::ReLUBackward(grad_output,LastPreactivation(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::Sigmoid:
-          CAIF_Ops::SigmoidBackward(grad_output,_last_output,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Sigmoid:
+          CAIF_Ops::SigmoidBackward(grad_output,LastOutput(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::Tanh:
-          CAIF_Ops::TanhBackward(grad_output,_last_output,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Tanh:
+          CAIF_Ops::TanhBackward(grad_output,LastOutput(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::Softmax:
-          CAIF_Ops::SoftmaxBackward(grad_output,_last_output,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Softmax:
+          CAIF_Ops::SoftmaxBackward(grad_output,LastOutput(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::LeakyReLU:
-          CAIF_Ops::LeakyReLUBackward(grad_output,_last_preactivation,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::LeakyReLU:
+          CAIF_Ops::LeakyReLUBackward(grad_output,LastPreactivation(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::ELU:
-          CAIF_Ops::ELUBackward(grad_output,_last_preactivation,_last_output,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::ELU:
+          CAIF_Ops::ELUBackward(grad_output,LastPreactivation(),LastOutput(),linear_grad);
           break;
-        case CAIF_DeviceActivation_e::GELU:
-          CAIF_Ops::GELUBackward(grad_output,_last_preactivation,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::GELU:
+          CAIF_Ops::GELUBackward(grad_output,
+                                 LastPreactivation(),
+                                 linear_grad,
+                                 CAIF_GELUApproximation::CAIF_GELUApproximation_e::Tanh);
           break;
-        case CAIF_DeviceActivation_e::Swish:
-          CAIF_Ops::SwishBackward(grad_output,_last_preactivation,_last_output,linear_grad);
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::Swish:
+          CAIF_Ops::SwishBackward(grad_output,LastPreactivation(),LastOutput(),linear_grad);
+          break;
+        case CAIF_DeviceActivation::CAIF_DeviceActivation_e::GELUExact:
+          CAIF_Ops::GELUBackward(grad_output,
+                                 LastPreactivation(),
+                                 linear_grad,
+                                 CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact);
           break;
       }
     }
 
-    CAIF_Ops::MatMulTransposeA(_last_input,linear_grad,_weight_grads,ctx,cdt);
+    // Accumulate (delta + Add) rather than overwrite, so several backward
+    // passes before a ZeroGradients sum — matching CAIF_DeviceFFN and
+    // CAIF_DeviceLinearHead and PyTorch-style gradient accumulation.
+    CAIF_DeviceTensor grad_w_delta=CAIF_DeviceTensor::Uninitialized(WeightGradients().Shape(),
+                                                                    ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeA(LastInput(),linear_grad,grad_w_delta,ctx,cdt);
+    CAIF_Ops::Add(WeightGradients(),grad_w_delta,WeightGradients());
 
-    if(_use_bias==true)
+    if(UseBias()==true)
     {
-      CAIF_Ops::BiasGradient(linear_grad,_bias_grads);
+      CAIF_DeviceTensor bias_grad_delta=CAIF_DeviceTensor::Uninitialized(BiasGradients().Shape(),
+                                                                         ctx.Stream(),sdt);
+      CAIF_Ops::BiasGradient(linear_grad,bias_grad_delta);
+      CAIF_Ops::Add(BiasGradients(),bias_grad_delta,BiasGradients());
     }
 
-    CAIF_DeviceTensor input_grad=CAIF_DeviceTensor::Uninitialized({batch_size,_input_size},
-                                                                    ctx.Stream(),sdt);
-    CAIF_Ops::MatMulTransposeB(linear_grad,_weights,input_grad,ctx,cdt);
+    CAIF_DeviceTensor input_grad=CAIF_DeviceTensor::Uninitialized({batch_size,InputSize()},
+                                                                  ctx.Stream(),sdt);
+    CAIF_Ops::MatMulTransposeB(linear_grad,Weights(),input_grad,ctx,cdt);
 
     return input_grad;
   }

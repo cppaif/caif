@@ -20,13 +20,15 @@
 #include "caif_device_bilinear_activation.h"
 #include "caif_exception.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
+#include "caif_role_registry.h"
 
 namespace instance
 {
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTransformerModel<ComputeT,StorageT>::CAIF_DeviceTransformerModel(
-                                                  const Config_t &config,
+                                                  const CAIF_DeviceTransformerModelConfig &config,
                                                   CAIF_CudaStream &stream):CAIF_DeviceContainer(stream),
                                                                            _config(config),
                                                                            _pos_enc_present(false)
@@ -34,85 +36,81 @@ CAIF_DeviceTransformerModel<ComputeT,StorageT>::CAIF_DeviceTransformerModel(
   try
   {
     // Validate config
-    if(config.vocab_size==0)
+    if(config.VocabSize()==0)
     {
       THROW_CAIFE("DeviceTransformerModel: vocab_size must be > 0");
     }
-    if(config.dim==0)
+    if(config.Dim()==0)
     {
       THROW_CAIFE("DeviceTransformerModel: dim must be > 0");
     }
-    if(config.num_heads==0)
+    if(config.NumHeads()==0)
     {
       THROW_CAIFE("DeviceTransformerModel: num_heads must be > 0");
     }
-    if(config.num_layers==0)
+    if(config.NumLayers()==0)
     {
       THROW_CAIFE("DeviceTransformerModel: num_layers must be > 0");
     }
-    if(config.dim%config.num_heads!=0)
+    if(config.Dim()%config.NumHeads()!=0)
     {
       THROW_CAIFE("DeviceTransformerModel: dim must be divisible by num_heads");
     }
 
     // Default num_kv_heads to num_heads if not specified
-    uint32_t num_kv_heads=config.num_kv_heads;
+    uint32_t num_kv_heads=config.NumKvHeads();
     if(num_kv_heads==0)
     {
-      num_kv_heads=config.num_heads;
+      num_kv_heads=config.NumHeads();
     }
 
     // Default output_dim to vocab_size if not specified
-    uint32_t output_dim=config.output_dim;
+    uint32_t output_dim=config.OutputDim();
     if(output_dim==0)
     {
-      output_dim=config.vocab_size;
+      output_dim=config.VocabSize();
     }
 
     // 1. Token embedding — keep a temporary typed raw reference before
     //    transferring ownership to the container, because the tied-weights
     //    head needs the embedding's parameter+gradient tensors.
-    typename CAIF_DeviceTokenEmbedding<ComputeT,StorageT>::Config_t emb_config{config.vocab_size,
-                                                                                config.dim};
+    CAIF_DeviceTokenEmbeddingConfig emb_config(config.VocabSize(),config.Dim());
+    emb_config.SetOutputScale(config.EmbedScale());
     auto embedding=std::make_unique<CAIF_DeviceTokenEmbedding<ComputeT,StorageT>>(emb_config,stream);
     CAIF_DeviceTokenEmbedding<ComputeT,StorageT> *embedding_ref=embedding.get();
     AddLayer(std::move(embedding));
 
     // 2. Positional encoding (if not using RoPE)
-    if(config.use_rope==false)
+    if(config.UseRope()==false)
     {
-      typename CAIF_DevicePositionalEncoding<ComputeT,StorageT>::Config_t pe_config{config.max_seq_len,
-                                                                                     config.dim,
-                                                                                     config.pe_mode};
+      CAIF_DevicePositionalEncodingConfig pe_config(config.MaxSeqLen(),config.Dim(),config.PeMode());
       AddLayer(std::make_unique<CAIF_DevicePositionalEncoding<ComputeT,StorageT>>(pe_config,stream));
-      _pos_enc_present=true;
+      SetPosEncPresent(true);
     }
 
     // 3. Transformer blocks
-    typename CAIF_DeviceTransformerBlock<ComputeT,StorageT>::TransformerBlockConfig_t block_config;
-    block_config.dim=config.dim;
-    block_config.num_heads=config.num_heads;
-    block_config.num_kv_heads=num_kv_heads;
-    block_config.ffn_dim=config.ffn_dim;
-    block_config.dropout_rate=0.0f;
-    block_config.causal=config.causal;
-    block_config.use_rope=config.use_rope;
-    block_config.rope_base=g_caif_rope_default_base;
-    block_config.rope_style=config.rope_style;
+    CAIF_DeviceTransformerBlockConfig block_config(config.Dim(),
+                                                   config.NumHeads(),
+                                                   num_kv_heads,
+                                                   config.FfnDim(),
+                                                   0.0f,
+                                                   config.Causal(),
+                                                   config.UseRope(),
+                                                   g_caif_rope_default_base);
+    block_config.SetRopeStyle(config.RopeStyle());
 
-    for(uint32_t i=0;i<config.num_layers;++i)
+    for(uint32_t i=0;i<config.NumLayers();++i)
     {
       AddLayer(std::make_unique<CAIF_DeviceTransformerBlock<ComputeT,StorageT>>(block_config,stream));
     }
 
     // 4. Final RMSNorm
-    AddLayer(std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.dim,stream));
+    AddLayer(std::make_unique<CAIF_DeviceRMSNorm<ComputeT,StorageT>>(config.Dim(),stream));
 
     // 5. Output head
-    typename CAIF_DeviceLinearHead<ComputeT,StorageT>::Config_t head_config{config.dim,
-                                                                             output_dim,
-                                                                             false};
-    if(config.tie_weights==true)
+    CAIF_DeviceLinearHeadConfig head_config(config.Dim(),output_dim,false);
+    head_config.SetOutputScale(config.LogitScale());
+    if(config.TieWeights()==true)
     {
       AddLayer(std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(
                                                        head_config,
@@ -131,8 +129,8 @@ CAIF_DeviceTransformerModel<ComputeT,StorageT>::CAIF_DeviceTransformerModel(
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTransformerModel<ComputeT,StorageT>::CAIF_DeviceTransformerModel(
                               CAIF_DeviceTransformerModel &&other):CAIF_DeviceContainer(std::move(other)),
-                                                                   _config(other._config),
-                                                                   _pos_enc_present(other._pos_enc_present)
+                                                                   _config(other.Config()),
+                                                                   _pos_enc_present(other.PosEncPresent())
 {
 }
 
@@ -143,8 +141,8 @@ CAIF_DeviceTransformerModel<ComputeT,StorageT>::operator=(CAIF_DeviceTransformer
   if(this!=&other)
   {
     CAIF_DeviceContainer::operator=(std::move(other));
-    _config=other._config;
-    _pos_enc_present=other._pos_enc_present;
+    SetConfig(other.Config());
+    SetPosEncPresent(other.PosEncPresent());
   }
   return *this;
 }
@@ -154,11 +152,20 @@ std::string CAIF_DeviceTransformerModel<ComputeT,StorageT>::Description()const
 {
   try
   {
-    return std::string(g_caif_description_transformer_model_prefix)+
-           "(dim="+std::to_string(_config.dim)+
-           ",heads="+std::to_string(_config.num_heads)+
-           ",layers="+std::to_string(_config.num_layers)+
-           ",vocab="+std::to_string(_config.vocab_size)+")";
+    return std::string(g_serial_tag_transformer_model)+
+           g_serial_open_paren+
+           g_serial_kv_dim+
+           std::to_string(Config().Dim())+
+           g_serial_comma+
+           g_serial_kv_heads+
+           std::to_string(Config().NumHeads())+
+           g_serial_comma+
+           g_serial_kv_layers+
+           std::to_string(Config().NumLayers())+
+           g_serial_comma+
+           g_serial_kv_vocab+
+           std::to_string(Config().VocabSize())+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -169,46 +176,44 @@ CAIF_DeviceTransformerModel<ComputeT,StorageT>::ParameterNames(const std::string
 {
   try
   {
-    // Slot layout mirrors the order AddLayer was called in the ctor:
-    //   [0]            embedding       -> "embed_tokens."
-    //   [1]            pos_enc (opt)   -> "embed_positions."
-    //   [1|2 .. n]     N blocks        -> "layers.N."
-    //   [.]            final norm      -> "norm."
-    //   [.]            head            -> "lm_head."
+    // Slot layout mirrors the order AddLayer was called in the ctor.
+    // Both structural prefixes and sub-layer leaf names flow through
+    // the registry — caller overrides any of them via SetName.
+    const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
     std::vector<std::string> names;
     std::vector<std::string> slot_names;
 
     size_t slot=0;
 
     // Embedding
-    slot_names=Layer(slot).ParameterNames(prefix+g_caif_name_embed_tokens);
+    slot_names=Layer(slot).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathEmbedIn_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
     ++slot;
 
     // Positional encoding (optional)
-    if(_pos_enc_present==true)
+    if(PosEncPresent()==true)
     {
-      slot_names=Layer(slot).ParameterNames(prefix+g_caif_name_embed_positions);
+      slot_names=Layer(slot).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathEmbedPos_e));
       names.insert(names.end(),slot_names.begin(),slot_names.end());
       ++slot;
     }
 
     // Transformer blocks
-    for(uint32_t i=0;i<_config.num_layers;++i)
+    for(uint32_t i=0;i<Config().NumLayers();++i)
     {
-      std::string block_prefix=prefix+g_caif_name_layers_prefix+std::to_string(i)+".";
+      std::string block_prefix=prefix+reg.Name(CAIF_ParamRole::Role_e::PathTransformerBlocks_e)+std::to_string(i)+".";
       slot_names=Layer(slot).ParameterNames(block_prefix);
       names.insert(names.end(),slot_names.begin(),slot_names.end());
       ++slot;
     }
 
     // Final norm
-    slot_names=Layer(slot).ParameterNames(prefix+g_caif_name_norm);
+    slot_names=Layer(slot).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathFinalNorm_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
     ++slot;
 
     // Head
-    slot_names=Layer(slot).ParameterNames(prefix+g_caif_name_lm_head);
+    slot_names=Layer(slot).ParameterNames(prefix+reg.Name(CAIF_ParamRole::Role_e::PathHead_e));
     names.insert(names.end(),slot_names.begin(),slot_names.end());
 
     return names;

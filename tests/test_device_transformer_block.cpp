@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Tests for CAIF_DeviceTransformerBlock<float,float>.
+//------------------------------------------------------------------------------
 #include "caif_device_transformer_block.h"
 #include "caif_test_harness.h"
 #include "caif_device_swiglu_activation.h"
@@ -26,60 +30,81 @@
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_constants.h"
-#include <iostream>
+#include "caif_grad_mode.h"
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cmath>
 #include <string>
 
-using namespace instance;
-
-struct GradMode_t
+namespace instance
 {
-  bool precise;
-  float tol;
-  float fd_h;
-  const char *label;
-};
-
-// Gradient tolerance is applied relative to |analytical| for values > 1,
-// absolute otherwise: diff_tol = grad_tol * max(1, |analytical|).
-// fd_h: TF32's reduced mantissa precision causes catastrophic cancellation
-// in (sum_plus - sum_minus) when h is small relative to accumulated TF32
-// noise across the full block (RMSNorm+MHA+residual+RMSNorm+FFN). Use a
-// larger step for TF32 to keep signal above the noise floor.
-static const GradMode_t kGradModePrecise={true, 8e-2f, 1e-3f,"Precise"};
-static const GradMode_t kGradModeTF32=   {false,1.5e-1f,1e-2f,"TF32"};
-
-static void ReportResult(const char *test_name,bool passed)
-{
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
 #ifdef USE_CAIF_CUDA
+
+constexpr uint32_t g_caif_tb_test_batch_shape=2;
+constexpr uint32_t g_caif_tb_test_seq_shape=4;
+constexpr uint32_t g_caif_tb_test_dim_shape=8;
+constexpr uint32_t g_caif_tb_test_heads_shape=2;
+constexpr uint32_t g_caif_tb_test_ffn_shape=16;
+constexpr uint32_t g_caif_tb_test_batch_residual=1;
+constexpr uint32_t g_caif_tb_test_seq_residual=2;
+constexpr uint32_t g_caif_tb_test_dim_residual=8;
+constexpr uint32_t g_caif_tb_test_heads_residual=2;
+constexpr uint32_t g_caif_tb_test_ffn_residual=16;
+constexpr uint32_t g_caif_tb_test_batch_causal=1;
+constexpr uint32_t g_caif_tb_test_seq_causal=4;
+constexpr uint32_t g_caif_tb_test_batch_bwd=1;
+constexpr uint32_t g_caif_tb_test_seq_bwd=2;
+constexpr uint32_t g_caif_tb_test_dim_bwd=4;
+constexpr uint32_t g_caif_tb_test_heads_bwd=2;
+constexpr uint32_t g_caif_tb_test_ffn_bwd=8;
+constexpr uint32_t g_caif_tb_test_dim_param=8;
+constexpr uint32_t g_caif_tb_test_heads_param=2;
+constexpr uint32_t g_caif_tb_test_ffn_param=16;
+constexpr uint32_t g_caif_tb_test_batch_zero=1;
+constexpr uint32_t g_caif_tb_test_seq_zero=2;
+constexpr float g_caif_tb_test_residual_eps=1e-6f;
+
+//------------------------------------------------------------------------------
+// TransformerBlock forward and backward correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_TransformerBlockTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    typedef CAIF_DeviceTransformerBlockConfig BlockConfig_t;
+
+    static void TestForwardShape();
+    static void TestForwardResidual();
+    static void TestForwardCausal();
+    static void TestBackwardGrad(const GradMode_t &mode);
+    static void TestParameterTensorCount();
+    static void TestTotalParameterCount();
+    static void TestZeroGradients();
+    static void TestDescription();
+    static void TestFFNDimAutoCompute();
+    static void TestDefaultActivation();
+};
 
 //------------------------------------------------------------------------------
 // Test 1: Forward shape preserved
 //------------------------------------------------------------------------------
-static void TestForwardShape()
+void CAIF_TransformerBlockTests::TestForwardShape()
 {
   try
   {
-    const uint32_t batch=2;
-    const uint32_t seq_len=4;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t batch=g_caif_tb_test_batch_shape;
+    const uint32_t seq_len=g_caif_tb_test_seq_shape;
+    const uint32_t dim=g_caif_tb_test_dim_shape;
+    const uint32_t num_heads=g_caif_tb_test_heads_shape;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_shape;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
@@ -87,8 +112,9 @@ static void TestForwardShape()
     ctx.SetStream(stream);
 
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -99,20 +125,20 @@ static void TestForwardShape()
     const auto &shape=host_output.Shape();
     if(shape.size()!=3||shape[0]!=batch||shape[1]!=seq_len||shape[2]!=dim)
     {
-      std::cout<<"  Shape mismatch: expected [2,4,8], got [";
+      ISE_Out::Out()<<"  Shape mismatch: expected [2,4,8], got [";
       for(size_t i=0;i<shape.size();++i)
       {
         if(i>0)
         {
-          std::cout<<",";
+          ISE_Out::Out()<<",";
         }
-        std::cout<<shape[i];
+        ISE_Out::Out()<<shape[i];
       }
-      std::cout<<"]\n";
+      ISE_Out::Out()<<"]\n";
       passed=false;
     }
 
-    ReportResult("TransformerBlock::ForwardShape",passed);
+    CAIF_TestHarness::Report("TransformerBlock::ForwardShape",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardShape")
 }
@@ -120,26 +146,18 @@ static void TestForwardShape()
 //------------------------------------------------------------------------------
 // Test 2: Forward residual - output differs from zero
 //------------------------------------------------------------------------------
-static void TestForwardResidual()
+void CAIF_TransformerBlockTests::TestForwardResidual()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t batch=g_caif_tb_test_batch_residual;
+    const uint32_t seq_len=g_caif_tb_test_seq_residual;
+    const uint32_t dim=g_caif_tb_test_dim_residual;
+    const uint32_t num_heads=g_caif_tb_test_heads_residual;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_residual;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
@@ -151,8 +169,9 @@ static void TestForwardResidual()
     {
       host_input[i]=static_cast<float>(i)*0.05f-0.1f;
     }
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -170,7 +189,7 @@ static void TestForwardResidual()
       {
         has_nonzero=true;
       }
-      if(std::fabs(host_output.Data()[i]-host_input[i])>1e-6f)
+      if(std::fabs(host_output.Data()[i]-host_input[i])>g_caif_tb_test_residual_eps)
       {
         differs_from_input=true;
       }
@@ -179,14 +198,14 @@ static void TestForwardResidual()
     bool passed=has_nonzero&&differs_from_input;
     if(has_nonzero==false)
     {
-      std::cout<<"  Output is all zeros\n";
+      ISE_Out::Out()<<"  Output is all zeros\n";
     }
     if(differs_from_input==false)
     {
-      std::cout<<"  Output is identical to input (sub-layers had no effect)\n";
+      ISE_Out::Out()<<"  Output is identical to input (sub-layers had no effect)\n";
     }
 
-    ReportResult("TransformerBlock::ForwardResidual",passed);
+    CAIF_TestHarness::Report("TransformerBlock::ForwardResidual",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardResidual")
 }
@@ -194,15 +213,15 @@ static void TestForwardResidual()
 //------------------------------------------------------------------------------
 // Test 3: Causal vs non-causal produces different output
 //------------------------------------------------------------------------------
-static void TestForwardCausal()
+void CAIF_TransformerBlockTests::TestForwardCausal()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=4;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t batch=g_caif_tb_test_batch_causal;
+    const uint32_t seq_len=g_caif_tb_test_seq_causal;
+    const uint32_t dim=g_caif_tb_test_dim_shape;
+    const uint32_t num_heads=g_caif_tb_test_heads_shape;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_shape;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
@@ -216,28 +235,12 @@ static void TestForwardCausal()
     }
 
     // Non-causal block
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config_nc;
-    config_nc.dim=dim;
-    config_nc.num_heads=num_heads;
-    config_nc.num_kv_heads=num_heads;
-    config_nc.ffn_dim=ffn_dim;
-    config_nc.dropout_rate=0.0f;
-    config_nc.causal=false;
-    config_nc.use_rope=false;
-    config_nc.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config_nc(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block_nc(config_nc,stream);
 
     // Causal block with same weights
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config_c;
-    config_c.dim=dim;
-    config_c.num_heads=num_heads;
-    config_c.num_kv_heads=num_heads;
-    config_c.ffn_dim=ffn_dim;
-    config_c.dropout_rate=0.0f;
-    config_c.causal=true;
-    config_c.use_rope=false;
-    config_c.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config_c(dim,num_heads,num_heads,ffn_dim,0.0f,true,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block_c(config_c,stream);
 
@@ -245,14 +248,15 @@ static void TestForwardCausal()
     for(size_t p=0;p<block_nc.ParameterTensorCount();++p)
     {
       CAIF_HostTensor h_param=block_nc.ParameterTensor(p).ToHost();
-      block_c.ParameterTensor(p).CopyFromHost(h_param.Data(),
-                                               h_param.TotalElements());
+      block_c.ParameterTensor(p).CopyFromHost(h_param.Data(),h_param.TotalElements());
     }
 
-    CAIF_DeviceTensor input_nc=CAIF_DeviceTensor::FromHostData(
-                                host_input.data(),{batch,seq_len,dim},stream);
-    CAIF_DeviceTensor input_c=CAIF_DeviceTensor::FromHostData(
-                               host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input_nc=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
+    CAIF_DeviceTensor input_c=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
 
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
@@ -265,7 +269,7 @@ static void TestForwardCausal()
     bool differs=false;
     for(size_t i=0;i<host_input.size();++i)
     {
-      if(std::fabs(host_nc.Data()[i]-host_c.Data()[i])>1e-6f)
+      if(std::fabs(host_nc.Data()[i]-host_c.Data()[i])>g_caif_tb_test_residual_eps)
       {
         differs=true;
         break;
@@ -275,10 +279,10 @@ static void TestForwardCausal()
     bool passed=differs;
     if(passed==false)
     {
-      std::cout<<"  Causal and non-causal outputs are identical\n";
+      ISE_Out::Out()<<"  Causal and non-causal outputs are identical\n";
     }
 
-    ReportResult("TransformerBlock::ForwardCausal",passed);
+    CAIF_TestHarness::Report("TransformerBlock::ForwardCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::ForwardCausal")
 }
@@ -286,34 +290,26 @@ static void TestForwardCausal()
 //------------------------------------------------------------------------------
 // Test 4: Backward input gradient (finite difference)
 //------------------------------------------------------------------------------
-static void TestBackwardGrad(const GradMode_t &mode)
+void CAIF_TransformerBlockTests::TestBackwardGrad(const GradMode_t &mode)
 {
-  const std::string test_name=std::string("TransformerBlock::BackwardGrad::")+mode.label;
-  const bool _prev_precise=CAIF_Settings::PreciseGradients();
+  const std::string test_name=std::string("TransformerBlock::BackwardGrad::")+mode.Label();
+  const bool prev_precise=CAIF_Settings::PreciseGradients();
   try
   {
-    CAIF_Settings::SetPreciseGradients(mode.precise);
+    CAIF_Settings::SetPreciseGradients(mode.Precise());
 
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=4;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=8;
-    const float h=mode.fd_h;
-    const float grad_tol=mode.tol;
+    const uint32_t batch=g_caif_tb_test_batch_bwd;
+    const uint32_t seq_len=g_caif_tb_test_seq_bwd;
+    const uint32_t dim=g_caif_tb_test_dim_bwd;
+    const uint32_t num_heads=g_caif_tb_test_heads_bwd;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_bwd;
+    const float h=mode.FdH();
+    const float grad_tol=mode.Tol();
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     // Create base input
     std::vector<float> host_input(batch*seq_len*dim);
@@ -333,15 +329,17 @@ static void TestBackwardGrad(const GradMode_t &mode)
       saved_params.push_back(block.ParameterTensor(p).ToHost());
     }
 
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     CAIF_DeviceTensor grad_input=block.Backward(grad_out,ctx);
     CAIF_HostTensor host_grad=grad_input.ToHost();
@@ -360,10 +358,11 @@ static void TestBackwardGrad(const GradMode_t &mode)
       for(size_t p=0;p<num_params;++p)
       {
         block_p.ParameterTensor(p).CopyFromHost(saved_params[p].Data(),
-                                                 saved_params[p].TotalElements());
+                                                saved_params[p].TotalElements());
       }
-      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(
-                               input_plus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_p=CAIF_DeviceTensor::FromHostData(input_plus.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       ctx.SetTraining(false);
       CAIF_DeviceTensor out_p=block_p.Forward(inp_p,ctx);
       CAIF_HostTensor hout_p=out_p.ToHost();
@@ -378,10 +377,11 @@ static void TestBackwardGrad(const GradMode_t &mode)
       for(size_t p=0;p<num_params;++p)
       {
         block_m.ParameterTensor(p).CopyFromHost(saved_params[p].Data(),
-                                                 saved_params[p].TotalElements());
+                                                saved_params[p].TotalElements());
       }
-      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(
-                               input_minus.data(),{batch,seq_len,dim},stream);
+      CAIF_DeviceTensor inp_m=CAIF_DeviceTensor::FromHostData(input_minus.data(),
+                                                              {batch,seq_len,dim},
+                                                              stream);
       CAIF_DeviceTensor out_m=block_m.Forward(inp_m,ctx);
       CAIF_HostTensor hout_m=out_m.ToHost();
       float sum_minus=0.0f;
@@ -395,40 +395,38 @@ static void TestBackwardGrad(const GradMode_t &mode)
 
       if(std::fabs(numerical-analytical)>grad_tol*std::max(1.0f,std::fabs(analytical)))
       {
-        std::cout<<"  dx mismatch at "<<i<<": analytical="<<analytical
-                 <<" numerical="<<numerical
-                 <<" diff="<<std::fabs(numerical-analytical)<<"\n";
+        ISE_Out::Out()<<"  dx mismatch at "
+                      <<i
+                      <<": analytical="
+                      <<analytical
+                      <<" numerical="
+                      <<numerical
+                      <<" diff="
+                      <<std::fabs(numerical-analytical)
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult(test_name.c_str(),passed);
+    CAIF_TestHarness::Report(test_name.c_str(),passed);
   }
   CAIF_TEST_CATCH_BLOCK("test_name.c_str()")
-  CAIF_Settings::SetPreciseGradients(_prev_precise);
+  CAIF_Settings::SetPreciseGradients(prev_precise);
 }
 
 //------------------------------------------------------------------------------
 // Test 5: Parameter tensor count
 //------------------------------------------------------------------------------
-static void TestParameterTensorCount()
+void CAIF_TransformerBlockTests::TestParameterTensorCount()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     bool passed=true;
 
@@ -437,8 +435,9 @@ static void TestParameterTensorCount()
       CAIF_DeviceTransformerBlock<float,float> block(config,stream);
       if(block.ParameterTensorCount()!=9)
       {
-        std::cout<<"  SwiGLU ParameterTensorCount expected 9, got "
-                 <<block.ParameterTensorCount()<<"\n";
+        ISE_Out::Out()<<"  SwiGLU ParameterTensorCount expected 9, got "
+                      <<block.ParameterTensorCount()
+                      <<"\n";
         passed=false;
       }
     }
@@ -449,13 +448,14 @@ static void TestParameterTensorCount()
       CAIF_DeviceTransformerBlock<float,float> block(config,std::move(activation),stream);
       if(block.ParameterTensorCount()!=8)
       {
-        std::cout<<"  GELU ParameterTensorCount expected 8, got "
-                 <<block.ParameterTensorCount()<<"\n";
+        ISE_Out::Out()<<"  GELU ParameterTensorCount expected 8, got "
+                      <<block.ParameterTensorCount()
+                      <<"\n";
         passed=false;
       }
     }
 
-    ReportResult("TransformerBlock::ParameterTensorCount",passed);
+    CAIF_TestHarness::Report("TransformerBlock::ParameterTensorCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::ParameterTensorCount")
 }
@@ -463,25 +463,17 @@ static void TestParameterTensorCount()
 //------------------------------------------------------------------------------
 // Test 6: Total parameter count
 //------------------------------------------------------------------------------
-static void TestTotalParameterCount()
+void CAIF_TransformerBlockTests::TestTotalParameterCount()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t head_dim=dim/num_heads;  // 4
-    const uint32_t ffn_dim=16;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
+    const uint32_t head_dim=dim/num_heads;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
@@ -508,12 +500,15 @@ static void TestTotalParameterCount()
     bool passed=true;
     if(block.TotalParameterCount()!=expected)
     {
-      std::cout<<"  Expected "<<expected<<", got "
-               <<block.TotalParameterCount()<<"\n";
+      ISE_Out::Out()<<"  Expected "
+                    <<expected
+                    <<", got "
+                    <<block.TotalParameterCount()
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("TransformerBlock::TotalParameterCount",passed);
+    CAIF_TestHarness::Report("TransformerBlock::TotalParameterCount",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::TotalParameterCount")
 }
@@ -521,26 +516,18 @@ static void TestTotalParameterCount()
 //------------------------------------------------------------------------------
 // Test 7: ZeroGradients
 //------------------------------------------------------------------------------
-static void TestZeroGradients()
+void CAIF_TransformerBlockTests::TestZeroGradients()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=2;
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t batch=g_caif_tb_test_batch_zero;
+    const uint32_t seq_len=g_caif_tb_test_seq_zero;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
@@ -549,15 +536,17 @@ static void TestZeroGradients()
 
     // Run forward + backward to produce non-zero gradients
     std::vector<float> host_input(batch*seq_len*dim,0.1f);
-    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(
-                             host_input.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
+                                                            {batch,seq_len,dim},
+                                                            stream);
     ctx.SetTraining(true);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     block.Forward(input,ctx);
 
     std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
-    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(
-                                grad_ones.data(),{batch,seq_len,dim},stream);
+    CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
+                                                               {batch,seq_len,dim},
+                                                               stream);
     ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
     block.Backward(grad_out,ctx);
 
@@ -572,8 +561,13 @@ static void TestZeroGradients()
       {
         if(host_grad.Data()[i]!=0.0f)
         {
-          std::cout<<"  Gradient["<<p<<"] not zeroed at "<<i<<": "
-                   <<host_grad.Data()[i]<<"\n";
+          ISE_Out::Out()<<"  Gradient["
+                        <<p
+                        <<"] not zeroed at "
+                        <<i
+                        <<": "
+                        <<host_grad.Data()[i]
+                        <<"\n";
           passed=false;
           break;
         }
@@ -584,7 +578,7 @@ static void TestZeroGradients()
       }
     }
 
-    ReportResult("TransformerBlock::ZeroGradients",passed);
+    CAIF_TestHarness::Report("TransformerBlock::ZeroGradients",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::ZeroGradients")
 }
@@ -592,24 +586,16 @@ static void TestZeroGradients()
 //------------------------------------------------------------------------------
 // Test 8: Description string
 //------------------------------------------------------------------------------
-static void TestDescription()
+void CAIF_TransformerBlockTests::TestDescription()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=true;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,true,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
     const std::string desc=block.Description();
@@ -619,32 +605,32 @@ static void TestDescription()
     // Check that key components are present
     if(desc.find("TransformerBlock")==std::string::npos)
     {
-      std::cout<<"  Missing 'TransformerBlock' in description\n";
+      ISE_Out::Out()<<"  Missing 'TransformerBlock' in description\n";
       passed=false;
     }
     if(desc.find("dim=8")==std::string::npos)
     {
-      std::cout<<"  Missing 'dim=8' in description\n";
+      ISE_Out::Out()<<"  Missing 'dim=8' in description\n";
       passed=false;
     }
     if(desc.find("heads=2")==std::string::npos)
     {
-      std::cout<<"  Missing 'heads=2' in description\n";
+      ISE_Out::Out()<<"  Missing 'heads=2' in description\n";
       passed=false;
     }
     if(desc.find("kv_heads=2")==std::string::npos)
     {
-      std::cout<<"  Missing 'kv_heads=2' in description\n";
+      ISE_Out::Out()<<"  Missing 'kv_heads=2' in description\n";
       passed=false;
     }
     if(desc.find("ffn_dim=16")==std::string::npos)
     {
-      std::cout<<"  Missing 'ffn_dim=16' in description\n";
+      ISE_Out::Out()<<"  Missing 'ffn_dim=16' in description\n";
       passed=false;
     }
     if(desc.find("causal=true")==std::string::npos)
     {
-      std::cout<<"  Missing 'causal=true' in description\n";
+      ISE_Out::Out()<<"  Missing 'causal=true' in description\n";
       passed=false;
     }
 
@@ -652,11 +638,15 @@ static void TestDescription()
       "TransformerBlock(dim=8,heads=2,kv_heads=2,ffn_dim=16,causal=true)";
     if(desc!=expected)
     {
-      std::cout<<"  Expected '"<<expected<<"', got '"<<desc<<"'\n";
+      ISE_Out::Out()<<"  Expected '"
+                    <<expected
+                    <<"', got '"
+                    <<desc
+                    <<"'\n";
       passed=false;
     }
 
-    ReportResult("TransformerBlock::Description",passed);
+    CAIF_TestHarness::Report("TransformerBlock::Description",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::Description")
 }
@@ -664,23 +654,15 @@ static void TestDescription()
 //------------------------------------------------------------------------------
 // Test 9: FFN dim auto-compute when ffn_dim=0
 //------------------------------------------------------------------------------
-static void TestFFNDimAutoCompute()
+void CAIF_TransformerBlockTests::TestFFNDimAutoCompute()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=0;  // auto-compute
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,0,0.0f,false,false,g_caif_rope_default_base);
 
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
 
@@ -695,12 +677,15 @@ static void TestFFNDimAutoCompute()
     bool passed=true;
     if(block.EffectiveFFNDim()!=expected)
     {
-      std::cout<<"  Expected ffn_dim="<<expected<<", got "
-               <<block.EffectiveFFNDim()<<"\n";
+      ISE_Out::Out()<<"  Expected ffn_dim="
+                    <<expected
+                    <<", got "
+                    <<block.EffectiveFFNDim()
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("TransformerBlock::FFNDimAutoCompute",passed);
+    CAIF_TestHarness::Report("TransformerBlock::FFNDimAutoCompute",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::FFNDimAutoCompute")
 }
@@ -708,24 +693,16 @@ static void TestFFNDimAutoCompute()
 //------------------------------------------------------------------------------
 // Test 10: Default activation (convenience constructor) produces SwiGLU
 //------------------------------------------------------------------------------
-static void TestDefaultActivation()
+void CAIF_TransformerBlockTests::TestDefaultActivation()
 {
   try
   {
-    const uint32_t dim=8;
-    const uint32_t num_heads=2;
-    const uint32_t ffn_dim=16;
+    const uint32_t dim=g_caif_tb_test_dim_param;
+    const uint32_t num_heads=g_caif_tb_test_heads_param;
+    const uint32_t ffn_dim=g_caif_tb_test_ffn_param;
 
     CAIF_CudaStream stream;
-    CAIF_DeviceTransformerBlock<float,float>::TransformerBlockConfig_t config;
-    config.dim=dim;
-    config.num_heads=num_heads;
-    config.num_kv_heads=num_heads;
-    config.ffn_dim=ffn_dim;
-    config.dropout_rate=0.0f;
-    config.causal=false;
-    config.use_rope=false;
-    config.rope_base=g_caif_rope_default_base;
+    BlockConfig_t config(dim,num_heads,num_heads,ffn_dim,0.0f,false,false,g_caif_rope_default_base);
 
     // Use convenience constructor (no activation arg -> SwiGLU)
     CAIF_DeviceTransformerBlock<float,float> block(config,stream);
@@ -734,37 +711,44 @@ static void TestDefaultActivation()
     bool passed=true;
     if(block.ParameterTensorCount()!=9)
     {
-      std::cout<<"  Expected 9 param tensors (SwiGLU), got "
-               <<block.ParameterTensorCount()<<"\n";
+      ISE_Out::Out()<<"  Expected 9 param tensors (SwiGLU), got "
+                    <<block.ParameterTensorCount()
+                    <<"\n";
       passed=false;
     }
 
-    ReportResult("TransformerBlock::DefaultActivation",passed);
+    CAIF_TestHarness::Report("TransformerBlock::DefaultActivation",passed);
   }
   CAIF_TEST_CATCH_BLOCK("TransformerBlock::DefaultActivation")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_TransformerBlockTests::RunAll()
 {
-  std::cout<<"=== CAIF_DeviceTransformerBlock<float,float> Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== CAIF_DeviceTransformerBlock<float,float> Tests ===\n\n";
   TestForwardShape();
   TestForwardResidual();
   TestForwardCausal();
-  TestBackwardGrad(kGradModePrecise);
-  TestBackwardGrad(kGradModeTF32);
+  TestBackwardGrad(g_caif_grad_mode_precise);
+  TestBackwardGrad(g_caif_grad_mode_tf32);
   TestParameterTensorCount();
   TestTotalParameterCount();
   TestZeroGradients();
   TestDescription();
   TestFFNDimAutoCompute();
   TestDefaultActivation();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif  // USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_TransformerBlockTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

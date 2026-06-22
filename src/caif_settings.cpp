@@ -19,6 +19,8 @@ namespace instance
 
 bool CAIF_Settings::g_train_log=false;
 bool CAIF_Settings::g_activation_aware_init=false;
+bool CAIF_Settings::g_flash_mla_prefill=true;
+bool CAIF_Settings::g_multi_tensor_optimizer=true;
 // Default regime: Accuracy_e (full FP32 both passes).
 // Conservative default that keeps gradient-test behaviour identical
 // to the pre-rearch baseline's network-level backward pass. Timing

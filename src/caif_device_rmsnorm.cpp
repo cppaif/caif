@@ -14,12 +14,15 @@
 
 // `_gamma`, `_gamma_grad`, `rms_cache`, `_rms_cache` are fp32 by RMSNorm
 // reference convention. Per-site `DevicePtr<float>()` reads name this
-// contract inline, per the type-dispatch full plan (Phase 2).
+// contract inline.
 
 #include "caif_device_rmsnorm.h"
 #include "caif_device_rmsnorm_factory.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_normalization.cuh"
+#include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
 #include <vector>
 
 namespace instance
@@ -46,11 +49,11 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::CAIF_DeviceRMSNorm(uint32_t dim,
 
     // gamma is always fp32: the kernel takes `const float *gamma` regardless
     // of T. Init to ones.
-    _gamma=CAIF_DeviceTensor::Uninitialized({dim},stream);
+    SetGamma(CAIF_DeviceTensor::Uninitialized({dim},stream));
     std::vector<float> ones(dim,1.0f);
-    _gamma.CopyFromHost(ones.data(),dim);
+    Gamma().CopyFromHost(ones.data(),dim);
 
-    _gamma_grad=CAIF_DeviceTensor::Zeros({dim},stream);
+    SetGammaGrad(CAIF_DeviceTensor::Zeros({dim},stream));
   }
   CAIF_CATCH_BLOCK()
 }
@@ -58,12 +61,12 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::CAIF_DeviceRMSNorm(uint32_t dim,
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceRMSNorm<ComputeT,StorageT>::CAIF_DeviceRMSNorm(CAIF_DeviceRMSNorm &&other):
                               CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
-                              _dim(other._dim),
-                              _epsilon(other._epsilon),
-                              _gamma(std::move(other._gamma)),
-                              _gamma_grad(std::move(other._gamma_grad)),
-                              _last_input(std::move(other._last_input)),
-                              _rms_cache(std::move(other._rms_cache))
+                              _dim(other.Dim()),
+                              _epsilon(other.Epsilon()),
+                              _gamma(std::move(other.Gamma())),
+                              _gamma_grad(std::move(other.GammaGrad())),
+                              _last_input(std::move(other.LastInput())),
+                              _rms_cache(std::move(other.RmsCache()))
 {
 }
 
@@ -76,12 +79,12 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::operator=(CAIF_DeviceRMSNorm &&other)
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _dim=other._dim;
-      _epsilon=other._epsilon;
-      _gamma=std::move(other._gamma);
-      _gamma_grad=std::move(other._gamma_grad);
-      _last_input=std::move(other._last_input);
-      _rms_cache=std::move(other._rms_cache);
+      SetDim(other.Dim());
+      SetEpsilon(other.Epsilon());
+      SetGamma(std::move(other.Gamma()));
+      SetGammaGrad(std::move(other.GammaGrad()));
+      SetLastInput(std::move(other.LastInput()));
+      SetRmsCache(std::move(other.RmsCache()));
     }
     return *this;
   }
@@ -102,7 +105,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
     {
       THROW_CAIFE("CAIF_DeviceRMSNorm::Forward: input tensor is empty");
     }
-    if(shape.back()!=_dim)
+    if(shape.back()!=Dim())
     {
       THROW_CAIFE("CAIF_DeviceRMSNorm::Forward: last dimension must match dim");
     }
@@ -114,22 +117,22 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &inpu
     }
 
     CAIF_DeviceTensor output=AllocateOutput(shape,ctx);
-    CAIF_DeviceTensor rms_cache=CAIF_DeviceTensor::Uninitialized(
-                                  {static_cast<uint32_t>(rows)},ctx.Stream());
+    CAIF_DeviceTensor rms_cache=CAIF_DeviceTensor::Uninitialized({static_cast<uint32_t>(rows)},
+                                                                 ctx.Stream());
 
     launch_rmsnorm_forward<StorageT>(StoragePtr(input),
-                                     _gamma.DevicePtr<float>(),       // fp32: scale param
+                                     Gamma().template DevicePtr<float>(),  // fp32: scale param
                                      StoragePtr(output),
-                                     rms_cache.DevicePtr<float>(),    // fp32: reduction cache
-                                     _epsilon,
+                                     rms_cache.template DevicePtr<float>(),// fp32: reduction cache
+                                     Epsilon(),
                                      rows,
-                                     static_cast<int>(_dim),
+                                     static_cast<int>(Dim()),
                                      ctx.Stream().Handle());
 
     if(ctx.Training()==true)
     {
-      _last_input=input.Clone();
-      _rms_cache=std::move(rms_cache);
+      SetLastInput(input.Clone());
+      SetRmsCache(std::move(rms_cache));
     }
 
     return output;
@@ -144,14 +147,14 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
 {
   try
   {
-    if(_last_input.IsEmpty()==true)
+    if(LastInput().IsEmpty()==true)
     {
       THROW_CAIFE("CAIF_DeviceRMSNorm::Backward: must call Forward with training=true first");
     }
     AssertInputDtype(grad_output);
 
     const std::vector<uint32_t> &shape=grad_output.Shape();
-    if(shape.back()!=_dim)
+    if(shape.back()!=Dim())
     {
       THROW_CAIFE("CAIF_DeviceRMSNorm::Backward: last dimension must match dim");
     }
@@ -166,17 +169,17 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &gra
 
     // Zero grad_gamma before atomicAdd accumulation. _gamma_grad is fp32
     // so Fill(0.0f) is safe; FillZero() is dtype-agnostic and equivalent.
-    _gamma_grad.FillZero();
+    GammaGrad().FillZero();
 
     launch_rmsnorm_backward<StorageT>(StoragePtr(grad_output),
-                                      StoragePtr(_last_input),
-                                      _gamma.DevicePtr<float>(),       // fp32: scale param
-                                      _rms_cache.DevicePtr<float>(),   // fp32: reduction cache
+                                      StoragePtr(LastInput()),
+                                      Gamma().template DevicePtr<float>(),    // fp32: scale param
+                                      RmsCache().template DevicePtr<float>(), // fp32: reduction cache
                                       StoragePtr(grad_input),
-                                      _gamma_grad.DevicePtr<float>(),  // fp32: scale-param grad
-                                      _epsilon,
+                                      GammaGrad().template DevicePtr<float>(),// fp32: param grad
+                                      Epsilon(),
                                       rows,
-                                      static_cast<int>(_dim),
+                                      static_cast<int>(Dim()),
                                       ctx.Stream().Handle());
 
     return grad_input;
@@ -189,7 +192,7 @@ void CAIF_DeviceRMSNorm<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _gamma_grad.FillZero();
+    GammaGrad().FillZero();
   }
   CAIF_CATCH_BLOCK()
 }
@@ -208,7 +211,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::ParameterTensor(size_t index)
   {
     if(index==0)
     {
-      return _gamma;
+      return Gamma();
     }
     THROW_CAIFE("CAIF_DeviceRMSNorm::ParameterTensor: index out of range");
   }
@@ -223,7 +226,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::ParameterTensor(size_t index)const
   {
     if(index==0)
     {
-      return _gamma;
+      return Gamma();
     }
     THROW_CAIFE("CAIF_DeviceRMSNorm::ParameterTensor: index out of range");
   }
@@ -238,7 +241,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::GradientTensor(size_t index)
   {
     if(index==0)
     {
-      return _gamma_grad;
+      return GammaGrad();
     }
     THROW_CAIFE("CAIF_DeviceRMSNorm::GradientTensor: index out of range");
   }
@@ -253,7 +256,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::GradientTensor(size_t index)const
   {
     if(index==0)
     {
-      return _gamma_grad;
+      return GammaGrad();
     }
     THROW_CAIFE("CAIF_DeviceRMSNorm::GradientTensor: index out of range");
   }
@@ -263,7 +266,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::GradientTensor(size_t index)const
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DeviceRMSNorm<ComputeT,StorageT>::TotalParameterCount()const
 {
-  return static_cast<size_t>(_dim);
+  return static_cast<size_t>(Dim());
 }
 
 template<typename ComputeT,typename StorageT>
@@ -271,7 +274,10 @@ std::string CAIF_DeviceRMSNorm<ComputeT,StorageT>::Description()const
 {
   try
   {
-    return "RMSNorm("+std::to_string(_dim)+")";
+    return g_serial_tag_rmsnorm+
+           g_serial_open_paren+
+           std::to_string(Dim())+
+           g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -283,7 +289,7 @@ CAIF_DeviceRMSNorm<ComputeT,StorageT>::ParameterNames(const std::string &prefix)
   try
   {
     std::vector<std::string> names;
-    names.push_back(prefix+"weight");
+    names.push_back(prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::RMSNormGamma_e));
     return names;
   }
   CAIF_CATCH_BLOCK()
@@ -295,11 +301,11 @@ void CAIF_DeviceRMSNorm<ComputeT,StorageT>::LoadGamma(CAIF_DeviceTensor &&gamma)
   try
   {
     const std::vector<uint32_t> &shape=gamma.Shape();
-    if(shape.size()!=1||shape[0]!=_dim)
+    if(shape.size()!=1||shape[0]!=Dim())
     {
       THROW_CAIFE("CAIF_DeviceRMSNorm::LoadGamma: shape mismatch, expected [dim]");
     }
-    _gamma=std::move(gamma);
+    SetGamma(std::move(gamma));
   }
   CAIF_CATCH_BLOCK()
 }

@@ -25,7 +25,7 @@ namespace instance
 {
 
 template<typename ComputeT,typename StorageT>
-CAIF_DevicePooling2D<ComputeT,StorageT>::CAIF_DevicePooling2D(const Config_t &config,
+CAIF_DevicePooling2D<ComputeT,StorageT>::CAIF_DevicePooling2D(const CAIF_DevicePooling2DConfig &config,
                                                               CAIF_CudaStream &stream):
                                           CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                           _config(config),
@@ -33,11 +33,11 @@ CAIF_DevicePooling2D<ComputeT,StorageT>::CAIF_DevicePooling2D(const Config_t &co
 {
   try
   {
-    if(config.pool_height==0 || config.pool_width==0)
+    if(config.PoolHeight()==0 || config.PoolWidth()==0)
     {
       THROW_CAIFE("CAIF_DevicePooling2D: pool dims must be > 0");
     }
-    if(config.stride_height==0 || config.stride_width==0)
+    if(config.StrideHeight()==0 || config.StrideWidth()==0)
     {
       THROW_CAIFE("CAIF_DevicePooling2D: stride dims must be > 0");
     }
@@ -62,8 +62,8 @@ CAIF_DevicePooling2D<ComputeT,StorageT>::operator=(CAIF_DevicePooling2D &&other)
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _config=other._config;
-      _cached_input_shape=std::move(other._cached_input_shape);
+      SetConfig(other.Config());
+      SetCachedInputShape(std::move(other.CachedInputShape()));
     }
     return *this;
   }

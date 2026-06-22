@@ -165,7 +165,7 @@
  * `CAIF_RunContext::ComputeTypeFor(CAIF_DataType::CAIF_DataType_e dt)` is
  * the one and only call site that translates this flag into a cuBLAS
  * compute type. Op implementations never read `CAIF_Settings` directly.
- * This keeps the policy in one place and makes it mechanically auditable.
+ * This keeps the policy in one place and makes it mechanically reviewable.
  * ============================================================================
  */
 
@@ -196,6 +196,23 @@ namespace instance
        */
       static void SetActivationAwareInit(const bool enabled){g_activation_aware_init=enabled;}
       static bool ActivationAwareInit(){return g_activation_aware_init;}
+
+      /**
+       * @brief Enable/disable the fused MLA flash-prefill kernel.
+       * Default on. Disable to force the explicit O(seq^2) attention path
+       * (debug / A-B parity / fallback).
+       */
+      static void SetFlashMlaPrefill(const bool enabled){g_flash_mla_prefill=enabled;}
+      static bool FlashMlaPrefill(){return g_flash_mla_prefill;}
+
+      /**
+       * @brief Enable/disable the multi-tensor ("foreach") optimizer step.
+       * Default on. When on, one kernel launch updates every fp32 parameter
+       * instead of one launch per parameter; disable for A/B parity testing
+       * and fallback to the per-parameter path.
+       */
+      static void SetMultiTensorOptimizer(const bool enabled){g_multi_tensor_optimizer=enabled;}
+      static bool MultiTensorOptimizer(){return g_multi_tensor_optimizer;}
 
       /**
        * @brief Select the FP32 matmul precision regime.
@@ -249,7 +266,7 @@ namespace instance
        * Returns `true` iff the current mode is `Accuracy_e`. Provided so
        * legacy test-harness and gradcheck code that still gates FD
        * perturbation windows on a boolean can continue to work during
-       * the rearchitecture transition.
+       * the device-runtime rework.
        *
        * DO NOT introduce new call sites. New code reads `MatmulMode()`
        * directly and switches on the enum — the name `PreciseGradients`
@@ -267,7 +284,7 @@ namespace instance
        * `true`  -> `Accuracy_e`   (full FP32 both passes)
        * `false` -> `Performance_e` (TF32 both passes)
        *
-       * Exists purely to let pre-rearchitecture call sites
+       * Exists purely to let pre-rework call sites
        * (`SetPreciseGradients(true/false)` scattered across tests)
        * compile unchanged while the new enum-based API is rolled out.
        * Every new call site must use `SetMatmulMode(MatmulMode_e::...)`.
@@ -317,6 +334,8 @@ namespace instance
     private:
       static bool g_train_log;
       static bool g_activation_aware_init;
+      static bool g_flash_mla_prefill;
+      static bool g_multi_tensor_optimizer;
       static MatmulMode_e g_matmul_mode;
       static size_t g_cublaslt_workspace_bytes;
   };

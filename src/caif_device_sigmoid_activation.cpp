@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_sigmoid_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -30,7 +31,7 @@ void CAIF_DeviceSigmoidActivation<ComputeT,StorageT>::Forward(const CAIF_DeviceT
     {
       THROW_CAIFE("CAIF_DeviceSigmoidActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(input.TotalElements());
+    const int64_t n=static_cast<int64_t>(input.TotalElements());
     launch_sigmoid_forward<StorageT>(input.template DevicePtr<StorageT>(),
                                       output.template DevicePtr<StorageT>(),
                                       n,
@@ -53,7 +54,7 @@ void CAIF_DeviceSigmoidActivation<ComputeT,StorageT>::Backward(
     {
       THROW_CAIFE("CAIF_DeviceSigmoidActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
     launch_sigmoid_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
                                        post_activation.template DevicePtr<StorageT>(),
                                        grad_input.template DevicePtr<StorageT>(),
@@ -66,7 +67,7 @@ void CAIF_DeviceSigmoidActivation<ComputeT,StorageT>::Backward(
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceSigmoidActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_sigmoid;
+  return g_serial_tag_sigmoid;
 }
 
 template<typename ComputeT,typename StorageT>

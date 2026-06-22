@@ -32,29 +32,29 @@ void CAIF_WeightMapper::AddPrefixRule(const std::string &hf_prefix,const std::st
   PrefixRule_t rule;
   rule.hf_prefix=hf_prefix;
   rule.aif_prefix=aif_prefix;
-  _prefix_rules.push_back(rule);
+  PrefixRules().push_back(rule);
 
   // Sort by longest hf_prefix first for longest-match semantics
-  std::sort(_prefix_rules.begin(),_prefix_rules.end(),ComparePrefixByLength);
+  std::sort(PrefixRules().begin(),PrefixRules().end(),ComparePrefixByLength);
 }
 
 void CAIF_WeightMapper::AddAlias(const std::string &hf_name,const std::string &aif_name)
 {
-  _hf_to_aif_aliases[hf_name]=aif_name;
-  _aif_to_hf_aliases[aif_name]=hf_name;
+  HfToAifAliases()[hf_name]=aif_name;
+  AifToHfAliases()[aif_name]=hf_name;
 }
 
 std::string CAIF_WeightMapper::HfToAif(const std::string &hf_name)const
 {
   // Check aliases first (exact match)
-  auto alias_it=_hf_to_aif_aliases.find(hf_name);
-  if(alias_it!=_hf_to_aif_aliases.end())
+  auto alias_it=HfToAifAliases().find(hf_name);
+  if(alias_it!=HfToAifAliases().end())
   {
     return alias_it->second;
   }
 
   // Try prefix rules (already sorted by longest prefix first)
-  for(const auto &rule:_prefix_rules)
+  for(const auto &rule:PrefixRules())
   {
     if(hf_name.size()>=rule.hf_prefix.size()&&
        hf_name.compare(0,rule.hf_prefix.size(),rule.hf_prefix)==0)
@@ -69,8 +69,8 @@ std::string CAIF_WeightMapper::HfToAif(const std::string &hf_name)const
 std::string CAIF_WeightMapper::AifToHf(const std::string &aif_name)const
 {
   // Check reverse aliases first (exact match)
-  auto alias_it=_aif_to_hf_aliases.find(aif_name);
-  if(alias_it!=_aif_to_hf_aliases.end())
+  auto alias_it=AifToHfAliases().find(aif_name);
+  if(alias_it!=AifToHfAliases().end())
   {
     return alias_it->second;
   }
@@ -79,7 +79,7 @@ std::string CAIF_WeightMapper::AifToHf(const std::string &aif_name)const
   // We need to try longest aif_prefix match, but rules are sorted by
   // hf_prefix length. Iterate all and pick longest aif_prefix match.
   const PrefixRule_t *best_rule=nullptr;
-  for(const auto &rule:_prefix_rules)
+  for(const auto &rule:PrefixRules())
   {
     if(aif_name.size()>=rule.aif_prefix.size()&&
        aif_name.compare(0,rule.aif_prefix.size(),rule.aif_prefix)==0)

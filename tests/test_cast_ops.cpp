@@ -33,23 +33,54 @@
 #include <random>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
-
-void ReportResult(const char *name,bool ok)
-{
-  CAIF_TestHarness::Report(name,ok);
-}
 
 #ifdef USE_CAIF_CUDA
 
-constexpr float g_fp16_round_tol=2e-3f;
-constexpr float g_bf16_round_tol=8e-3f;
-constexpr float g_identity_tol=0.0f;
+constexpr float g_caif_cast_test_fp16_round_tol=2e-3f;
+constexpr float g_caif_cast_test_bf16_round_tol=8e-3f;
+constexpr float g_caif_cast_test_identity_tol=0.0f;
+constexpr size_t g_caif_cast_test_n_small=256;
+constexpr size_t g_caif_cast_test_n_large=512;
+constexpr size_t g_caif_cast_test_n_mismatch_src=16;
+constexpr size_t g_caif_cast_test_n_mismatch_dst=8;
+constexpr uint32_t g_caif_cast_test_seed_identity=1;
+constexpr uint32_t g_caif_cast_test_seed_fp16=2;
+constexpr uint32_t g_caif_cast_test_seed_bf16=3;
+constexpr uint32_t g_caif_cast_test_seed_fp16_to_bf16=4;
+constexpr uint32_t g_caif_cast_test_seed_bf16_to_fp16=5;
+constexpr float g_caif_cast_test_int8_fill=0.5f;
 
-std::vector<float> MakeRandom(const size_t n,const uint32_t seed)
+//------------------------------------------------------------------------------
+// Cast pairwise dtype conversion tests.
+//------------------------------------------------------------------------------
+class CAIF_CastOpsTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static std::vector<float> MakeRandom(size_t n,uint32_t seed);
+    static bool MaxAbsClose(const std::vector<float> &ref,
+                             const std::vector<float> &got,
+                             float tol);
+    static std::vector<float> CastRoundTripViaOp(const std::vector<float> &src_host,
+                                                  CAIF_DataType::CAIF_DataType_e intermediate,
+                                                  CAIF_CudaStream &stream);
+
+    static void TestCastFP32Identity();
+    static void TestCastFP32ToFP16RoundTrip();
+    static void TestCastFP32ToBF16RoundTrip();
+    static void TestCastFP16ToBF16Chain();
+    static void TestCastBF16ToFP16Chain();
+    static void TestCastShapeMismatchThrows();
+    static void TestCastIntegerRejected();
+};
+
+std::vector<float> CAIF_CastOpsTests::MakeRandom(const size_t n,const uint32_t seed)
 {
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-1.0f,1.0f);
@@ -61,9 +92,9 @@ std::vector<float> MakeRandom(const size_t n,const uint32_t seed)
   return v;
 }
 
-bool MaxAbsClose(const std::vector<float> &ref,
-                 const std::vector<float> &got,
-                 const float tol)
+bool CAIF_CastOpsTests::MaxAbsClose(const std::vector<float> &ref,
+                                     const std::vector<float> &got,
+                                     const float tol)
 {
   if(ref.size()!=got.size())
   {
@@ -89,9 +120,10 @@ bool MaxAbsClose(const std::vector<float> &ref,
   return true;
 }
 
-std::vector<float> CastRoundTripViaOp(const std::vector<float> &src_host,
-                                      const CAIF_DataType::CAIF_DataType_e intermediate,
-                                      CAIF_CudaStream &stream)
+std::vector<float> CAIF_CastOpsTests::CastRoundTripViaOp(
+  const std::vector<float> &src_host,
+  const CAIF_DataType::CAIF_DataType_e intermediate,
+  CAIF_CudaStream &stream)
 {
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
@@ -99,8 +131,8 @@ std::vector<float> CastRoundTripViaOp(const std::vector<float> &src_host,
   CAIF_DeviceTensor src=CAIF_DeviceTensor::FromHostData(src_host.data(),shape,stream);
   CAIF_DeviceTensor mid=CAIF_DeviceTensor::Uninitialized(shape,stream,intermediate);
   CAIF_DeviceTensor back=CAIF_DeviceTensor::Uninitialized(shape,
-                                                          stream,
-                                                          CAIF_DataType::CAIF_DataType_e::Float32);
+                                                           stream,
+                                                           CAIF_DataType::CAIF_DataType_e::Float32);
   CAIF_Ops::Cast(src,mid,ctx);
   CAIF_Ops::Cast(mid,back,ctx);
   std::vector<float> out(src_host.size());
@@ -108,118 +140,128 @@ std::vector<float> CastRoundTripViaOp(const std::vector<float> &src_host,
   return out;
 }
 
-void TestCastFP32Identity()
+void CAIF_CastOpsTests::TestCastFP32Identity()
 {
   try
   {
     CAIF_CudaStream stream;
-    std::vector<float> src=MakeRandom(256,1);
+    std::vector<float> src=MakeRandom(g_caif_cast_test_n_small,g_caif_cast_test_seed_identity);
     std::vector<float> got=CastRoundTripViaOp(src,
-                                              CAIF_DataType::CAIF_DataType_e::Float32,
-                                              stream);
-    ReportResult("Cast::FP32Identity",MaxAbsClose(src,got,g_identity_tol));
+                                               CAIF_DataType::CAIF_DataType_e::Float32,
+                                               stream);
+    CAIF_TestHarness::Report("Cast::FP32Identity",MaxAbsClose(src,got,g_caif_cast_test_identity_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Cast::FP32Identity")
 }
 
-void TestCastFP32ToFP16RoundTrip()
+void CAIF_CastOpsTests::TestCastFP32ToFP16RoundTrip()
 {
   try
   {
     CAIF_CudaStream stream;
-    std::vector<float> src=MakeRandom(512,2);
+    std::vector<float> src=MakeRandom(g_caif_cast_test_n_large,g_caif_cast_test_seed_fp16);
     std::vector<float> got=CastRoundTripViaOp(src,
-                                              CAIF_DataType::CAIF_DataType_e::Float16,
-                                              stream);
-    ReportResult("Cast::FP32ToFP16RoundTrip",MaxAbsClose(src,got,g_fp16_round_tol));
+                                               CAIF_DataType::CAIF_DataType_e::Float16,
+                                               stream);
+    CAIF_TestHarness::Report("Cast::FP32ToFP16RoundTrip",
+                              MaxAbsClose(src,got,g_caif_cast_test_fp16_round_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Cast::FP32ToFP16RoundTrip")
 }
 
-void TestCastFP32ToBF16RoundTrip()
+void CAIF_CastOpsTests::TestCastFP32ToBF16RoundTrip()
 {
   try
   {
     CAIF_CudaStream stream;
-    std::vector<float> src=MakeRandom(512,3);
+    std::vector<float> src=MakeRandom(g_caif_cast_test_n_large,g_caif_cast_test_seed_bf16);
     std::vector<float> got=CastRoundTripViaOp(src,
-                                              CAIF_DataType::CAIF_DataType_e::BFloat16,
-                                              stream);
-    ReportResult("Cast::FP32ToBF16RoundTrip",MaxAbsClose(src,got,g_bf16_round_tol));
+                                               CAIF_DataType::CAIF_DataType_e::BFloat16,
+                                               stream);
+    CAIF_TestHarness::Report("Cast::FP32ToBF16RoundTrip",
+                              MaxAbsClose(src,got,g_caif_cast_test_bf16_round_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Cast::FP32ToBF16RoundTrip")
 }
 
-void TestCastFP16ToBF16Chain()
+void CAIF_CastOpsTests::TestCastFP16ToBF16Chain()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    std::vector<float> src_host=MakeRandom(512,4);
+    std::vector<float> src_host=MakeRandom(g_caif_cast_test_n_large,
+                                            g_caif_cast_test_seed_fp16_to_bf16);
     const std::vector<uint32_t> shape={static_cast<uint32_t>(src_host.size())};
     CAIF_DeviceTensor src_fp32=CAIF_DeviceTensor::FromHostData(src_host.data(),shape,stream);
     CAIF_DeviceTensor as_fp16=CAIF_DeviceTensor::Uninitialized(shape,
-                                                               stream,
-                                                               CAIF_DataType::CAIF_DataType_e::Float16);
+                                                                stream,
+                                                                CAIF_DataType::CAIF_DataType_e::Float16);
     CAIF_DeviceTensor as_bf16=CAIF_DeviceTensor::Uninitialized(shape,
-                                                               stream,
-                                                               CAIF_DataType::CAIF_DataType_e::BFloat16);
+                                                                stream,
+                                                                CAIF_DataType::CAIF_DataType_e::BFloat16);
     CAIF_DeviceTensor back_fp32=CAIF_DeviceTensor::Uninitialized(shape,
-                                                                 stream,
-                                                                 CAIF_DataType::CAIF_DataType_e::Float32);
+                                                                  stream,
+                                                                  CAIF_DataType::CAIF_DataType_e::Float32);
     CAIF_Ops::Cast(src_fp32,as_fp16,ctx);
     CAIF_Ops::Cast(as_fp16,as_bf16,ctx);
     CAIF_Ops::Cast(as_bf16,back_fp32,ctx);
     std::vector<float> got(src_host.size());
     back_fp32.CopyToHost(got.data());
-    ReportResult("Cast::FP16ToBF16Chain",MaxAbsClose(src_host,got,g_bf16_round_tol));
+    CAIF_TestHarness::Report("Cast::FP16ToBF16Chain",
+                              MaxAbsClose(src_host,got,g_caif_cast_test_bf16_round_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Cast::FP16ToBF16Chain")
 }
 
-void TestCastBF16ToFP16Chain()
+void CAIF_CastOpsTests::TestCastBF16ToFP16Chain()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    std::vector<float> src_host=MakeRandom(512,5);
+    std::vector<float> src_host=MakeRandom(g_caif_cast_test_n_large,
+                                            g_caif_cast_test_seed_bf16_to_fp16);
     const std::vector<uint32_t> shape={static_cast<uint32_t>(src_host.size())};
     CAIF_DeviceTensor src_fp32=CAIF_DeviceTensor::FromHostData(src_host.data(),shape,stream);
     CAIF_DeviceTensor as_bf16=CAIF_DeviceTensor::Uninitialized(shape,
-                                                               stream,
-                                                               CAIF_DataType::CAIF_DataType_e::BFloat16);
+                                                                stream,
+                                                                CAIF_DataType::CAIF_DataType_e::BFloat16);
     CAIF_DeviceTensor as_fp16=CAIF_DeviceTensor::Uninitialized(shape,
-                                                               stream,
-                                                               CAIF_DataType::CAIF_DataType_e::Float16);
+                                                                stream,
+                                                                CAIF_DataType::CAIF_DataType_e::Float16);
     CAIF_DeviceTensor back_fp32=CAIF_DeviceTensor::Uninitialized(shape,
-                                                                 stream,
-                                                                 CAIF_DataType::CAIF_DataType_e::Float32);
+                                                                  stream,
+                                                                  CAIF_DataType::CAIF_DataType_e::Float32);
     CAIF_Ops::Cast(src_fp32,as_bf16,ctx);
     CAIF_Ops::Cast(as_bf16,as_fp16,ctx);
     CAIF_Ops::Cast(as_fp16,back_fp32,ctx);
     std::vector<float> got(src_host.size());
     back_fp32.CopyToHost(got.data());
-    ReportResult("Cast::BF16ToFP16Chain",MaxAbsClose(src_host,got,g_bf16_round_tol));
+    CAIF_TestHarness::Report("Cast::BF16ToFP16Chain",
+                              MaxAbsClose(src_host,got,g_caif_cast_test_bf16_round_tol));
   }
   CAIF_TEST_CATCH_BLOCK("Cast::BF16ToFP16Chain")
 }
 
-void TestCastShapeMismatchThrows()
+void CAIF_CastOpsTests::TestCastShapeMismatchThrows()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    std::vector<float> src_host(16,1.0f);
-    CAIF_DeviceTensor src=CAIF_DeviceTensor::FromHostData(src_host.data(),{16},stream);
-    CAIF_DeviceTensor dst=CAIF_DeviceTensor::Uninitialized({8},
-                                                           stream,
-                                                           CAIF_DataType::CAIF_DataType_e::Float16);
+    std::vector<float> src_host(g_caif_cast_test_n_mismatch_src,1.0f);
+    CAIF_DeviceTensor src=CAIF_DeviceTensor::FromHostData(
+      src_host.data(),
+      {static_cast<uint32_t>(g_caif_cast_test_n_mismatch_src)},
+      stream);
+    CAIF_DeviceTensor dst=CAIF_DeviceTensor::Uninitialized(
+      {static_cast<uint32_t>(g_caif_cast_test_n_mismatch_dst)},
+      stream,
+      CAIF_DataType::CAIF_DataType_e::Float16);
     bool threw=false;
     try
     {
@@ -229,23 +271,27 @@ void TestCastShapeMismatchThrows()
     {
       threw=true;
     }
-    ReportResult("Cast::ShapeMismatchThrows",threw);
+    CAIF_TestHarness::Report("Cast::ShapeMismatchThrows",threw);
   }
   CAIF_TEST_CATCH_BLOCK("Cast::ShapeMismatchThrows")
 }
 
-void TestCastIntegerRejected()
+void CAIF_CastOpsTests::TestCastIntegerRejected()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    std::vector<float> src_host(16,0.5f);
-    CAIF_DeviceTensor src=CAIF_DeviceTensor::FromHostData(src_host.data(),{16},stream);
-    CAIF_DeviceTensor dst=CAIF_DeviceTensor::Uninitialized({16},
-                                                           stream,
-                                                           CAIF_DataType::CAIF_DataType_e::Int8);
+    std::vector<float> src_host(g_caif_cast_test_n_mismatch_src,g_caif_cast_test_int8_fill);
+    CAIF_DeviceTensor src=CAIF_DeviceTensor::FromHostData(
+      src_host.data(),
+      {static_cast<uint32_t>(g_caif_cast_test_n_mismatch_src)},
+      stream);
+    CAIF_DeviceTensor dst=CAIF_DeviceTensor::Uninitialized(
+      {static_cast<uint32_t>(g_caif_cast_test_n_mismatch_src)},
+      stream,
+      CAIF_DataType::CAIF_DataType_e::Int8);
     bool threw=false;
     try
     {
@@ -255,20 +301,15 @@ void TestCastIntegerRejected()
     {
       threw=true;
     }
-    ReportResult("Cast::IntegerRejected",threw);
+    CAIF_TestHarness::Report("Cast::IntegerRejected",threw);
   }
   CAIF_TEST_CATCH_BLOCK("Cast::IntegerRejected")
 }
 
-#endif// USE_CAIF_CUDA
-
-}// anon
-
-int main()
+void CAIF_CastOpsTests::RunAll()
 {
-  ISE_Out::Out()<<"=== Cast Op Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== Cast Op Tests ==="
+                <<"\n\n";
   TestCastFP32Identity();
   TestCastFP32ToFP16RoundTrip();
   TestCastFP32ToBF16RoundTrip();
@@ -276,10 +317,6 @@ int main()
   TestCastBF16ToFP16Chain();
   TestCastShapeMismatchThrows();
   TestCastIntegerRejected();
-#else
-  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
-
   ISE_Out::Out()<<"\n=== Summary ===\n"
                 <<"Passed: "
                 <<CAIF_TestHarness::PassedCount()
@@ -287,5 +324,20 @@ int main()
                 <<"Failed: "
                 <<CAIF_TestHarness::FailedCount()
                 <<"\n";
-  return CAIF_TestHarness::FinalExitCode();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_CastOpsTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+                <<"\n";
+  return 0;
+#endif
 }

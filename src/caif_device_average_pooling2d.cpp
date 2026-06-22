@@ -21,6 +21,7 @@
 
 #include "caif_device_average_pooling2d.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_cudnn_util.h"
 #include "caif_device_context.h"
 #include "caif_exception.h"
@@ -34,9 +35,6 @@
 
 namespace instance
 {
-
-
-constexpr size_t POOLING_INPUT_RANK=4;
 
 #ifdef USE_CAIF_CUDA
 
@@ -375,14 +373,14 @@ CAIF_DeviceAveragePooling2D<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTen
   {
     (void)ctx;
     const std::vector<uint32_t> &in_shape=input.Shape();
-    if(in_shape.size()!=POOLING_INPUT_RANK)
+    if(in_shape.size()!=g_caif_pooling_input_rank)
     {
       THROW_CAIFE("CAIF_DeviceAveragePooling2D: expects rank-4 input [N,H,W,C]");
     }
-    const uint32_t pH=Config().pool_height;
-    const uint32_t pW=Config().pool_width;
-    const uint32_t sH=Config().stride_height;
-    const uint32_t sW=Config().stride_width;
+    const uint32_t pH=Config().PoolHeight();
+    const uint32_t pW=Config().PoolWidth();
+    const uint32_t sH=Config().StrideHeight();
+    const uint32_t sW=Config().StrideWidth();
 
     if(input.Location()==CAIF_DeviceTensor::Location_e::Host_e)
     {
@@ -425,10 +423,10 @@ CAIF_DeviceAveragePooling2D<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTe
   try
   {
     (void)ctx;
-    const uint32_t pH=Config().pool_height;
-    const uint32_t pW=Config().pool_width;
-    const uint32_t sH=Config().stride_height;
-    const uint32_t sW=Config().stride_width;
+    const uint32_t pH=Config().PoolHeight();
+    const uint32_t pW=Config().PoolWidth();
+    const uint32_t sH=Config().StrideHeight();
+    const uint32_t sW=Config().StrideWidth();
 
     if(grad_output.Location()==CAIF_DeviceTensor::Location_e::Host_e)
     {
@@ -459,7 +457,7 @@ CAIF_DeviceAveragePooling2D<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTe
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceAveragePooling2D<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_average_pooling2d;
+  return g_serial_tag_average_pooling2d;
 }
 
 // Explicit instantiations — full 3x3 (ComputeT, StorageT) grid.

@@ -24,6 +24,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_lora_adapter_config.h"
 #include "caif_run_context.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
@@ -44,15 +45,8 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct LoRAConfig_t
-    {
-      uint32_t rank;
-      float alpha;
-      uint32_t input_dim;
-      uint32_t output_dim;
-    };
 
-    CAIF_DeviceLoRAAdapter(const LoRAConfig_t &config,
+    CAIF_DeviceLoRAAdapter(const CAIF_DeviceLoRAAdapterConfig &config,
                            std::unique_ptr<CAIF_DeviceLayer> base_layer,
                            CAIF_CudaStream &stream,
                            uint32_t seed=0);
@@ -81,8 +75,9 @@ class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
     std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    const LoRAConfig_t &Config()const{return _config;}
+    const CAIF_DeviceLoRAAdapterConfig &Config()const{return _config;}
 
+    bool HasBaseLayer()const{return _base_layer!=nullptr;}
     CAIF_DeviceLayer &BaseLayer()
     {
       if(_base_layer==nullptr)
@@ -112,9 +107,33 @@ class CAIF_DeviceLoRAAdapter:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
-    CAIF_DeviceTensor &LoRAAMut(){return _lora_a;}
+    void SetConfig(const CAIF_DeviceLoRAAdapterConfig &c){_config=c;}
 
-    LoRAConfig_t _config;
+    const CAIF_DeviceTensor &LoRAA()const{return _lora_a;}
+    CAIF_DeviceTensor &LoRAAMut(){return _lora_a;}
+    void SetLoRAA(CAIF_DeviceTensor &&t){_lora_a=std::move(t);}
+
+    const CAIF_DeviceTensor &LoRAB()const{return _lora_b;}
+    CAIF_DeviceTensor &LoRABMut(){return _lora_b;}
+    void SetLoRAB(CAIF_DeviceTensor &&t){_lora_b=std::move(t);}
+
+    const CAIF_DeviceTensor &GradLoRAA()const{return _grad_lora_a;}
+    CAIF_DeviceTensor &GradLoRAA(){return _grad_lora_a;}
+    void SetGradLoRAA(CAIF_DeviceTensor &&t){_grad_lora_a=std::move(t);}
+
+    const CAIF_DeviceTensor &GradLoRAB()const{return _grad_lora_b;}
+    CAIF_DeviceTensor &GradLoRAB(){return _grad_lora_b;}
+    void SetGradLoRAB(CAIF_DeviceTensor &&t){_grad_lora_b=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedLoRAHidden()const{return _cached_lora_hidden;}
+    CAIF_DeviceTensor &CachedLoRAHidden(){return _cached_lora_hidden;}
+    void SetCachedLoRAHidden(CAIF_DeviceTensor &&t){_cached_lora_hidden=std::move(t);}
+
+    CAIF_DeviceLoRAAdapterConfig _config;
     std::unique_ptr<CAIF_DeviceLayer> _base_layer;
 
     CAIF_DeviceTensor _lora_a;

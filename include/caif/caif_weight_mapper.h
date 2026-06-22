@@ -118,12 +118,12 @@ class CAIF_WeightMapper:public CAIF_Base
     /**
      * @brief Number of prefix rules configured.
      */
-    size_t PrefixRuleCount()const{return _prefix_rules.size();}
+    size_t PrefixRuleCount()const{return PrefixRules().size();}
 
     /**
      * @brief Number of aliases configured.
      */
-    size_t AliasCount()const{return _hf_to_aif_aliases.size();}
+    size_t AliasCount()const{return HfToAifAliases().size();}
 
   protected:
 
@@ -135,6 +135,14 @@ class CAIF_WeightMapper:public CAIF_Base
     };
 
     static bool ComparePrefixByLength(const PrefixRule_t &a,const PrefixRule_t &b);
+
+    // Internal accessors — single point of access for each member.
+    const std::vector<PrefixRule_t> &PrefixRules()const{return _prefix_rules;}
+    std::vector<PrefixRule_t> &PrefixRules(){return _prefix_rules;}
+    const std::map<std::string,std::string> &HfToAifAliases()const{return _hf_to_aif_aliases;}
+    std::map<std::string,std::string> &HfToAifAliases(){return _hf_to_aif_aliases;}
+    const std::map<std::string,std::string> &AifToHfAliases()const{return _aif_to_hf_aliases;}
+    std::map<std::string,std::string> &AifToHfAliases(){return _aif_to_hf_aliases;}
 
     // Prefix rules sorted by longest hf_prefix first (for longest-match)
     std::vector<PrefixRule_t> _prefix_rules;

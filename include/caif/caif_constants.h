@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include "caif_data_type.h"
 
 namespace instance
@@ -30,57 +31,17 @@ namespace instance
     TPU
   };
 
-  // Activation functions
-  enum class CAIF_ActivationType_e:uint8_t
-  {
-    Linear,
-    ReLU,
-    Sigmoid,
-    Tanh,
-    Softmax,
-    LeakyReLU,
-    ELU,
-    GELU,
-    Swish
-  };
+  // Activation functions — enum moved to include/caif/caif_activation_type.h
+  // (class-scoped: CAIF_ActivationType::CAIF_ActivationType_e). Moved 2026-05-13.
 
-  // Loss functions
-  enum class CAIF_LossType_e:uint8_t
-  {
-    MeanSquaredError,
-    CrossEntropy,
-    BinaryCrossEntropy,
-    BinaryCrossEntropyWithLogits,
-    CategoricalCrossEntropy,
-    Huber,
-    MeanAbsoluteError
-  };
+  // Loss functions — enum moved to include/caif/caif_loss_type.h
+  // (class-scoped: CAIF_LossType::CAIF_LossType_e). Moved 2026-05-13.
 
-  // Optimizer types
-  enum class CAIF_OptimizerType_e:uint8_t
-  {
-    SGD,
-    Adam,
-    AdaGrad,
-    RMSprop,
-    Momentum
-  };
+  // Optimizer types — enum moved to include/caif/caif_optimizer_type.h
+  // (class-scoped: CAIF_OptimizerType::CAIF_OptimizerType_e). Moved 2026-05-13.
 
-  // Layer types
-  enum class CAIF_LayerType_e:uint8_t
-  {
-    Embedding,
-    Dense,
-    Convolution2D,
-    MaxPooling2D,
-    AveragePooling2D,
-    BatchNormalization,
-    Dropout,
-    Flatten,
-    Reshape,
-    MultiHeadAttention,
-    TransformerEncoder
-  };
+  // Layer types — enum moved to include/caif/caif_layer_type.h
+  // (class-scoped: CAIF_LayerType::CAIF_LayerType_e). Moved 2026-05-13.
 
   // Global constants
   constexpr uint32_t g_caif_max_tensor_dimensions=8;
@@ -90,7 +51,28 @@ namespace instance
   constexpr float g_caif_epsilon=1e-5f;
   // Standard Adam default eps
   constexpr float g_caif_adam_epsilon=1e-8f;
+  // Renormalization division-by-zero guard used by host TopK / MoE gating
+  // helpers and matched by the device-kernel epsilon in
+  // caif_cuda_kernels.cu.
+  constexpr float g_caif_division_epsilon=1.0e-12f;
+  // Sentinel rate value meaning "drop nothing" — dropout fast-path skips the
+  // RNG / mask path entirely when rate equals this.
+  constexpr float g_caif_dropout_full_keep_rate=0.0f;
+  // Per-element seed mixer used by the host-side dropout SplitMix64 counter
+  // to decorrelate adjacent indices when iterating a flat tensor.
+  constexpr uint64_t g_caif_dropout_counter_mix=0xD1342543DE82EF95ULL;
   constexpr uint32_t g_caif_max_threads=16;
+
+  // MatMul-family op labels for the RequireMatchingDtype diagnostic. Shared by
+  // the host and device matmul backends so a dtype-mismatch error names the
+  // operation that raised it.
+  inline const std::string g_caif_op_matmul="MatMul";
+  inline const std::string g_caif_op_matmul_bias="MatMulBias";
+  inline const std::string g_caif_op_matmul_transpose_a="MatMulTransposeA";
+  inline const std::string g_caif_op_matmul_transpose_b="MatMulTransposeB";
+  inline const std::string g_caif_op_batched_matmul="BatchedMatMul";
+  inline const std::string g_caif_op_batched_matmul_transpose_a="BatchedMatMulTransposeA";
+  inline const std::string g_caif_op_batched_matmul_transpose_b="BatchedMatMulTransposeB";
 
   // Mathematical constants
   constexpr double g_caif_pi=3.14159265358979323846;
@@ -107,11 +89,22 @@ namespace instance
   constexpr float g_caif_sgd_default_momentum=0.9f;
   // Standard RMSprop default alpha (smoothing constant)
   constexpr float g_caif_rmsprop_default_alpha=0.99f;
+
+  // Mixed-precision loss scaler defaults — match
+  // torch.cuda.amp.GradScaler. init=2^16; double the scale every
+  // growth_interval overflow-free steps; halve it the moment a step overflows.
+  constexpr float g_caif_loss_scaler_init_scale=65536.0f;
+  constexpr float g_caif_loss_scaler_growth_factor=2.0f;
+  constexpr float g_caif_loss_scaler_backoff_factor=0.5f;
+  constexpr uint32_t g_caif_loss_scaler_growth_interval=2000;
   // Standard RMSprop default eps
   constexpr float g_caif_rmsprop_default_epsilon=1e-8f;
   // Standard AdaGrad default eps
   constexpr float g_caif_adagrad_default_epsilon=1e-10f;
   constexpr float g_caif_weight_init_scale=0.1f;
+  // CLS-token init uses a small offset on top of the golden-ratio
+  // sequence so the deterministic seed differs from the W_proj table.
+  constexpr float g_caif_cls_token_init_offset=0.3f;
   constexpr uint32_t g_caif_default_epochs=100;
   // Optimizer behavior constants
   // Disabled by default (no clipping)
@@ -138,6 +131,8 @@ namespace instance
   constexpr uint32_t g_caif_conv_width_idx=2;   // Index of width dimension in conv shape
   constexpr uint32_t g_caif_conv_channel_idx=3; // Index of channel dimension in conv shape
   constexpr uint32_t g_caif_2d_matrix_dimensions=2; // Number of dimensions for 2D matrices (rows, columns)
+  // Rank of a pooling-layer input tensor ([N, H, W, C]).
+  constexpr size_t g_caif_pooling_input_rank=4;
 
   // Memory alignment
   constexpr size_t g_caif_memory_alignment=32;
@@ -175,8 +170,8 @@ namespace instance
   // MatMul diagnostic instrumentation toggles. When the kernel-time tracer
   // is on, every cublasLtMatmul call reports its event-timed ms + TFLOPS to
   // stderr together with shape, compute_type, workspace, and the cuBLAS-Lt
-  // algo bytes picked on cache miss. Flip these to true only for a perf
-  // audit — they force a per-iter cudaEventSynchronize that adds overhead.
+  // algo bytes picked on cache miss. Flip these to true only for performance
+  // profiling — they force a per-iter cudaEventSynchronize that adds overhead.
   constexpr bool g_caif_matmul_trace_enabled=false;
   constexpr bool g_caif_matmul_skip_probe=false;
   // Unit-conversion constants for the trace TFLOPS calculation.
@@ -186,19 +181,40 @@ namespace instance
   // (cuBLAS-Lt heuristics consider pointer alignment when ranking algos).
   constexpr unsigned int g_caif_matmul_trace_alignment_modulus=256u;
   // Optional cuBLAS-Lt workspace-size override for the MatMul probe-and-pick
-  // audit. 0 = use the device-context workspace as normal. Non-zero (in MiB)
+  // path. 0 = use the device-context workspace as normal. Non-zero (in MiB)
   // allocates a separate workspace of that size and routes the perf-test
   // matmuls through it so we can measure whether bigger/smaller workspace
-  // changes the heuristic's algo pick. Audit-only — set back to 0 after.
+  // changes the heuristic's algo pick. Debug-only — set back to 0 after.
   constexpr size_t g_caif_matmul_workspace_override_mib=0;
   constexpr size_t g_caif_bytes_per_mebibyte=1024ULL*1024ULL;
 
   // MoE Forward stage-timing instrumentation. When enabled, each top-level
   // stage of CAIF_DeviceMoELayer::ForwardImpl reports event-timed ms to
   // stderr — router, dispatch-map, dispatch-gpu, per-expert, combine.
-  // Audit-only; flip back to false after a perf audit because the per-stage
+  // Debug-only; flip back to false after profiling because the per-stage
   // cudaEventSynchronize forces stream serialization and inflates the bench.
   constexpr bool g_caif_moe_forward_trace_enabled=false;
+
+  // MLA decode-dispatch crossover. The standard decode path is compute-bound (the
+  // per-step decompress GEMM, whose FLOPs grow with cache length); the absorbed
+  // path is bandwidth-bound (the fixed folded-weight read). The crossover cache
+  // length is dim/(qk_nope+v_head) times the GPU's effective compute:bandwidth
+  // ratio, computed from queried device properties — no per-machine constant.
+  // These describe the hardware/workload, not one machine.
+  // FP32 CUDA cores per SM (Ampere/Ada/Hopper/Blackwell).
+  constexpr uint32_t g_caif_cuda_fp32_cores_per_sm=128;
+  // Two FLOPs per fused multiply-add.
+  constexpr uint32_t g_caif_flops_per_fma=2;
+  // (G)DDR transfers per memory clock.
+  constexpr uint32_t g_caif_memory_transfers_per_clock=2;
+  constexpr uint32_t g_caif_bits_per_byte=8;
+  // Device clocks are reported in kHz.
+  constexpr double g_caif_khz_to_hz=1000.0;
+  // Fraction of FP32 peak the small-K decompress GEMM sustains — the single
+  // workload factor (~0.5 across modern GPUs) that sets the crossover magnitude.
+  constexpr double g_caif_mla_decode_gemm_efficiency=0.54;
+  // Crossover ratio used when device properties are unavailable.
+  constexpr uint32_t g_caif_mla_decode_fallback_ratio=120;
 
 
   // Multi-head attention layer constants.
@@ -328,6 +344,10 @@ namespace instance
   // GELU activation constants
   constexpr float g_caif_gelu_sqrt_2_over_pi=0.7978845608f;
   constexpr float g_caif_gelu_coeff=0.044715f;
+  // Exact (erf) GELU constants: f(x)=0.5*x*(1+erf(x/sqrt(2))); the backward
+  // adds x*phi(x) with phi the standard-normal pdf (1/sqrt(2*pi))*exp(-x^2/2).
+  constexpr float g_caif_gelu_inv_sqrt2=0.7071067812f;     // 1/sqrt(2)
+  constexpr float g_caif_gelu_inv_sqrt2pi=0.3989422804f;   // 1/sqrt(2*pi)
 
   // BCE loss epsilon
   constexpr float g_caif_bce_epsilon=1e-6f;
@@ -360,71 +380,114 @@ namespace instance
   // consumers. Centralised here so ParameterNames and FrozenTensorNames
   // overrides cannot drift, and so a future redesign that moves naming
   // policy out of CAIF leaves only this header to change.
-  constexpr const char *g_caif_name_weight="weight";
-  constexpr const char *g_caif_name_bias="bias";
-  constexpr const char *g_caif_name_lora_a="lora_a";
-  constexpr const char *g_caif_name_lora_b="lora_b";
-
-  constexpr const char *g_caif_name_q_proj="q_proj.";
-  constexpr const char *g_caif_name_k_proj="k_proj.";
-  constexpr const char *g_caif_name_v_proj="v_proj.";
-  constexpr const char *g_caif_name_o_proj="o_proj.";
-
-  constexpr const char *g_caif_name_input_layernorm="input_layernorm.";
-  constexpr const char *g_caif_name_self_attn="self_attn.";
-  constexpr const char *g_caif_name_post_attention_layernorm="post_attention_layernorm.";
-  constexpr const char *g_caif_name_mlp="mlp.";
-
-  // Description() return strings for layer subclasses. Centralised so callers
-  // (logging, bench tags, naming profiles) match exact-string expectations.
-  constexpr const char *g_caif_description_frozen_linear="FrozenLinear";
-  constexpr const char *g_caif_description_relu="ReLU";
-  constexpr const char *g_caif_description_gelu="GELU";
-  constexpr const char *g_caif_description_sigmoid="Sigmoid";
-  constexpr const char *g_caif_description_tanh="Tanh";
-  constexpr const char *g_caif_description_swish="Swish";
-  constexpr const char *g_caif_description_leaky_relu="LeakyReLU";
-  constexpr const char *g_caif_description_elu="ELU";
-  constexpr const char *g_caif_description_linear="Linear";
+  inline const std::string g_caif_name_weight="weight";
+  inline const std::string g_caif_name_bias="bias";
+  inline const std::string g_caif_name_lora_a="lora_a";
+  inline const std::string g_caif_name_lora_b="lora_b";
 
   // Default activation hyperparameters.
   constexpr float g_caif_default_leaky_relu_alpha=0.01f;
   constexpr float g_caif_default_elu_alpha=1.0f;
 
-  // Description() return strings for shape-op layers.
-  constexpr const char *g_caif_description_flatten="CAIF_DeviceFlatten";
-  constexpr const char *g_caif_description_reshape="CAIF_DeviceReshape";
-
-  // Description() return strings for vision (cuDNN-backed) layers.
-  constexpr const char *g_caif_description_average_pooling2d="CAIF_DeviceAveragePooling2D";
-  constexpr const char *g_caif_description_max_pooling2d="CAIF_DeviceMaxPooling2D";
-  constexpr const char *g_caif_description_conv2d="CAIF_DeviceConv2D";
-  constexpr const char *g_caif_description_batch_norm="CAIF_DeviceBatchNorm";
-
   // Workspace cap (bytes) for cuDNN convolution algorithm selection.
   // The first algorithm whose workspace fits this cap is chosen.
   constexpr size_t g_caif_cudnn_workspace_max_bytes=256ULL*1024ULL*1024ULL;
 
-  // Description() return strings / fragments for container layers.
-  constexpr const char *g_caif_description_container_prefix="Container";
-  constexpr const char *g_caif_description_pre_norm_block_prefix="PreNormBlock";
-  constexpr const char *g_caif_description_transformer_block_prefix="TransformerBlock";
-  constexpr const char *g_caif_description_transformer_model_prefix="TransformerModel";
-  constexpr const char *g_caif_description_vit_prefix="ViT";
+  // Description() class-name tags live in caif_serialization_constants.h
+  // under g_serial_tag_*.
 
-  // Naming prefixes for TransformerModel slot iteration.
-  constexpr const char *g_caif_name_embed_tokens="embed_tokens.";
-  constexpr const char *g_caif_name_embed_positions="embed_positions.";
-  constexpr const char *g_caif_name_layers_prefix="layers.";
-  constexpr const char *g_caif_name_norm="norm.";
-  constexpr const char *g_caif_name_lm_head="lm_head.";
+  // Default caif-neutral names per CAIF_ParamRole::Role_e. These are the
+  // factory defaults that CAIF_RoleRegistry seeds into each role's
+  // CAIF_RoleInfo at startup. Callers override individual entries via
+  // CAIF_RoleRegistry::SetName / LoadNamesFromJSON to map onto external
+  // checkpoint formats (HF safetensors, GGUF, etc.); caif itself never
+  // ships any external-format names.
+  inline const std::string g_caif_role_name_attn_w_q="w_q";
+  inline const std::string g_caif_role_name_attn_w_k="w_k";
+  inline const std::string g_caif_role_name_attn_w_v="w_v";
+  inline const std::string g_caif_role_name_attn_w_o="w_o";
+  inline const std::string g_caif_role_name_attn_bias_q="bias_q";
+  inline const std::string g_caif_role_name_attn_bias_k="bias_k";
+  inline const std::string g_caif_role_name_attn_bias_v="bias_v";
+  inline const std::string g_caif_role_name_attn_q_norm_gamma="q_norm_gamma";
+  inline const std::string g_caif_role_name_attn_k_norm_gamma="k_norm_gamma";
 
-  // Naming prefixes for ViT slot iteration.
-  constexpr const char *g_caif_name_vit_patch_embeddings="embeddings.patch_embeddings.";
-  constexpr const char *g_caif_name_vit_position_embeddings="embeddings.position_embeddings.";
-  constexpr const char *g_caif_name_vit_encoder_layer="encoder.layer.";
-  constexpr const char *g_caif_name_vit_layernorm="layernorm.";
-  constexpr const char *g_caif_name_vit_classifier="classifier.";
+  inline const std::string g_caif_role_name_mla_w_q_compress="w_q_compress";
+  inline const std::string g_caif_role_name_mla_w_q_decompress="w_q_decompress";
+  inline const std::string g_caif_role_name_mla_w_kv_compress="w_kv_compress";
+  inline const std::string g_caif_role_name_mla_w_kv_decompress="w_kv_decompress";
+  inline const std::string g_caif_role_name_mla_w_o="w_o";
+  inline const std::string g_caif_role_name_mla_q_norm_gamma="q_norm_gamma";
+  inline const std::string g_caif_role_name_mla_kv_norm_gamma="kv_norm_gamma";
+
+  inline const std::string g_caif_role_name_ffn_w_gate="w_gate";
+  inline const std::string g_caif_role_name_ffn_w_up="w_up";
+  inline const std::string g_caif_role_name_ffn_w_down="w_down";
+  inline const std::string g_caif_role_name_ffn_bias_gate="bias_gate";
+  inline const std::string g_caif_role_name_ffn_bias_up="bias_up";
+  inline const std::string g_caif_role_name_ffn_bias_down="bias_down";
+
+  inline const std::string g_caif_role_name_moe_router_w="router_w";
+  inline const std::string g_caif_role_name_moe_router_bias="router_bias";
+  inline const std::string g_caif_role_name_moe_expert_w_gate="expert_w_gate";
+  inline const std::string g_caif_role_name_moe_expert_w_up="expert_w_up";
+  inline const std::string g_caif_role_name_moe_expert_w_down="expert_w_down";
+  inline const std::string g_caif_role_name_moe_shared_expert_w_gate="shared_expert_w_gate";
+  inline const std::string g_caif_role_name_moe_shared_expert_w_up="shared_expert_w_up";
+  inline const std::string g_caif_role_name_moe_shared_expert_w_down="shared_expert_w_down";
+  inline const std::string g_caif_role_name_moe_expert_b_gate="b_gate";
+  inline const std::string g_caif_role_name_moe_expert_b_up="b_up";
+  inline const std::string g_caif_role_name_moe_expert_b_down="b_down";
+
+  inline const std::string g_caif_role_name_rmsnorm_gamma="rms_norm_gamma";
+  inline const std::string g_caif_role_name_layernorm_gamma="layer_norm_gamma";
+  inline const std::string g_caif_role_name_layernorm_beta="layer_norm_beta";
+  inline const std::string g_caif_role_name_final_norm_gamma="final_norm_gamma";
+
+  inline const std::string g_caif_role_name_token_embedding_table="token_embed";
+  inline const std::string g_caif_role_name_position_embedding_table="position_embed";
+
+  inline const std::string g_caif_role_name_linear_head_w="head_w";
+  inline const std::string g_caif_role_name_linear_head_bias="head_bias";
+
+  inline const std::string g_caif_role_name_lora_a="lora_a";
+  inline const std::string g_caif_role_name_lora_b="lora_b";
+
+  inline const std::string g_caif_role_name_conv_w="conv_w";
+  inline const std::string g_caif_role_name_conv_bias="conv_bias";
+  inline const std::string g_caif_role_name_bn_gamma="bn_gamma";
+  inline const std::string g_caif_role_name_bn_beta="bn_beta";
+  inline const std::string g_caif_role_name_bn_running_mean="bn_running_mean";
+  inline const std::string g_caif_role_name_bn_running_var="bn_running_var";
+
+  inline const std::string g_caif_role_name_relative_position_bias="rpb";
+
+  inline const std::string g_caif_role_name_embed_proj_w="proj_w";
+  inline const std::string g_caif_role_name_embed_proj_bias="proj_bias";
+  inline const std::string g_caif_role_name_embed_cls_token="cls_token";
+
+  inline const std::string g_caif_role_name_generic_weight="weight";
+  inline const std::string g_caif_role_name_generic_bias="bias";
+
+  // Structural path prefixes used by container layers when assembling
+  // child parameter paths. Caif-structural (not external-format
+  // specific); downstream model-builder code overrides only the leaf role
+  // names — these container path components are always emitted as-is.
+  inline const std::string g_caif_path_moe_router="router.";
+  inline const std::string g_caif_path_moe_expert="expert_";
+  inline const std::string g_caif_path_moe_shared_expert="shared_expert_";
+  inline const std::string g_caif_path_transformer_blocks="blocks.";
+  inline const std::string g_caif_path_vit_blocks="blocks.";
+  inline const std::string g_caif_path_embed_in="embed_in.";
+  inline const std::string g_caif_path_embed_pos="embed_pos.";
+  inline const std::string g_caif_path_final_norm="final_norm.";
+  inline const std::string g_caif_path_head="head.";
+  inline const std::string g_caif_path_attn_norm="attn_norm.";
+  inline const std::string g_caif_path_attn="attn.";
+  inline const std::string g_caif_path_ffn_norm="ffn_norm.";
+  inline const std::string g_caif_path_ffn="ffn.";
+  inline const std::string g_caif_path_vit_patch_embed="patch_embed.";
+  inline const std::string g_caif_path_generic_container_layer="layers.";
 
   // SafeTensors format limits (formerly `namespace SafeTensorsConstants`).
   constexpr uint64_t g_caif_safetensors_max_file_size=2ULL<<40;

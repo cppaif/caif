@@ -23,6 +23,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 
@@ -35,11 +36,10 @@ namespace instance
 {
 
 template<typename ComputeT=float,typename StorageT=float>
-class CAIF_DeviceCrossEntropyLoss
+class CAIF_DeviceCrossEntropyLoss:public CAIF_Base
 {
   public:
     CAIF_DeviceCrossEntropyLoss()=delete;
-    ~CAIF_DeviceCrossEntropyLoss()=delete;
 
     static constexpr int g_default_ignore_index=-100;
 

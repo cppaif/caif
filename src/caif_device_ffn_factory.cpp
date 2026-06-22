@@ -26,7 +26,7 @@ std::unique_ptr<CAIF_DeviceLayer> MakeFFN(uint32_t dim,
                                            std::unique_ptr<CAIF_DeviceActivation> activation,
                                            CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceFFN<ComputeT,StorageT>::FFNConfig_t cfg{dim,ffn_dim};
+  CAIF_DeviceFFNConfig cfg{dim,ffn_dim};
   return std::make_unique<CAIF_DeviceFFN<ComputeT,StorageT>>(cfg,std::move(activation),stream);
 }
 

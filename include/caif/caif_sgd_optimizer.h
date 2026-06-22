@@ -15,6 +15,7 @@
 #pragma once
 
 #include "caif_optimizer.h"
+#include "caif_optimizer_type.h"
 
 namespace instance
 {
@@ -27,9 +28,9 @@ class CAIF_SgdOptimizer:public CAIF_Optimizer
                       CAIF_CudaStream &stream);
     ~CAIF_SgdOptimizer()override=default;
 
-    CAIF_OptimizerType_e Type()const override
+    CAIF_OptimizerType::CAIF_OptimizerType_e Type()const override
     {
-      return CAIF_OptimizerType_e::SGD;
+      return CAIF_OptimizerType::CAIF_OptimizerType_e::SGD;
     }
 
   protected:
@@ -38,6 +39,7 @@ class CAIF_SgdOptimizer:public CAIF_Optimizer
     void UpdateOne(CAIF_DeviceTensor &target,
                    const CAIF_DeviceTensor &grad,
                    const size_t idx)override;
+    bool BatchedStep(CAIF_DeviceNetwork &network)override;
 };
 
 }//end instance namespace

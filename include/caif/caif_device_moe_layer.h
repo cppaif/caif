@@ -26,6 +26,7 @@
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_data_type.h"
+#include "caif_moe_overflow_strategy.h"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -38,13 +39,45 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceMoELayer:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    enum class OverflowStrategy_e:uint8_t
-    {
-      Drop=0,
-      NoOp=1,
-      Redistribute=2
-    };
+    // Policy for token-to-expert assignments that exceed a finite per-expert
+    // capacity on the GPU dispatch path. Capacity, when finite, is
+    //   capacity = ceil(num_tokens / num_experts * capacity_factor * top_k)
+    // (the GShard/Switch formula); see ForwardImpl for where it is applied.
+    //
+    //   Drop          GShard/Switch-style capacity dropping. Assignments past an
+    //                 expert's capacity are discarded; the combine omits the
+    //                 dropped term and does NOT renormalize the surviving gate
+    //                 weights (the GShard/Switch convention), so a token that
+    //                 loses one of its top_k experts yields a smaller-magnitude
+    //                 MoE branch. Intended for training-throughput-bounded runs
+    //                 that deliberately cap per-expert load. This is NOT HF
+    //                 parity: HF DeepSeek-V2 / Mixtral / GLM-MoE never drop.
+    //   NoDrop        No capacity limit. Every token reaches all of its top_k
+    //                 experts regardless of routing imbalance (dispatch runs
+    //                 with capacity 0, the kernel's "unlimited" sentinel), so
+    //                 nothing is dropped and no renormalization is needed. This
+    //                 is the HF-parity path and the correct choice for inference
+    //                 and for add-MoE cold-start, where a freshly grafted router
+    //                 is maximally imbalanced and Drop would silently discard
+    //                 tokens. capacity_factor is ignored under NoDrop.
+    //   NoOp          Reserved; not implemented on the GPU dispatch path.
+    //   Redistribute  Reserved; not implemented on the GPU dispatch path.
+    //
+    // ForwardImpl accepts only Drop and NoDrop (NoOp / Redistribute throw). A
+    // non-positive capacity_factor is also treated as no-drop regardless of the
+    // strategy, so callers may request no-drop either explicitly (NoDrop) or by
+    // passing capacity_factor <= 0.
+    //
+    // The enum lives in the shared (non-templated) CAIF_MoEOverflowStrategy so a
+    // config or composer can carry the value without binding to a storage dtype;
+    // it is aliased here as OverflowStrategy_e for the layer's call sites.
+    typedef CAIF_MoEOverflowStrategy::CAIF_MoEOverflowStrategy_e OverflowStrategy_e;
 
+    // capacity_factor and overflow_strategy together control MoE token
+    // dropping; see OverflowStrategy_e above. For HF-parity inference pass
+    // OverflowStrategy_e::NoDrop (or capacity_factor <= 0): no token is dropped.
+    // A positive capacity_factor with OverflowStrategy_e::Drop enables finite
+    // GShard-style per-expert capacity for training-throughput-bounded runs.
     CAIF_DeviceMoELayer(uint32_t input_dim,
                         uint32_t hidden_dim,
                         uint32_t num_experts,
@@ -106,8 +139,8 @@ class CAIF_DeviceMoELayer:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 
     uint32_t InputDim()const{return _input_dim;}
     uint32_t HiddenDim()const{return _hidden_dim;}
-    uint32_t NumExperts()const{return static_cast<uint32_t>(_experts.size());}
-    uint32_t NumSharedExperts()const{return static_cast<uint32_t>(_shared_experts.size());}
+    uint32_t NumExperts()const{return static_cast<uint32_t>(Experts().size());}
+    uint32_t NumSharedExperts()const{return static_cast<uint32_t>(SharedExpertsVec().size());}
     uint32_t TopK()const{return _top_k;}
     const CAIF_DeviceMoERouter<ComputeT,StorageT> &Router()const{return *_router;}
     CAIF_DeviceMoERouter<ComputeT,StorageT> &Router(){return *_router;}
@@ -144,6 +177,117 @@ class CAIF_DeviceMoELayer:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    // Build internal Router/Expert primitives from scalar args. Used by
+    // the primary constructor. Experts are always sized to HiddenDim();
+    // if the caller wants a distinct shared-expert width they pass
+    // shared_hidden_dim.
+    static void BuildPrimitives(uint32_t input_dim,
+                                uint32_t hidden_dim,
+                                uint32_t num_experts,
+                                uint32_t top_k,
+                                bool expert_use_gated,
+                                bool expert_use_bias,
+                                uint32_t num_shared_experts,
+                                uint32_t shared_hidden_dim,
+                                bool router_use_bias,
+                                float router_noise_std,
+                                CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+                                bool norm_topk_prob,
+                                float routed_scaling_factor,
+                                CAIF_CudaStream &stream,
+                                std::unique_ptr<CAIF_DeviceMoERouter<ComputeT,StorageT>> &out_router,
+                                ExpertVec_t &out_experts,
+                                ExpertVec_t &out_shared);
+
+    // Validate scalar MoE-layer construction args; throws on bad input.
+    static void ValidateCore(uint32_t input_dim,
+                             uint32_t hidden_dim,
+                             uint32_t num_experts,
+                             uint32_t top_k);
+
+    // Internal setters / accessors for Phase A.5 — method bodies access
+    // every member through these. The public Router() / InputDim() /
+    // HiddenDim() / TopK() / NumExperts() / NumSharedExperts() above
+    // already cover the read paths for those members; this block adds
+    // setters and the missing accessors only.
+    void SetInputDim(const uint32_t v){_input_dim=v;}
+    void SetHiddenDim(const uint32_t v){_hidden_dim=v;}
+    void SetTopK(const uint32_t v){_top_k=v;}
+    float CapacityFactor()const{return _capacity_factor;}
+    void SetCapacityFactor(const float v){_capacity_factor=v;}
+    OverflowStrategy_e OverflowStrategy()const{return _overflow_strategy;}
+    void SetOverflowStrategy(const OverflowStrategy_e v){_overflow_strategy=v;}
+    float BalanceLossWeight()const{return _balance_loss_weight;}
+    void SetBalanceLossWeight(const float v){_balance_loss_weight=v;}
+    float ZLossWeight()const{return _z_loss_weight;}
+    void SetZLossWeight(const float v){_z_loss_weight=v;}
+    void SetLastBalanceLoss(const float v){_last_balance_loss=v;}
+    void SetLastZLoss(const float v){_last_z_loss=v;}
+
+    std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &Experts()
+    {
+      return _experts;
+    }
+    const std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &Experts()const
+    {
+      return _experts;
+    }
+    std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &SharedExpertsVec()
+    {
+      return _shared_experts;
+    }
+    const std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &SharedExpertsVec()const
+    {
+      return _shared_experts;
+    }
+
+    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &CachedRouting()
+    {
+      return _cached_routing;
+    }
+    const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &CachedRouting()const
+    {
+      return _cached_routing;
+    }
+    void SetCachedRouting(typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &&v)
+    {
+      _cached_routing=std::move(v);
+    }
+
+    std::vector<uint32_t> &CachedTokenCounts(){return _cached_token_counts;}
+    const std::vector<uint32_t> &CachedTokenCounts()const{return _cached_token_counts;}
+
+    const CAIF_DeviceTensor &CachedLogsumexp()const{return _cached_logsumexp;}
+    CAIF_DeviceTensor &CachedLogsumexp(){return _cached_logsumexp;}
+    void SetCachedLogsumexp(CAIF_DeviceTensor &&t){_cached_logsumexp=std::move(t);}
+
+    std::vector<uint32_t> &OverflowTokens(){return _overflow_tokens;}
+    const std::vector<uint32_t> &OverflowTokens()const{return _overflow_tokens;}
+
+    const CAIF_DeviceTensor &WsDispatchMap()const{return _ws_dispatch_map;}
+    CAIF_DeviceTensor &WsDispatchMap(){return _ws_dispatch_map;}
+    void SetWsDispatchMap(CAIF_DeviceTensor &&t){_ws_dispatch_map=std::move(t);}
+
+    const CAIF_DeviceTensor &WsExpertOffsets()const{return _ws_expert_offsets;}
+    CAIF_DeviceTensor &WsExpertOffsets(){return _ws_expert_offsets;}
+    void SetWsExpertOffsets(CAIF_DeviceTensor &&t){_ws_expert_offsets=std::move(t);}
+
+    const CAIF_DeviceTensor &WsExpertInputBuffer()const{return _ws_expert_input_buffer;}
+    CAIF_DeviceTensor &WsExpertInputBuffer(){return _ws_expert_input_buffer;}
+    void SetWsExpertInputBuffer(CAIF_DeviceTensor &&t){_ws_expert_input_buffer=std::move(t);}
+
+    const CAIF_DeviceTensor &WsExpertOutputBuffer()const{return _ws_expert_output_buffer;}
+    CAIF_DeviceTensor &WsExpertOutputBuffer(){return _ws_expert_output_buffer;}
+    void SetWsExpertOutputBuffer(CAIF_DeviceTensor &&t){_ws_expert_output_buffer=std::move(t);}
+
+    const CAIF_DeviceTensor &WsGradExpertOutputBuffer()const{return _ws_grad_expert_output_buffer;}
+    CAIF_DeviceTensor &WsGradExpertOutputBuffer(){return _ws_grad_expert_output_buffer;}
+    void SetWsGradExpertOutputBuffer(CAIF_DeviceTensor &&t){_ws_grad_expert_output_buffer=std::move(t);}
+
+    const CAIF_DeviceTensor &WsGradExpertInputBuffer()const{return _ws_grad_expert_input_buffer;}
+    CAIF_DeviceTensor &WsGradExpertInputBuffer(){return _ws_grad_expert_input_buffer;}
+    void SetWsGradExpertInputBuffer(CAIF_DeviceTensor &&t){_ws_grad_expert_input_buffer=std::move(t);}
+
     uint32_t _input_dim;
     uint32_t _hidden_dim;
     uint32_t _top_k;

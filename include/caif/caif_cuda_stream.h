@@ -136,8 +136,16 @@ class CAIF_CudaStream:public CAIF_Base
     bool _valid;
     bool _owns_stream;
 
+    // Internal accessors — method bodies route through these.
+    void SetValid(const bool v){_valid=v;}
+    void SetOwnsStream(const bool v){_owns_stream=v;}
+    bool OwnsStream()const{return _owns_stream;}
+#ifdef USE_CAIF_CUDA
+    void SetStream(cudaStream_t v){_stream=v;}
+#endif
+
     // Singleton default stream
-    static std::unique_ptr<CAIF_CudaStream> s_default_stream;
+    static std::unique_ptr<CAIF_CudaStream> _default_stream;
 };
 
 }//end instance namespace

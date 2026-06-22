@@ -28,6 +28,7 @@
 
 #include "caif_device_container.h"
 #include "caif_device_layer_typed.h"
+#include "caif_device_transformer_block_config.h"
 #include "caif_run_context.h"
 #include "caif_device_rmsnorm.h"
 #include "caif_device_multi_head_attention.h"
@@ -55,25 +56,13 @@ class CAIF_DeviceTransformerBlock:public CAIF_DeviceContainer
   public:
     typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
 
-    struct TransformerBlockConfig_t
-    {
-      uint32_t dim;
-      uint32_t num_heads;
-      uint32_t num_kv_heads;
-      uint32_t ffn_dim;
-      float dropout_rate;
-      bool causal;
-      bool use_rope;
-      float rope_base;
-      int rope_style=0;
-    };
 
-    CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,
+    CAIF_DeviceTransformerBlock(const CAIF_DeviceTransformerBlockConfig &config,
                                 std::unique_ptr<CAIF_DeviceActivation> activation,
                                 CAIF_CudaStream &stream);
 
     // Convenience constructor: defaults to SwiGLU activation at the same cell.
-    CAIF_DeviceTransformerBlock(const TransformerBlockConfig_t &config,
+    CAIF_DeviceTransformerBlock(const CAIF_DeviceTransformerBlockConfig &config,
                                 CAIF_CudaStream &stream);
 
     ~CAIF_DeviceTransformerBlock()override=default;
@@ -95,8 +84,26 @@ class CAIF_DeviceTransformerBlock:public CAIF_DeviceContainer
     CAIF_DeviceTensor FrozenTensorFP32(size_t index)const override;
     std::vector<std::string> FrozenTensorNames(const std::string &prefix="")const override;
 
-    const TransformerBlockConfig_t &Config()const{return _config;}
+    const CAIF_DeviceTransformerBlockConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceTransformerBlockConfig &config){_config=config;}
     uint32_t EffectiveFFNDim()const{return _effective_ffn_dim;}
+    void SetEffectiveFFNDim(const uint32_t v){_effective_ffn_dim=v;}
+
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> *Norm1Ptr(){return _norm1;}
+    const CAIF_DeviceRMSNorm<ComputeT,StorageT> *Norm1Ptr()const{return _norm1;}
+    void SetNorm1Ptr(CAIF_DeviceRMSNorm<ComputeT,StorageT> *p){_norm1=p;}
+
+    CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> *AttentionPtr(){return _attention;}
+    const CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> *AttentionPtr()const{return _attention;}
+    void SetAttentionPtr(CAIF_DeviceMultiHeadAttention<ComputeT,StorageT> *p){_attention=p;}
+
+    CAIF_DeviceRMSNorm<ComputeT,StorageT> *Norm2Ptr(){return _norm2;}
+    const CAIF_DeviceRMSNorm<ComputeT,StorageT> *Norm2Ptr()const{return _norm2;}
+    void SetNorm2Ptr(CAIF_DeviceRMSNorm<ComputeT,StorageT> *p){_norm2=p;}
+
+    CAIF_DeviceFFN<ComputeT,StorageT> *FFNPtr(){return _ffn;}
+    const CAIF_DeviceFFN<ComputeT,StorageT> *FFNPtr()const{return _ffn;}
+    void SetFFNPtr(CAIF_DeviceFFN<ComputeT,StorageT> *p){_ffn=p;}
 
     static constexpr CAIF_DataType::CAIF_DataType_e ComputeDtype()
     {
@@ -177,7 +184,7 @@ class CAIF_DeviceTransformerBlock:public CAIF_DeviceContainer
   private:
     static uint32_t ComputeDefaultFFNDim(uint32_t dim);
 
-    TransformerBlockConfig_t _config;
+    CAIF_DeviceTransformerBlockConfig _config;
     uint32_t _effective_ffn_dim;
 
     // Non-owning typed pointers into _sublayers (owned by container base).

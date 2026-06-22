@@ -28,42 +28,110 @@
 
 #include "caif_device_multi_head_attention.h"
 #include "caif_test_harness.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_attention_support.cuh"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_data_type.h"
 #include "caif_constants.h"
 #include "caif_cpu_reference/caif_cpu_softmax.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
+
 #include <vector>
 #include <cmath>
 #include <cstring>
 #include <string>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
-static bool FloatClose(float a,float b,float tol)
+#ifdef USE_CAIF_CUDA
+
+constexpr float g_caif_prefix_test_mask_value=-1e9f;
+constexpr float g_caif_prefix_test_mask_tol=1.0f;
+constexpr float g_caif_prefix_test_unmask_tol=1e-5f;
+constexpr float g_caif_prefix_test_fill_tol=5e-4f;
+constexpr float g_caif_prefix_test_hetero_tol=2e-3f;
+constexpr float g_caif_prefix_test_clear_tol=5e-4f;
+constexpr float g_caif_prefix_test_scores_init=1.0f;
+constexpr float g_caif_prefix_test_grad_init=0.7f;
+constexpr uint32_t g_caif_prefix_test_kernel_batch=2;
+constexpr uint32_t g_caif_prefix_test_kernel_heads=2;
+constexpr uint32_t g_caif_prefix_test_kernel_seq=4;
+constexpr uint32_t g_caif_prefix_test_grad_batch=1;
+constexpr uint32_t g_caif_prefix_test_grad_heads=1;
+constexpr uint32_t g_caif_prefix_test_grad_seq=4;
+constexpr uint32_t g_caif_prefix_test_flash_batch=2;
+constexpr uint32_t g_caif_prefix_test_flash_seq=8;
+constexpr uint32_t g_caif_prefix_test_flash_dim=128;
+constexpr uint32_t g_caif_prefix_test_flash_heads=4;
+constexpr uint32_t g_caif_prefix_test_hetero_batch=3;
+constexpr uint32_t g_caif_prefix_test_hetero_seq=8;
+constexpr uint32_t g_caif_prefix_test_hetero_dim=128;
+constexpr uint32_t g_caif_prefix_test_hetero_heads=4;
+constexpr uint32_t g_caif_prefix_test_bwd_batch=2;
+constexpr uint32_t g_caif_prefix_test_bwd_seq=16;
+constexpr uint32_t g_caif_prefix_test_bwd_dim=128;
+constexpr uint32_t g_caif_prefix_test_bwd_heads=4;
+constexpr uint32_t g_caif_prefix_test_clear_batch=1;
+constexpr uint32_t g_caif_prefix_test_clear_seq=8;
+constexpr uint32_t g_caif_prefix_test_clear_dim=64;
+constexpr uint32_t g_caif_prefix_test_clear_heads=2;
+
+//------------------------------------------------------------------------------
+// Prefix-LM mask correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_PrefixLMTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static bool FloatClose(float a,float b,float tol);
+
+    static CAIF_DeviceTensor MakePrefixTensor(const std::vector<int32_t> &lens,
+                                              CAIF_CudaStream &stream);
+
+    static CAIF_DeviceMultiHeadAttentionConfig
+    MakeConfig(uint32_t dim,uint32_t num_heads,bool causal);
+
+    // CPU MHA with optional per-row prefix-LM mask.
+    // prefix_lens: length batch, entry b = prefix length for row b. If empty,
+    // pure causal is applied when causal==true.
+    static void CpuMHAPrefix(const float *input,
+                              const float *w_q,
+                              const float *w_k,
+                              const float *w_v,
+                              const float *w_o,
+                              float *output,
+                              int batch,
+                              int seq_len,
+                              int dim,
+                              int num_heads,
+                              int head_dim,
+                              bool causal,
+                              const std::vector<int32_t> &prefix_lens);
+
+    static void TestKernelPrefixMaskFill();
+    static void TestKernelPrefixMaskGrad();
+    static void TestFlashPrefixZeroEqualsCausal();
+    static void TestFlashPrefixHeterogeneousVsCPU();
+    static void TestFlashPrefixBackwardNoNaN();
+    static void TestClearRevertsToCausal();
+};
+
+bool CAIF_PrefixLMTests::FloatClose(const float a,const float b,const float tol)
 {
   return std::fabs(a-b)<tol;
 }
 
-#ifdef USE_CAIF_CUDA
-
-//------------------------------------------------------------------------------
-// Helpers
-//------------------------------------------------------------------------------
-
-static CAIF_DeviceTensor MakePrefixTensor(const std::vector<int32_t> &lens,
-                                          CAIF_CudaStream &stream)
+CAIF_DeviceTensor CAIF_PrefixLMTests::MakePrefixTensor(const std::vector<int32_t> &lens,
+                                                        CAIF_CudaStream &stream)
 {
   std::vector<uint32_t> shape={static_cast<uint32_t>(lens.size())};
-  // Prefix lengths are unsigned per Phase 3 of TYPE_DISPATCH_FULL_PLAN —
+  // Prefix lengths are unsigned —
   // kernel signatures take `const uint32_t *`. Convert input int32 to
   // uint32 for upload (prefix lengths are always non-negative).
   std::vector<uint32_t> ulens(lens.size());
@@ -77,45 +145,42 @@ static CAIF_DeviceTensor MakePrefixTensor(const std::vector<int32_t> &lens,
                                         CAIF_DataType::CAIF_DataType_e::UInt32);
 }
 
-static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeConfig(uint32_t dim,
-                                                                    uint32_t num_heads,
-                                                                    bool causal)
+CAIF_DeviceMultiHeadAttentionConfig
+CAIF_PrefixLMTests::MakeConfig(const uint32_t dim,
+                                const uint32_t num_heads,
+                                const bool causal)
 {
-  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
-  config.dim=dim;
-  config.num_heads=num_heads;
-  config.num_kv_heads=num_heads;
-  config.head_dim=dim/num_heads;
-  config.causal=causal;
-  config.use_rope=false;
-  config.rope_base=g_caif_rope_default_base;
-  config.dropout_rate=0.0f;
+  CAIF_DeviceMultiHeadAttentionConfig config(dim,
+                                             num_heads,
+                                             num_heads,
+                                             dim/num_heads,
+                                             causal,
+                                             false,
+                                             g_caif_rope_default_base,
+                                             0.0f);
   return config;
 }
 
-// CPU MHA with optional per-row prefix-LM mask.
-// prefix_lens: length batch, entry b = prefix length for row b. If empty,
-// pure causal is applied when causal==true.
-static void CpuMHA_Prefix(const float *input,
-                          const float *w_q,
-                          const float *w_k,
-                          const float *w_v,
-                          const float *w_o,
-                          float *output,
-                          int batch,
-                          int seq_len,
-                          int dim,
-                          int num_heads,
-                          int head_dim,
-                          bool causal,
-                          const std::vector<int32_t> &prefix_lens)
+void CAIF_PrefixLMTests::CpuMHAPrefix(const float *input,
+                                       const float *w_q,
+                                       const float *w_k,
+                                       const float *w_v,
+                                       const float *w_o,
+                                       float *output,
+                                       const int batch,
+                                       const int seq_len,
+                                       const int dim,
+                                       const int num_heads,
+                                       const int head_dim,
+                                       const bool causal,
+                                       const std::vector<int32_t> &prefix_lens)
 {
   const int bs=batch*seq_len;
   const int qk_dim=num_heads*head_dim;
 
-  std::vector<float> q(bs*qk_dim);
-  std::vector<float> k(bs*qk_dim);
-  std::vector<float> v(bs*qk_dim);
+  std::vector<float> q(static_cast<size_t>(bs*qk_dim));
+  std::vector<float> k(static_cast<size_t>(bs*qk_dim));
+  std::vector<float> v(static_cast<size_t>(bs*qk_dim));
   for(int i=0;i<bs;++i)
   {
     for(int j=0;j<qk_dim;++j)
@@ -129,13 +194,13 @@ static void CpuMHA_Prefix(const float *input,
         sk+=input[i*dim+d]*w_k[d*qk_dim+j];
         sv+=input[i*dim+d]*w_v[d*qk_dim+j];
       }
-      q[i*qk_dim+j]=sq;
-      k[i*qk_dim+j]=sk;
-      v[i*qk_dim+j]=sv;
+      q[static_cast<size_t>(i*qk_dim+j)]=sq;
+      k[static_cast<size_t>(i*qk_dim+j)]=sk;
+      v[static_cast<size_t>(i*qk_dim+j)]=sv;
     }
   }
 
-  std::vector<float> concat(bs*qk_dim,0.0f);
+  std::vector<float> concat(static_cast<size_t>(bs*qk_dim),0.0f);
   const float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
 
   for(int b=0;b<batch;++b)
@@ -143,25 +208,25 @@ static void CpuMHA_Prefix(const float *input,
     int pfx=0;
     if(prefix_lens.empty()==false)
     {
-      pfx=prefix_lens[b];
+      pfx=prefix_lens[static_cast<size_t>(b)];
     }
     for(int h=0;h<num_heads;++h)
     {
-      std::vector<float> qh(seq_len*head_dim);
-      std::vector<float> kh(seq_len*head_dim);
-      std::vector<float> vh(seq_len*head_dim);
+      std::vector<float> qh(static_cast<size_t>(seq_len*head_dim));
+      std::vector<float> kh(static_cast<size_t>(seq_len*head_dim));
+      std::vector<float> vh(static_cast<size_t>(seq_len*head_dim));
       for(int s=0;s<seq_len;++s)
       {
         for(int d=0;d<head_dim;++d)
         {
           const int idx=(b*seq_len+s)*qk_dim+h*head_dim+d;
-          qh[s*head_dim+d]=q[idx];
-          kh[s*head_dim+d]=k[idx];
-          vh[s*head_dim+d]=v[idx];
+          qh[static_cast<size_t>(s*head_dim+d)]=q[static_cast<size_t>(idx)];
+          kh[static_cast<size_t>(s*head_dim+d)]=k[static_cast<size_t>(idx)];
+          vh[static_cast<size_t>(s*head_dim+d)]=v[static_cast<size_t>(idx)];
         }
       }
 
-      std::vector<float> scores(seq_len*seq_len,0.0f);
+      std::vector<float> scores(static_cast<size_t>(seq_len*seq_len),0.0f);
       for(int i=0;i<seq_len;++i)
       {
         for(int j=0;j<seq_len;++j)
@@ -169,9 +234,9 @@ static void CpuMHA_Prefix(const float *input,
           float s=0.0f;
           for(int d=0;d<head_dim;++d)
           {
-            s+=qh[i*head_dim+d]*kh[j*head_dim+d];
+            s+=qh[static_cast<size_t>(i*head_dim+d)]*kh[static_cast<size_t>(j*head_dim+d)];
           }
-          scores[i*seq_len+j]=s*scale;
+          scores[static_cast<size_t>(i*seq_len+j)]=s*scale;
         }
       }
 
@@ -197,7 +262,7 @@ static void CpuMHA_Prefix(const float *input,
           }
           if(masked==true)
           {
-            scores[i*seq_len+j]=-1e9f;
+            scores[static_cast<size_t>(i*seq_len+j)]=g_caif_prefix_test_mask_value;
           }
         }
       }
@@ -207,7 +272,7 @@ static void CpuMHA_Prefix(const float *input,
         CAIF_CpuSoftmax::ApplyRow(scores.data()+i*seq_len,seq_len);
       }
 
-      std::vector<float> ctx(seq_len*head_dim,0.0f);
+      std::vector<float> ctx_out(static_cast<size_t>(seq_len*head_dim),0.0f);
       for(int i=0;i<seq_len;++i)
       {
         for(int d=0;d<head_dim;++d)
@@ -215,9 +280,10 @@ static void CpuMHA_Prefix(const float *input,
           float s=0.0f;
           for(int j=0;j<seq_len;++j)
           {
-            s+=scores[i*seq_len+j]*vh[j*head_dim+d];
+            s+=scores[static_cast<size_t>(i*seq_len+j)]
+               *vh[static_cast<size_t>(j*head_dim+d)];
           }
-          ctx[i*head_dim+d]=s;
+          ctx_out[static_cast<size_t>(i*head_dim+d)]=s;
         }
       }
 
@@ -225,7 +291,8 @@ static void CpuMHA_Prefix(const float *input,
       {
         for(int d=0;d<head_dim;++d)
         {
-          concat[(b*seq_len+s)*qk_dim+h*head_dim+d]=ctx[s*head_dim+d];
+          concat[static_cast<size_t>((b*seq_len+s)*qk_dim+h*head_dim+d)]=
+            ctx_out[static_cast<size_t>(s*head_dim+d)];
         }
       }
     }
@@ -238,7 +305,7 @@ static void CpuMHA_Prefix(const float *input,
       float s=0.0f;
       for(int p=0;p<qk_dim;++p)
       {
-        s+=concat[i*qk_dim+p]*w_o[p*dim+j];
+        s+=concat[static_cast<size_t>(i*qk_dim+p)]*w_o[static_cast<size_t>(p*dim+j)];
       }
       output[i*dim+j]=s;
     }
@@ -248,24 +315,26 @@ static void CpuMHA_Prefix(const float *input,
 //------------------------------------------------------------------------------
 // Direct kernel: launch_prefix_mask_fill
 //------------------------------------------------------------------------------
-static void TestKernelPrefixMaskFill()
+void CAIF_PrefixLMTests::TestKernelPrefixMaskFill()
 {
   try
   {
-    const int batch=2;
-    const int num_heads=2;
-    const int seq_len=4;
+    const int batch=static_cast<int>(g_caif_prefix_test_kernel_batch);
+    const int num_heads=static_cast<int>(g_caif_prefix_test_kernel_heads);
+    const int seq_len=static_cast<int>(g_caif_prefix_test_kernel_seq);
     const int bh=batch*num_heads;
 
     CAIF_CudaStream stream;
 
-    // Initial scores: all 1.0f so masked cells become visibly -1e9 post-kernel
-    std::vector<float> host_scores(bh*seq_len*seq_len,1.0f);
-    CAIF_DeviceTensor scores=CAIF_DeviceTensor::FromHostData(host_scores.data(),
-                                                             {static_cast<uint32_t>(bh),
-                                                              static_cast<uint32_t>(seq_len),
-                                                              static_cast<uint32_t>(seq_len)},
-                                                             stream);
+    // Initial scores: all 1.0f so masked cells become visibly -1e9 post-kernel.
+    std::vector<float> host_scores(static_cast<size_t>(bh*seq_len*seq_len),
+                                   g_caif_prefix_test_scores_init);
+    CAIF_DeviceTensor scores=CAIF_DeviceTensor::FromHostData(
+      host_scores.data(),
+      {static_cast<uint32_t>(bh),
+       static_cast<uint32_t>(seq_len),
+       static_cast<uint32_t>(seq_len)},
+      stream);
 
     std::vector<int32_t> prefix_lens={1,3};
     CAIF_DeviceTensor prefix=MakePrefixTensor(prefix_lens,stream);
@@ -282,7 +351,7 @@ static void TestKernelPrefixMaskFill()
     bool passed=true;
     for(int b=0;b<batch;++b)
     {
-      const int pfx=prefix_lens[b];
+      const int pfx=prefix_lens[static_cast<size_t>(b)];
       for(int h=0;h<num_heads;++h)
       {
         for(int r=0;r<seq_len;++r)
@@ -290,23 +359,43 @@ static void TestKernelPrefixMaskFill()
           for(int c=0;c<seq_len;++c)
           {
             const int idx=((b*num_heads+h)*seq_len+r)*seq_len+c;
-            const float got=out.Data()[idx];
+            const float got=out.Data()[static_cast<size_t>(idx)];
             const bool should_mask=(c>r && c>=pfx);
             if(should_mask==true)
             {
-              if(FloatClose(got,-1e9f,1.0f)==false)
+              if(FloatClose(got,g_caif_prefix_test_mask_value,
+                            g_caif_prefix_test_mask_tol)==false)
               {
-                std::cout<<"  b="<<b<<" h="<<h<<" r="<<r<<" c="<<c
-                         <<" expected masked got "<<got<<"\n";
+                ISE_Out::Out()<<"  b="
+                              <<b
+                              <<" h="
+                              <<h
+                              <<" r="
+                              <<r
+                              <<" c="
+                              <<c
+                              <<" expected masked got "
+                              <<got
+                              <<"\n";
                 passed=false;
               }
             }
             else
             {
-              if(FloatClose(got,1.0f,1e-5f)==false)
+              if(FloatClose(got,g_caif_prefix_test_scores_init,
+                            g_caif_prefix_test_unmask_tol)==false)
               {
-                std::cout<<"  b="<<b<<" h="<<h<<" r="<<r<<" c="<<c
-                         <<" expected unmodified got "<<got<<"\n";
+                ISE_Out::Out()<<"  b="
+                              <<b
+                              <<" h="
+                              <<h
+                              <<" r="
+                              <<r
+                              <<" c="
+                              <<c
+                              <<" expected unmodified got "
+                              <<got
+                              <<"\n";
                 passed=false;
               }
             }
@@ -314,7 +403,7 @@ static void TestKernelPrefixMaskFill()
         }
       }
     }
-    ReportResult("Prefix::KernelMaskFill",passed);
+    CAIF_TestHarness::Report("Prefix::KernelMaskFill",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::KernelMaskFill")
 }
@@ -322,22 +411,24 @@ static void TestKernelPrefixMaskFill()
 //------------------------------------------------------------------------------
 // Direct kernel: launch_prefix_mask_grad zeros masked positions
 //------------------------------------------------------------------------------
-static void TestKernelPrefixMaskGrad()
+void CAIF_PrefixLMTests::TestKernelPrefixMaskGrad()
 {
   try
   {
-    const int batch=1;
-    const int num_heads=1;
-    const int seq_len=4;
+    const int batch=static_cast<int>(g_caif_prefix_test_grad_batch);
+    const int num_heads=static_cast<int>(g_caif_prefix_test_grad_heads);
+    const int seq_len=static_cast<int>(g_caif_prefix_test_grad_seq);
     const int bh=batch*num_heads;
 
     CAIF_CudaStream stream;
-    std::vector<float> host_grad(bh*seq_len*seq_len,0.7f);
-    CAIF_DeviceTensor grad=CAIF_DeviceTensor::FromHostData(host_grad.data(),
-                                                           {static_cast<uint32_t>(bh),
-                                                            static_cast<uint32_t>(seq_len),
-                                                            static_cast<uint32_t>(seq_len)},
-                                                           stream);
+    std::vector<float> host_grad(static_cast<size_t>(bh*seq_len*seq_len),
+                                 g_caif_prefix_test_grad_init);
+    CAIF_DeviceTensor grad=CAIF_DeviceTensor::FromHostData(
+      host_grad.data(),
+      {static_cast<uint32_t>(bh),
+       static_cast<uint32_t>(seq_len),
+       static_cast<uint32_t>(seq_len)},
+      stream);
 
     std::vector<int32_t> prefix_lens={2};
     CAIF_DeviceTensor prefix=MakePrefixTensor(prefix_lens,stream);
@@ -357,18 +448,29 @@ static void TestKernelPrefixMaskGrad()
     {
       for(int c=0;c<seq_len;++c)
       {
-        const float got=out.Data()[r*seq_len+c];
+        const float got=out.Data()[static_cast<size_t>(r*seq_len+c)];
         const bool should_zero=(c>r && c>=pfx);
-        const float expected=should_zero?0.0f:0.7f;
-        if(FloatClose(got,expected,1e-5f)==false)
+        float expected=0.0f;
+        if(should_zero==false)
         {
-          std::cout<<"  r="<<r<<" c="<<c<<" expected "<<expected
-                   <<" got "<<got<<"\n";
+          expected=g_caif_prefix_test_grad_init;
+        }
+        if(FloatClose(got,expected,g_caif_prefix_test_unmask_tol)==false)
+        {
+          ISE_Out::Out()<<"  r="
+                        <<r
+                        <<" c="
+                        <<c
+                        <<" expected "
+                        <<expected
+                        <<" got "
+                        <<got
+                        <<"\n";
           passed=false;
         }
       }
     }
-    ReportResult("Prefix::KernelMaskGrad",passed);
+    CAIF_TestHarness::Report("Prefix::KernelMaskGrad",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::KernelMaskGrad")
 }
@@ -377,24 +479,23 @@ static void TestKernelPrefixMaskGrad()
 // Flash path: prefix_len=0 for all rows must match pure causal MHA bit-for-bit
 // within fp32 tolerance.
 //------------------------------------------------------------------------------
-static void TestFlashPrefixZeroEqualsCausal()
+void CAIF_PrefixLMTests::TestFlashPrefixZeroEqualsCausal()
 {
   try
   {
-    const uint32_t batch=2;
-    const uint32_t seq_len=8;
-    const uint32_t dim=128;
-    const uint32_t num_heads=4;
+    const uint32_t batch=g_caif_prefix_test_flash_batch;
+    const uint32_t seq_len=g_caif_prefix_test_flash_seq;
+    const uint32_t dim=g_caif_prefix_test_flash_dim;
+    const uint32_t num_heads=g_caif_prefix_test_flash_heads;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
-    auto cfg=MakeConfig(dim,num_heads,true);
-    CAIF_DeviceMultiHeadAttention<float,float> mha(cfg,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(MakeConfig(dim,num_heads,true),stream);
 
-    std::vector<float> host_input(batch*seq_len*dim);
+    std::vector<float> host_input(static_cast<size_t>(batch*seq_len*dim));
     for(size_t i=0;i<host_input.size();++i)
     {
       host_input[i]=static_cast<float>(i%37)*0.013f-0.2f;
@@ -418,16 +519,21 @@ static void TestFlashPrefixZeroEqualsCausal()
     bool passed=true;
     for(size_t i=0;i<h_causal.TotalElements();++i)
     {
-      if(FloatClose(h_causal.Data()[i],h_prefix.Data()[i],5e-4f)==false)
+      if(FloatClose(h_causal.Data()[i],h_prefix.Data()[i],g_caif_prefix_test_fill_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": causal="<<h_causal.Data()[i]
-                 <<" prefix0="<<h_prefix.Data()[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": causal="
+                      <<h_causal.Data()[i]
+                      <<" prefix0="
+                      <<h_prefix.Data()[i]
+                      <<"\n";
         passed=false;
         break;
       }
     }
     ctx.ClearPrefixLengths();
-    ReportResult("Prefix::FlashZeroEqualsCausal",passed);
+    CAIF_TestHarness::Report("Prefix::FlashZeroEqualsCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::FlashZeroEqualsCausal")
 }
@@ -435,14 +541,14 @@ static void TestFlashPrefixZeroEqualsCausal()
 //------------------------------------------------------------------------------
 // Flash path: heterogeneous prefix lengths, compare against CPU reference
 //------------------------------------------------------------------------------
-static void TestFlashPrefixHeterogeneousVsCPU()
+void CAIF_PrefixLMTests::TestFlashPrefixHeterogeneousVsCPU()
 {
   try
   {
-    const uint32_t batch=3;
-    const uint32_t seq_len=8;
-    const uint32_t dim=128;
-    const uint32_t num_heads=4;
+    const uint32_t batch=g_caif_prefix_test_hetero_batch;
+    const uint32_t seq_len=g_caif_prefix_test_hetero_seq;
+    const uint32_t dim=g_caif_prefix_test_hetero_dim;
+    const uint32_t num_heads=g_caif_prefix_test_hetero_heads;
     const uint32_t head_dim=dim/num_heads;
 
     CAIF_CudaStream stream;
@@ -450,15 +556,14 @@ static void TestFlashPrefixHeterogeneousVsCPU()
     ctx.SetStream(stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
-    auto cfg=MakeConfig(dim,num_heads,true);
-    CAIF_DeviceMultiHeadAttention<float,float> mha(cfg,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(MakeConfig(dim,num_heads,true),stream);
 
     CAIF_HostTensor h_wq=mha.ParameterTensor(0).ToHost();
     CAIF_HostTensor h_wk=mha.ParameterTensor(1).ToHost();
     CAIF_HostTensor h_wv=mha.ParameterTensor(2).ToHost();
     CAIF_HostTensor h_wo=mha.ParameterTensor(3).ToHost();
 
-    std::vector<float> host_input(batch*seq_len*dim);
+    std::vector<float> host_input(static_cast<size_t>(batch*seq_len*dim));
     for(size_t i=0;i<host_input.size();++i)
     {
       host_input[i]=static_cast<float>((i*7+3)%41)*0.01f-0.2f;
@@ -467,19 +572,24 @@ static void TestFlashPrefixHeterogeneousVsCPU()
                                                             {batch,seq_len,dim},
                                                             stream);
 
-    std::vector<int32_t> prefix_lens={0,3,seq_len};
+    std::vector<int32_t> prefix_lens={0,3,static_cast<int32_t>(seq_len)};
     CAIF_DeviceTensor prefix=MakePrefixTensor(prefix_lens,stream);
     ctx.SetPrefixLengths(prefix);
 
     CAIF_DeviceTensor gpu_out=mha.Forward(input,ctx);
     CAIF_HostTensor h_gpu=gpu_out.ToHost();
 
-    std::vector<float> expected(batch*seq_len*dim);
-    CpuMHA_Prefix(host_input.data(),
-                  h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
-                  expected.data(),
-                  batch,seq_len,dim,num_heads,head_dim,
-                  true,prefix_lens);
+    std::vector<float> expected(static_cast<size_t>(batch*seq_len*dim));
+    CpuMHAPrefix(host_input.data(),
+                 h_wq.Data(),h_wk.Data(),h_wv.Data(),h_wo.Data(),
+                 expected.data(),
+                 static_cast<int>(batch),
+                 static_cast<int>(seq_len),
+                 static_cast<int>(dim),
+                 static_cast<int>(num_heads),
+                 static_cast<int>(head_dim),
+                 true,
+                 prefix_lens);
 
     bool passed=true;
     float max_diff=0.0f;
@@ -490,19 +600,28 @@ static void TestFlashPrefixHeterogeneousVsCPU()
       {
         max_diff=diff;
       }
-      if(diff>2e-3f)
+      if(diff>g_caif_prefix_test_hetero_tol)
       {
         if(passed==true)
         {
-          std::cout<<"  First mismatch at "<<i<<": gpu="<<h_gpu.Data()[i]
-                   <<" cpu="<<expected[i]<<" diff="<<diff<<"\n";
+          ISE_Out::Out()<<"  First mismatch at "
+                        <<i
+                        <<": gpu="
+                        <<h_gpu.Data()[i]
+                        <<" cpu="
+                        <<expected[i]
+                        <<" diff="
+                        <<diff
+                        <<"\n";
         }
         passed=false;
       }
     }
-    std::cout<<"  max |gpu-cpu|="<<max_diff<<"\n";
+    ISE_Out::Out()<<"  max |gpu-cpu|="
+                  <<max_diff
+                  <<"\n";
     ctx.ClearPrefixLengths();
-    ReportResult("Prefix::FlashHeterogeneousVsCPU",passed);
+    CAIF_TestHarness::Report("Prefix::FlashHeterogeneousVsCPU",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::FlashHeterogeneousVsCPU")
 }
@@ -510,22 +629,21 @@ static void TestFlashPrefixHeterogeneousVsCPU()
 //------------------------------------------------------------------------------
 // Flash backward: finite gradients, none NaN/Inf, with heterogeneous prefix
 //------------------------------------------------------------------------------
-static void TestFlashPrefixBackwardNoNaN()
+void CAIF_PrefixLMTests::TestFlashPrefixBackwardNoNaN()
 {
   try
   {
-    const uint32_t batch=2;
-    const uint32_t seq_len=16;
-    const uint32_t dim=128;
-    const uint32_t num_heads=4;
+    const uint32_t batch=g_caif_prefix_test_bwd_batch;
+    const uint32_t seq_len=g_caif_prefix_test_bwd_seq;
+    const uint32_t dim=g_caif_prefix_test_bwd_dim;
+    const uint32_t num_heads=g_caif_prefix_test_bwd_heads;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    auto cfg=MakeConfig(dim,num_heads,true);
-    CAIF_DeviceMultiHeadAttention<float,float> mha(cfg,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(MakeConfig(dim,num_heads,true),stream);
 
-    std::vector<float> host_input(batch*seq_len*dim);
+    std::vector<float> host_input(static_cast<size_t>(batch*seq_len*dim));
     for(size_t i=0;i<host_input.size();++i)
     {
       host_input[i]=static_cast<float>((i*11+5)%53)*0.009f-0.2f;
@@ -543,7 +661,7 @@ static void TestFlashPrefixBackwardNoNaN()
     CAIF_DeviceTensor out=mha.Forward(input,ctx);
     CAIF_HostTensor h_out=out.ToHost();
 
-    std::vector<float> grad_ones(batch*seq_len*dim,1.0f);
+    std::vector<float> grad_ones(static_cast<size_t>(batch*seq_len*dim),1.0f);
     CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
                                                                {batch,seq_len,dim},
                                                                stream);
@@ -559,7 +677,9 @@ static void TestFlashPrefixBackwardNoNaN()
       std::memcpy(&bits,&h_out.Data()[i],4);
       if((bits&0x7F800000)==0x7F800000)
       {
-        std::cout<<"  Forward: NaN/Inf at "<<i<<"\n";
+        ISE_Out::Out()<<"  Forward: NaN/Inf at "
+                      <<i
+                      <<"\n";
         passed=false;
         break;
       }
@@ -571,7 +691,9 @@ static void TestFlashPrefixBackwardNoNaN()
       std::memcpy(&bits,&h_grad_in.Data()[i],4);
       if((bits&0x7F800000)==0x7F800000)
       {
-        std::cout<<"  grad_input: NaN/Inf at "<<i<<"\n";
+        ISE_Out::Out()<<"  grad_input: NaN/Inf at "
+                      <<i
+                      <<"\n";
         passed=false;
         break;
       }
@@ -586,7 +708,11 @@ static void TestFlashPrefixBackwardNoNaN()
         std::memcpy(&bits,&gp.Data()[i],4);
         if((bits&0x7F800000)==0x7F800000)
         {
-          std::cout<<"  grad_param["<<p<<"]: NaN/Inf at "<<i<<"\n";
+          ISE_Out::Out()<<"  grad_param["
+                        <<p
+                        <<"]: NaN/Inf at "
+                        <<i
+                        <<"\n";
           passed=false;
           break;
         }
@@ -594,7 +720,7 @@ static void TestFlashPrefixBackwardNoNaN()
     }
 
     ctx.ClearPrefixLengths();
-    ReportResult("Prefix::FlashBackwardNoNaN",passed);
+    CAIF_TestHarness::Report("Prefix::FlashBackwardNoNaN",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::FlashBackwardNoNaN")
 }
@@ -602,24 +728,23 @@ static void TestFlashPrefixBackwardNoNaN()
 //------------------------------------------------------------------------------
 // ClearPrefixLengths reverts to pure causal
 //------------------------------------------------------------------------------
-static void TestClearRevertsToCausal()
+void CAIF_PrefixLMTests::TestClearRevertsToCausal()
 {
   try
   {
-    const uint32_t batch=1;
-    const uint32_t seq_len=8;
-    const uint32_t dim=64;
-    const uint32_t num_heads=2;
+    const uint32_t batch=g_caif_prefix_test_clear_batch;
+    const uint32_t seq_len=g_caif_prefix_test_clear_seq;
+    const uint32_t dim=g_caif_prefix_test_clear_dim;
+    const uint32_t num_heads=g_caif_prefix_test_clear_heads;
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
-    auto cfg=MakeConfig(dim,num_heads,true);
-    CAIF_DeviceMultiHeadAttention<float,float> mha(cfg,stream);
+    CAIF_DeviceMultiHeadAttention<float,float> mha(MakeConfig(dim,num_heads,true),stream);
 
-    std::vector<float> host_input(batch*seq_len*dim);
+    std::vector<float> host_input(static_cast<size_t>(batch*seq_len*dim));
     for(size_t i=0;i<host_input.size();++i)
     {
       host_input[i]=static_cast<float>(i%29)*0.02f-0.3f;
@@ -644,7 +769,7 @@ static void TestClearRevertsToCausal()
     bool differed=false;
     for(size_t i=0;i<h_ref.TotalElements();++i)
     {
-      if(FloatClose(h_ref.Data()[i],h_alt.Data()[i],1e-5f)==false)
+      if(FloatClose(h_ref.Data()[i],h_alt.Data()[i],g_caif_prefix_test_unmask_tol)==false)
       {
         differed=true;
         break;
@@ -654,10 +779,15 @@ static void TestClearRevertsToCausal()
     bool restored=true;
     for(size_t i=0;i<h_ref.TotalElements();++i)
     {
-      if(FloatClose(h_ref.Data()[i],h_back.Data()[i],5e-4f)==false)
+      if(FloatClose(h_ref.Data()[i],h_back.Data()[i],g_caif_prefix_test_clear_tol)==false)
       {
-        std::cout<<"  Post-clear mismatch at "<<i<<": causal="<<h_ref.Data()[i]
-                 <<" after-clear="<<h_back.Data()[i]<<"\n";
+        ISE_Out::Out()<<"  Post-clear mismatch at "
+                      <<i
+                      <<": causal="
+                      <<h_ref.Data()[i]
+                      <<" after-clear="
+                      <<h_back.Data()[i]
+                      <<"\n";
         restored=false;
         break;
       }
@@ -665,32 +795,40 @@ static void TestClearRevertsToCausal()
 
     if(differed==false)
     {
-      std::cout<<"  Setting prefix produced identical output as causal — "
-               <<"prefix path may not be taking effect\n";
+      ISE_Out::Out()<<"  Setting prefix produced identical output as causal — "
+                    <<"prefix path may not be taking effect\n";
     }
 
     const bool passed=(differed==true && restored==true);
-    ReportResult("Prefix::ClearRevertsToCausal",passed);
+    CAIF_TestHarness::Report("Prefix::ClearRevertsToCausal",passed);
   }
   CAIF_TEST_CATCH_BLOCK("Prefix::ClearRevertsToCausal")
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_PrefixLMTests::RunAll()
 {
-  std::cout<<"=== Prefix-LM mask tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== Prefix-LM mask tests ==="
+                <<"\n\n";
   TestKernelPrefixMaskFill();
   TestKernelPrefixMaskGrad();
   TestFlashPrefixZeroEqualsCausal();
   TestFlashPrefixHeterogeneousVsCPU();
   TestFlashPrefixBackwardNoNaN();
   TestClearRevertsToCausal();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_PrefixLMTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+                <<"\n";
+  return 0;
+#endif
 }

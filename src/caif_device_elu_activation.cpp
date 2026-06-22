@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_elu_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -30,10 +31,10 @@ void CAIF_DeviceELUActivation<ComputeT,StorageT>::Forward(const CAIF_DeviceTenso
     {
       THROW_CAIFE("CAIF_DeviceELUActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(input.TotalElements());
+    const int64_t n=static_cast<int64_t>(input.TotalElements());
     launch_elu_forward<StorageT>(input.template DevicePtr<StorageT>(),
                                   output.template DevicePtr<StorageT>(),
-                                  _alpha,
+                                  Alpha(),
                                   n,
                                   output.Stream().Handle());
   }
@@ -52,12 +53,12 @@ void CAIF_DeviceELUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTens
     {
       THROW_CAIFE("CAIF_DeviceELUActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
     launch_elu_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
                                    pre_activation.template DevicePtr<StorageT>(),
                                    post_activation.template DevicePtr<StorageT>(),
                                    grad_input.template DevicePtr<StorageT>(),
-                                   _alpha,
+                                   Alpha(),
                                    n,
                                    grad_input.Stream().Handle());
   }
@@ -67,14 +68,14 @@ void CAIF_DeviceELUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTens
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceELUActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_elu;
+  return g_serial_tag_elu;
 }
 
 template<typename ComputeT,typename StorageT>
 std::unique_ptr<CAIF_DeviceActivation>
 CAIF_DeviceELUActivation<ComputeT,StorageT>::Clone()const
 {
-  return std::make_unique<CAIF_DeviceELUActivation<ComputeT,StorageT>>(_alpha);
+  return std::make_unique<CAIF_DeviceELUActivation<ComputeT,StorageT>>(Alpha());
 }
 
 template class CAIF_DeviceELUActivation<float,float>;

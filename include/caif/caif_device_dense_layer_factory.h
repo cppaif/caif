@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_dense_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -28,16 +29,15 @@
 namespace instance
 {
 
-class CAIF_DeviceDenseLayerFactory
+class CAIF_DeviceDenseLayerFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceDenseLayerFactory()=delete;
-    ~CAIF_DeviceDenseLayerFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t input_size,
            uint32_t output_size,
-           CAIF_DeviceActivation_e activation,
+           CAIF_DeviceActivation::CAIF_DeviceActivation_e activation,
            CAIF_CudaStream &stream,
            CAIF_DataType::CAIF_DataType_e compute_dtype,
            CAIF_DataType::CAIF_DataType_e storage_dtype,

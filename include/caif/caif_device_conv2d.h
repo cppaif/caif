@@ -27,6 +27,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_conv2d_config.h"
 #include "caif_data_type.h"
 #include <cstdint>
 #include <string>
@@ -41,17 +42,8 @@ class CAIF_DeviceConv2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
   public:
     typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Base_t;
 
-    struct Config_t
-    {
-      uint32_t in_channels;
-      uint32_t out_channels;
-      uint32_t kernel_height;
-      uint32_t kernel_width;
-      uint32_t stride_height;
-      uint32_t stride_width;
-    };
 
-    CAIF_DeviceConv2D(const Config_t &config,CAIF_CudaStream &stream);
+    CAIF_DeviceConv2D(const CAIF_DeviceConv2DConfig &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceConv2D()override=default;
 
     CAIF_DeviceConv2D(CAIF_DeviceConv2D &&other);
@@ -74,7 +66,8 @@ class CAIF_DeviceConv2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const Config_t &Config()const{return _config;}
+    const CAIF_DeviceConv2DConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceConv2DConfig &c){_config=c;}
 
   public:
     using Base_t::StorageDtype;
@@ -92,12 +85,16 @@ class CAIF_DeviceConv2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     // "Member access via accessors, even from inside the class").
     CAIF_DeviceTensor &Weights(){return _weights;}
     const CAIF_DeviceTensor &Weights()const{return _weights;}
+    void SetWeights(CAIF_DeviceTensor t){_weights=std::move(t);}
     CAIF_DeviceTensor &Bias(){return _bias;}
     const CAIF_DeviceTensor &Bias()const{return _bias;}
+    void SetBias(CAIF_DeviceTensor t){_bias=std::move(t);}
     CAIF_DeviceTensor &WeightsGrad(){return _weights_grad;}
     const CAIF_DeviceTensor &WeightsGrad()const{return _weights_grad;}
+    void SetWeightsGrad(CAIF_DeviceTensor t){_weights_grad=std::move(t);}
     CAIF_DeviceTensor &BiasGrad(){return _bias_grad;}
     const CAIF_DeviceTensor &BiasGrad()const{return _bias_grad;}
+    void SetBiasGrad(CAIF_DeviceTensor t){_bias_grad=std::move(t);}
 
     const std::vector<uint32_t> &CachedInputShape()const{return _cached_input_shape;}
     void SetCachedInputShape(const std::vector<uint32_t> &shape){_cached_input_shape=shape;}
@@ -126,7 +123,7 @@ class CAIF_DeviceConv2D:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     const CAIF_DeviceTensor &BiasGradDevice()const{return _bias_grad_device;}
     void SetBiasGradDevice(CAIF_DeviceTensor &&t){_bias_grad_device=std::move(t);}
 
-    Config_t _config;
+    CAIF_DeviceConv2DConfig _config;
 
     // Canonical host-side weights/bias/grads (HWCK layout for weights, fp32).
     // Used by host fp32 path and by optimizer integration.

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_gelu_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -30,11 +31,21 @@ void CAIF_DeviceGELUActivation<ComputeT,StorageT>::Forward(const CAIF_DeviceTens
     {
       THROW_CAIFE("CAIF_DeviceGELUActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(input.TotalElements());
-    launch_gelu_forward<StorageT>(input.template DevicePtr<StorageT>(),
-                                   output.template DevicePtr<StorageT>(),
-                                   n,
-                                   output.Stream().Handle());
+    const int64_t n=static_cast<int64_t>(input.TotalElements());
+    if(Approx()==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact)
+    {
+      launch_gelu_forward_erf<StorageT>(input.template DevicePtr<StorageT>(),
+                                        output.template DevicePtr<StorageT>(),
+                                        n,
+                                        output.Stream().Handle());
+    }
+    else
+    {
+      launch_gelu_forward<StorageT>(input.template DevicePtr<StorageT>(),
+                                    output.template DevicePtr<StorageT>(),
+                                    n,
+                                    output.Stream().Handle());
+    }
   }
   CAIF_CATCH_BLOCK()
 }
@@ -52,12 +63,23 @@ void CAIF_DeviceGELUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTen
     {
       THROW_CAIFE("CAIF_DeviceGELUActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
-    launch_gelu_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
-                                    pre_activation.template DevicePtr<StorageT>(),
-                                    grad_input.template DevicePtr<StorageT>(),
-                                    n,
-                                    grad_input.Stream().Handle());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
+    if(Approx()==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact)
+    {
+      launch_gelu_backward_erf<StorageT>(grad_output.template DevicePtr<StorageT>(),
+                                         pre_activation.template DevicePtr<StorageT>(),
+                                         grad_input.template DevicePtr<StorageT>(),
+                                         n,
+                                         grad_input.Stream().Handle());
+    }
+    else
+    {
+      launch_gelu_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
+                                     pre_activation.template DevicePtr<StorageT>(),
+                                     grad_input.template DevicePtr<StorageT>(),
+                                     n,
+                                     grad_input.Stream().Handle());
+    }
   }
   CAIF_CATCH_BLOCK()
 }
@@ -65,14 +87,18 @@ void CAIF_DeviceGELUActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTen
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceGELUActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_gelu;
+  if(Approx()==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact)
+  {
+    return g_serial_tag_gelu_exact;
+  }
+  return g_serial_tag_gelu;
 }
 
 template<typename ComputeT,typename StorageT>
 std::unique_ptr<CAIF_DeviceActivation>
 CAIF_DeviceGELUActivation<ComputeT,StorageT>::Clone()const
 {
-  return std::make_unique<CAIF_DeviceGELUActivation<ComputeT,StorageT>>();
+  return std::make_unique<CAIF_DeviceGELUActivation<ComputeT,StorageT>>(Approx());
 }
 
 template class CAIF_DeviceGELUActivation<float,float>;

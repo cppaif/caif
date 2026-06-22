@@ -184,6 +184,13 @@ class CAIF_HostTensor:public CAIF_Base
      */
     explicit CAIF_HostTensor(const std::vector<uint32_t> &shape,bool allocate);
 
+    // Internal accessors — method bodies route through these per
+    // CODING_GUIDELINES.md §Member Access.
+    bool HasData()const{return _data!=nullptr;}
+    void SetTotalElements(const size_t v){_total_elements=v;}
+    void SetSizeBytes(const size_t v){_size_bytes=v;}
+    void SetShape(const std::vector<uint32_t> &v){_shape=v;}
+
     std::unique_ptr<float[]> _data;
     std::vector<uint32_t> _shape;
     size_t _total_elements;

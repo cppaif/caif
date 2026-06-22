@@ -17,6 +17,8 @@
 
 #include "caif_base.h"
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #ifdef USE_CAIF_CUDA
 #include <cuda_runtime_api.h>
@@ -37,6 +39,8 @@ namespace instance
 class CAIF_CudaEvent:public CAIF_Base
 {
   public:
+    typedef std::vector<std::unique_ptr<CAIF_CudaEvent>> PtrVec_t;
+
     /**
      * @brief Construct a new CUDA event
      *
@@ -88,7 +92,11 @@ class CAIF_CudaEvent:public CAIF_Base
   protected:
 
   private:
+    // Internal accessors — method bodies route through these.
+    void SetValid(const bool v){_valid=v;}
 #ifdef USE_CAIF_CUDA
+    void SetEvent(cudaEvent_t v){_event=v;}
+
     cudaEvent_t _event;
 #endif
     bool _valid;

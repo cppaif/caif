@@ -21,6 +21,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_device_positional_encoding.h"
 #include "caif_data_type.h"
@@ -32,16 +33,15 @@
 namespace instance
 {
 
-class CAIF_DevicePositionalEncodingFactory
+class CAIF_DevicePositionalEncodingFactory:public CAIF_Base
 {
   public:
     CAIF_DevicePositionalEncodingFactory()=delete;
-    ~CAIF_DevicePositionalEncodingFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t max_seq_len,
            uint32_t dim,
-           PositionalEncodingMode_e mode,
+           CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e mode,
            CAIF_CudaStream &stream,
            CAIF_DataType::CAIF_DataType_e compute_dtype,
            CAIF_DataType::CAIF_DataType_e storage_dtype);

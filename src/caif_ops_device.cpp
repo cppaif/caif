@@ -21,11 +21,20 @@
 // (caif_ops_host.cpp).
 //------------------------------------------------------------------------------
 #include "caif_ops.h"
+#include "caif_matmul_algo_cache.h"
 #include "caif_constants.h"
 #include "caif_device_context.h"
 #include "caif_device_network.h"
 #include "caif_run_context.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_attention_support.cuh"
+#include "caif_cuda_kernels_embeddings.cuh"
+#include "caif_cuda_kernels_loss.cuh"
+#include "caif_cuda_kernels_moe.cuh"
+#include "caif_cuda_kernels_optimizers.cuh"
+#include "caif_cuda_kernels_quant.cuh"
+#include "caif_cuda_kernels_tensor_ops.cuh"
+#include "caif_cuda_kernels_elementwise.cuh"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_exception.h"
 #include "caif_settings.h"
 #include <cmath>
@@ -42,582 +51,6 @@
 namespace instance
 {
 
-
-#ifdef USE_CAIF_CUDA
-
-// Map CAIF dtype to cuBLAS matrix element type. Throws for dtypes that do not
-// belong on the gemm path (Int8/Int4 weight-only quant dequants first; see
-// CAIF int8/int4 kernel task).
-cudaDataType_t MatrixTypeFor(CAIF_DataType::CAIF_DataType_e dt)
-{
-  switch(dt)
-  {
-    case CAIF_DataType::CAIF_DataType_e::Float32:return CUDA_R_32F;
-    case CAIF_DataType::CAIF_DataType_e::Float16:return CUDA_R_16F;
-    case CAIF_DataType::CAIF_DataType_e::BFloat16:return CUDA_R_16BF;
-    default:break;
-  }
-  THROW_CAIFE("cuBLAS matmul: unsupported dtype (expected fp32/fp16/bf16)");
-}
-
-void RequireMatchingDtype(const CAIF_DeviceTensor &a,
-                          const CAIF_DeviceTensor &b,
-                          const CAIF_DeviceTensor &out,
-                          const char *op)
-{
-  if(a.Dtype()!=b.Dtype()||a.Dtype()!=out.Dtype())
-  {
-    (void)op;
-    THROW_CAIFE("cuBLAS matmul: input/output dtype mismatch");
-  }
-}
-
-//------------------------------------------------------------------------------
-// MatMul algo cache for cublasLt. First call per (op_a, op_b, m, n, k,
-// lda, ldb, ldc, matType, computeType, batch_count, strides) asks cuBLAS-Lt
-// for its top-ranked algo via heuristic and stores it; subsequent calls reuse
-// it directly. Beats cublasGemmEx(CUBLAS_GEMM_DEFAULT) on large GEMMs because
-// Lt's algo catalog is broader and we skip the per-call heuristic lookup.
-//------------------------------------------------------------------------------
-class CAIF_MatMulAlgoCache
-{
-  public:
-    static constexpr int ProbeCandidates(){return _probe_candidates;}
-    static constexpr int ProbeIters(){return _probe_iters;}
-
-    struct Key_t
-    {
-      cublasOperation_t _op_a;
-      cublasOperation_t _op_b;
-      int _m;
-      int _n;
-      int _k;
-      int _lda;
-      int _ldb;
-      int _ldc;
-      cudaDataType_t _mat_type;
-      cublasComputeType_t _compute_type;
-      int _batch_count;
-      long long _stride_a;
-      long long _stride_b;
-      long long _stride_c;
-      uint8_t _epilogue_bias; // 0 = none, 1 = BIAS epilogue active
-
-      bool operator==(const Key_t &o)const
-      {
-        return _op_a==o._op_a&&_op_b==o._op_b
-             &&_m==o._m&&_n==o._n&&_k==o._k
-             &&_lda==o._lda&&_ldb==o._ldb&&_ldc==o._ldc
-             &&_mat_type==o._mat_type&&_compute_type==o._compute_type
-             &&_batch_count==o._batch_count
-             &&_stride_a==o._stride_a
-             &&_stride_b==o._stride_b
-             &&_stride_c==o._stride_c
-             &&_epilogue_bias==o._epilogue_bias;
-      }
-    };
-
-    struct Hasher_t
-    {
-      size_t operator()(const Key_t &k)const
-      {
-        size_t h=static_cast<size_t>(k._op_a);
-        h=h*1315423911u+static_cast<size_t>(k._op_b);
-        h=h*1315423911u+static_cast<size_t>(k._m);
-        h=h*1315423911u+static_cast<size_t>(k._n);
-        h=h*1315423911u+static_cast<size_t>(k._k);
-        h=h*1315423911u+static_cast<size_t>(k._lda);
-        h=h*1315423911u+static_cast<size_t>(k._ldb);
-        h=h*1315423911u+static_cast<size_t>(k._ldc);
-        h=h*1315423911u+static_cast<size_t>(k._mat_type);
-        h=h*1315423911u+static_cast<size_t>(k._compute_type);
-        h=h*1315423911u+static_cast<size_t>(k._batch_count);
-        h=h*1315423911u+static_cast<size_t>(k._stride_a);
-        h=h*1315423911u+static_cast<size_t>(k._stride_b);
-        h=h*1315423911u+static_cast<size_t>(k._stride_c);
-        h=h*1315423911u+static_cast<size_t>(k._epilogue_bias);
-        return h;
-      }
-    };
-
-    typedef std::unordered_map<Key_t,cublasLtMatmulAlgo_t,Hasher_t> CacheMap_t;
-
-    static CAIF_MatMulAlgoCache &Instance()
-    {
-      static CAIF_MatMulAlgoCache s_instance;
-      return s_instance;
-    }
-
-    bool Lookup(const Key_t &k,cublasLtMatmulAlgo_t &out)
-    {
-      std::lock_guard<std::mutex> lk(_mutex);
-      CacheMap_t::const_iterator it=_map.find(k);
-      if(it==_map.end())
-      {
-        return false;
-      }
-      out=it->second;
-      return true;
-    }
-
-    void Store(const Key_t &k,const cublasLtMatmulAlgo_t &algo)
-    {
-      std::lock_guard<std::mutex> lk(_mutex);
-      _map[k]=algo;
-    }
-
-  protected:
-
-  private:
-    CAIF_MatMulAlgoCache()=default;
-    ~CAIF_MatMulAlgoCache()=default;
-    CAIF_MatMulAlgoCache(const CAIF_MatMulAlgoCache &)=delete;
-    CAIF_MatMulAlgoCache &operator=(const CAIF_MatMulAlgoCache &)=delete;
-
-    static constexpr int _probe_candidates=g_caif_matmul_probe_candidates_default;
-    static constexpr int _probe_iters=g_caif_matmul_probe_iters_default;
-
-    CacheMap_t _map;
-    std::mutex _mutex;
-};
-
-// Probe cublasLt's top candidate algos for this op+layout combo, time each on
-// the current stream against real data pointers, and return the fastest.
-// Called once per cache-miss shape; subsequent calls hit the cache and skip
-// probing entirely. Requires beta==0 on the caller (the probe overwrites
-// output multiple times; beta==0 makes the last write the correct answer
-// so no scratch buffer is needed).
-bool ProbeAndCacheBestAlgo(cublasLtHandle_t lt_handle,
-                           cublasLtMatmulDesc_t op_desc,
-                           cublasLtMatrixLayout_t a_desc,
-                           cublasLtMatrixLayout_t b_desc,
-                           cublasLtMatrixLayout_t c_desc,
-                           const void *alpha,
-                           const void *a_data,
-                           const void *b_data,
-                           const void *beta,
-                           void *c_data,
-                           void *workspace,
-                           size_t workspace_size,
-                           cudaStream_t stream,
-                           cublasLtMatmulAlgo_t &best_algo_out)
-{
-  cublasLtMatmulPreference_t pref=nullptr;
-  cublasStatus_t s=cublasLtMatmulPreferenceCreate(&pref);
-  if(s!=CUBLAS_STATUS_SUCCESS)
-  {
-    return false;
-  }
-  cublasLtMatmulPreferenceSetAttribute(pref,
-                                       CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                       &workspace_size,
-                                       sizeof(workspace_size));
-
-  cublasLtMatmulHeuristicResult_t results[CAIF_MatMulAlgoCache::ProbeCandidates()];
-  std::memset(&results,0,sizeof(results));
-  int returned=0;
-  s=cublasLtMatmulAlgoGetHeuristic(lt_handle,
-                                   op_desc,
-                                   a_desc,
-                                   b_desc,
-                                   c_desc,
-                                   c_desc,
-                                   pref,
-                                   CAIF_MatMulAlgoCache::ProbeCandidates(),
-                                   results,
-                                   &returned);
-  cublasLtMatmulPreferenceDestroy(pref);
-  if(s!=CUBLAS_STATUS_SUCCESS||returned<1)
-  {
-    return false;
-  }
-
-  // Rank algos by MIN-of-iters, not SUM/MEAN. A single slow iter (cold
-  // caches, TLB warmup, async scheduler hiccup) can otherwise mask an
-  // algo whose steady-state is best. Matches the peak-of-N rule used by
-  // the benchmark pipeline itself.
-  cudaEvent_t ev_per_iter[2*CAIF_MatMulAlgoCache::ProbeIters()];
-  for(int e=0;e<2*CAIF_MatMulAlgoCache::ProbeIters();++e)
-  {
-    cudaEventCreate(&ev_per_iter[e]);
-  }
-
-  int best_idx=-1;
-  float best_ms=1.0e30f;
-  for(int i=0;i<returned;++i)
-  {
-    if(results[i].state!=CUBLAS_STATUS_SUCCESS)
-    {
-      continue;
-    }
-    cublasStatus_t warm=cublasLtMatmul(lt_handle,
-                                       op_desc,
-                                       alpha,
-                                       a_data,a_desc,
-                                       b_data,b_desc,
-                                       beta,
-                                       c_data,c_desc,
-                                       c_data,c_desc,
-                                       &results[i].algo,
-                                       workspace,workspace_size,
-                                       stream);
-    if(warm!=CUBLAS_STATUS_SUCCESS)
-    {
-      continue;
-    }
-    bool probe_ok=true;
-    for(int iter=0;iter<CAIF_MatMulAlgoCache::ProbeIters();++iter)
-    {
-      cudaEventRecord(ev_per_iter[2*iter],stream);
-      cublasStatus_t rs=cublasLtMatmul(lt_handle,
-                                       op_desc,
-                                       alpha,
-                                       a_data,a_desc,
-                                       b_data,b_desc,
-                                       beta,
-                                       c_data,c_desc,
-                                       c_data,c_desc,
-                                       &results[i].algo,
-                                       workspace,workspace_size,
-                                       stream);
-      cudaEventRecord(ev_per_iter[2*iter+1],stream);
-      if(rs!=CUBLAS_STATUS_SUCCESS)
-      {
-        probe_ok=false;
-        break;
-      }
-    }
-    cudaEventSynchronize(ev_per_iter[2*CAIF_MatMulAlgoCache::ProbeIters()-1]);
-    if(probe_ok==false)
-    {
-      continue;
-    }
-    float min_ms=1.0e30f;
-    for(int iter=0;iter<CAIF_MatMulAlgoCache::ProbeIters();++iter)
-    {
-      float iter_ms=0.0f;
-      cudaEventElapsedTime(&iter_ms,
-                           ev_per_iter[2*iter],
-                           ev_per_iter[2*iter+1]);
-      if(iter_ms<min_ms)
-      {
-        min_ms=iter_ms;
-      }
-    }
-    if(min_ms<best_ms)
-    {
-      best_ms=min_ms;
-      best_idx=i;
-    }
-  }
-
-  for(int e=0;e<2*CAIF_MatMulAlgoCache::ProbeIters();++e)
-  {
-    cudaEventDestroy(ev_per_iter[e]);
-  }
-
-  if(best_idx<0)
-  {
-    return false;
-  }
-  best_algo_out=results[best_idx].algo;
-
-  return true;
-}
-
-// Shared cuBLAS-Lt execution helper: builds op+layout descriptors, looks up
-// the algo in the shape-keyed cache, probes on miss, executes. All matmul
-// variants (Mat, MatBias, MatTransposeA, MatTransposeB, Batched*) share this
-// path so the cache and algo-pick benefit applies uniformly. Args are
-// cuBLAS-Lt-side (caller has already applied the row-major trick: for row-major
-// C = op_A(A) * op_B(B), pass first_ptr=B_ptr with op_a/layout encoding B^T's
-// col-major view, second_ptr=A_ptr with op_b/layout encoding A's col-major
-// view). batch_count==0 means a single gemm (strides ignored).
-cublasStatus_t LtMatMulExecuteCached(cublasLtHandle_t lt_handle,
-                                     cudaStream_t stream,
-                                     cublasOperation_t op_a,
-                                     cublasOperation_t op_b,
-                                     int m,
-                                     int n,
-                                     int k,
-                                     const float *alpha,
-                                     const void *first_ptr,
-                                     int first_rows,
-                                     int first_cols,
-                                     int lda,
-                                     const void *second_ptr,
-                                     int second_rows,
-                                     int second_cols,
-                                     int ldb,
-                                     const float *beta,
-                                     void *c_ptr,
-                                     int ldc,
-                                     int batch_count,
-                                     long long stride_a,
-                                     long long stride_b,
-                                     long long stride_c,
-                                     cudaDataType_t mat_type,
-                                     cublasComputeType_t compute_type,
-                                     const void *bias_ptr,
-                                     void *workspace,
-                                     size_t workspace_size)
-{
-  cublasLtMatmulDesc_t op_desc=nullptr;
-  cublasStatus_t s=cublasLtMatmulDescCreate(&op_desc,compute_type,CUDA_R_32F);
-  if(s!=CUBLAS_STATUS_SUCCESS)
-  {
-    return s;
-  }
-  cublasLtMatmulDescSetAttribute(op_desc,
-                                 CUBLASLT_MATMUL_DESC_TRANSA,
-                                 &op_a,
-                                 sizeof(op_a));
-  cublasLtMatmulDescSetAttribute(op_desc,
-                                 CUBLASLT_MATMUL_DESC_TRANSB,
-                                 &op_b,
-                                 sizeof(op_b));
-  if(bias_ptr!=nullptr)
-  {
-    const cublasLtEpilogue_t epi=CUBLASLT_EPILOGUE_BIAS;
-    cublasLtMatmulDescSetAttribute(op_desc,
-                                   CUBLASLT_MATMUL_DESC_EPILOGUE,
-                                   &epi,
-                                   sizeof(epi));
-    cublasLtMatmulDescSetAttribute(op_desc,
-                                   CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                                   &bias_ptr,
-                                   sizeof(bias_ptr));
-  }
-
-  cublasLtMatrixLayout_t a_desc=nullptr;
-  cublasLtMatrixLayout_t b_desc=nullptr;
-  cublasLtMatrixLayout_t c_desc=nullptr;
-  cublasLtMatrixLayoutCreate(&a_desc,mat_type,first_rows,first_cols,lda);
-  cublasLtMatrixLayoutCreate(&b_desc,mat_type,second_rows,second_cols,ldb);
-  cublasLtMatrixLayoutCreate(&c_desc,mat_type,m,n,ldc);
-
-  if(batch_count>0)
-  {
-    const int32_t bc=batch_count;
-    cublasLtMatrixLayoutSetAttribute(a_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                     &bc,
-                                     sizeof(bc));
-    cublasLtMatrixLayoutSetAttribute(b_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                     &bc,
-                                     sizeof(bc));
-    cublasLtMatrixLayoutSetAttribute(c_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                     &bc,
-                                     sizeof(bc));
-    cublasLtMatrixLayoutSetAttribute(a_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                     &stride_a,
-                                     sizeof(stride_a));
-    cublasLtMatrixLayoutSetAttribute(b_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                     &stride_b,
-                                     sizeof(stride_b));
-    cublasLtMatrixLayoutSetAttribute(c_desc,
-                                     CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                     &stride_c,
-                                     sizeof(stride_c));
-  }
-
-  CAIF_MatMulAlgoCache::Key_t key;
-  key._op_a=op_a;
-  key._op_b=op_b;
-  key._m=m;
-  key._n=n;
-  key._k=k;
-  key._lda=lda;
-  key._ldb=ldb;
-  key._ldc=ldc;
-  key._mat_type=mat_type;
-  key._compute_type=compute_type;
-  key._batch_count=batch_count;
-  key._stride_a=stride_a;
-  key._stride_b=stride_b;
-  key._stride_c=stride_c;
-  key._epilogue_bias=(bias_ptr!=nullptr)?static_cast<uint8_t>(1):static_cast<uint8_t>(0);
-
-  cublasLtMatmulAlgo_t algo;
-  CAIF_MatMulAlgoCache &cache=CAIF_MatMulAlgoCache::Instance();
-  const bool have_cached=cache.Lookup(key,algo);
-
-  cublasStatus_t status=CUBLAS_STATUS_SUCCESS;
-  if(g_caif_matmul_skip_probe==true)
-  {
-    cudaEvent_t ev_s=nullptr;
-    cudaEvent_t ev_e=nullptr;
-    if(g_caif_matmul_trace_enabled==true)
-    {
-      cudaEventCreate(&ev_s);
-      cudaEventCreate(&ev_e);
-      cudaEventRecord(ev_s,stream);
-    }
-    status=cublasLtMatmul(lt_handle,
-                          op_desc,
-                          alpha,
-                          first_ptr,a_desc,
-                          second_ptr,b_desc,
-                          beta,
-                          c_ptr,c_desc,
-                          c_ptr,c_desc,
-                          nullptr,
-                          workspace,workspace_size,
-                          stream);
-    if(g_caif_matmul_trace_enabled==true)
-    {
-      cudaEventRecord(ev_e,stream);
-      cudaEventSynchronize(ev_e);
-      float ms=0.0f;
-      cudaEventElapsedTime(&ms,ev_s,ev_e);
-      const uint64_t flops=2ull*static_cast<uint64_t>(m)
-                              *static_cast<uint64_t>(n)
-                              *static_cast<uint64_t>(k);
-      const double tflops=(static_cast<double>(flops)*g_caif_matmul_tflops_per_flop)
-                          /(static_cast<double>(ms)*g_caif_matmul_seconds_per_ms);
-      std::fprintf(stderr,
-                   "[MM-NOPROBE] m=%d n=%d k=%d ct=%d ws=%zu "
-                   "ms=%.3f tflops=%.2f\n",
-                   m,
-                   n,
-                   k,
-                   static_cast<int>(compute_type),
-                   workspace_size,
-                   static_cast<double>(ms),
-                   tflops);
-      cudaEventDestroy(ev_s);
-      cudaEventDestroy(ev_e);
-    }
-  }
-  else if(have_cached==true)
-  {
-    cudaEvent_t ev_s=nullptr;
-    cudaEvent_t ev_e=nullptr;
-    if(g_caif_matmul_trace_enabled==true)
-    {
-      cudaEventCreate(&ev_s);
-      cudaEventCreate(&ev_e);
-      cudaEventRecord(ev_s,stream);
-    }
-    status=cublasLtMatmul(lt_handle,
-                          op_desc,
-                          alpha,
-                          first_ptr,a_desc,
-                          second_ptr,b_desc,
-                          beta,
-                          c_ptr,c_desc,
-                          c_ptr,c_desc,
-                          &algo,
-                          workspace,workspace_size,
-                          stream);
-    if(g_caif_matmul_trace_enabled==true)
-    {
-      cudaEventRecord(ev_e,stream);
-      cudaEventSynchronize(ev_e);
-      float ms=0.0f;
-      cudaEventElapsedTime(&ms,ev_s,ev_e);
-      const uint64_t flops=2ull*static_cast<uint64_t>(m)
-                              *static_cast<uint64_t>(n)
-                              *static_cast<uint64_t>(k);
-      const double tflops=(static_cast<double>(flops)*g_caif_matmul_tflops_per_flop)
-                          /(static_cast<double>(ms)*g_caif_matmul_seconds_per_ms);
-      const uintptr_t pa=reinterpret_cast<uintptr_t>(first_ptr);
-      const uintptr_t pb=reinterpret_cast<uintptr_t>(second_ptr);
-      const uintptr_t pc=reinterpret_cast<uintptr_t>(c_ptr);
-      const uintptr_t pw=reinterpret_cast<uintptr_t>(workspace);
-      const unsigned int amod=g_caif_matmul_trace_alignment_modulus;
-      std::fprintf(stderr,
-                   "[MM] m=%d n=%d k=%d ct=%d ws=%zu "
-                   "ms=%.3f tflops=%.2f "
-                   "a=%lx(mod%u=%lu) b=%lx(mod%u=%lu) "
-                   "c=%lx(mod%u=%lu) w=%lx(mod%u=%lu)\n",
-                   m,
-                   n,
-                   k,
-                   static_cast<int>(compute_type),
-                   workspace_size,
-                   static_cast<double>(ms),
-                   tflops,
-                   static_cast<unsigned long>(pa),
-                   amod,
-                   static_cast<unsigned long>(pa%amod),
-                   static_cast<unsigned long>(pb),
-                   amod,
-                   static_cast<unsigned long>(pb%amod),
-                   static_cast<unsigned long>(pc),
-                   amod,
-                   static_cast<unsigned long>(pc%amod),
-                   static_cast<unsigned long>(pw),
-                   amod,
-                   static_cast<unsigned long>(pw%amod));
-      cudaEventDestroy(ev_s);
-      cudaEventDestroy(ev_e);
-    }
-  }
-  else
-  {
-    const bool probed=ProbeAndCacheBestAlgo(lt_handle,
-                                            op_desc,
-                                            a_desc,b_desc,c_desc,
-                                            alpha,
-                                            first_ptr,second_ptr,
-                                            beta,
-                                            c_ptr,
-                                            workspace,workspace_size,
-                                            stream,
-                                            algo);
-    if(probed==true)
-    {
-      cache.Store(key,algo);
-      if(g_caif_matmul_trace_enabled==true)
-      {
-        const uint64_t *algo_bytes=reinterpret_cast<const uint64_t*>(algo.data);
-        std::fprintf(stderr,
-                     "[MM-PICK] m=%d n=%d k=%d ct=%d ws=%zu "
-                     "mat_type=%d batch=%d "
-                     "algo[0..3]=%016lx %016lx %016lx %016lx\n",
-                     m,
-                     n,
-                     k,
-                     static_cast<int>(compute_type),
-                     workspace_size,
-                     static_cast<int>(mat_type),
-                     batch_count,
-                     static_cast<unsigned long>(algo_bytes[0]),
-                     static_cast<unsigned long>(algo_bytes[1]),
-                     static_cast<unsigned long>(algo_bytes[2]),
-                     static_cast<unsigned long>(algo_bytes[3]));
-      }
-    }
-    else
-    {
-      // Fallback: no probe-ranked algo available; let cuBLAS-Lt default pick.
-      status=cublasLtMatmul(lt_handle,
-                            op_desc,
-                            alpha,
-                            first_ptr,a_desc,
-                            second_ptr,b_desc,
-                            beta,
-                            c_ptr,c_desc,
-                            c_ptr,c_desc,
-                            nullptr,
-                            workspace,workspace_size,
-                            stream);
-    }
-  }
-
-  cublasLtMatrixLayoutDestroy(c_desc);
-  cublasLtMatrixLayoutDestroy(b_desc);
-  cublasLtMatrixLayoutDestroy(a_desc);
-  cublasLtMatmulDescDestroy(op_desc);
-  return status;
-}
-
-#endif
 
 //------------------------------------------------------------------------------
 // Matrix Operations
@@ -653,13 +86,13 @@ void CAIF_Ops::MatMulDevice(const CAIF_DeviceTensor &a,
     THROW_CAIFE("MatMul: output shape mismatch");
   }
 
-  RequireMatchingDtype(a,b,output,"MatMul");
+  RequireMatchingDtype(a,b,output,g_caif_op_matmul);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   cublasLtHandle_t lt_handle=device_ctx.CublasLtHandle();
   const cudaStream_t stream=output.Stream().Handle();
 
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -671,26 +104,26 @@ void CAIF_Ops::MatMulDevice(const CAIF_DeviceTensor &a,
   // A_ptr second with col-major-view-of-A = A^T (K,M,K), both ops N.
   const float alpha=1.0f;
   const float beta=0.0f;
-  cublasStatus_t status=LtMatMulExecuteCached(lt_handle,
-                                              stream,
-                                              CUBLAS_OP_N,
-                                              CUBLAS_OP_N,
-                                              cols_b,rows_a,cols_a,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              cols_b,cols_a,cols_b,
-                                              a.DeviceDataRaw(),
-                                              cols_a,rows_a,cols_a,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              cols_b,
-                                              0,
-                                              0,0,0,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              use_ws,
-                                              use_ws_size);
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(lt_handle,
+                                                                    stream,
+                                                                    CUBLAS_OP_N,
+                                                                    CUBLAS_OP_N,
+                                                                    cols_b,rows_a,cols_a,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    cols_b,cols_a,cols_b,
+                                                                    a.DeviceDataRaw(),
+                                                                    cols_a,rows_a,cols_a,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    cols_b,
+                                                                    0,
+                                                                    0,0,0,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    use_ws,
+                                                                    use_ws_size);
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt MatMul failed");
@@ -717,7 +150,7 @@ void CAIF_Ops::MatMulBiasDevice(const CAIF_DeviceTensor &a,
   const auto &shape_a=a.Shape();
   const auto &shape_b=b.Shape();
 
-  RequireMatchingDtype(a,b,output,"MatMulBias");
+  RequireMatchingDtype(a,b,output,g_caif_op_matmul_bias);
   if(bias.Dtype()!=a.Dtype())
   {
     THROW_CAIFE("cuBLAS MatMulBias: bias dtype must match matrices");
@@ -730,7 +163,7 @@ void CAIF_Ops::MatMulBiasDevice(const CAIF_DeviceTensor &a,
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   cublasLtHandle_t lt_handle=device_ctx.CublasLtHandle();
 
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -738,26 +171,26 @@ void CAIF_Ops::MatMulBiasDevice(const CAIF_DeviceTensor &a,
   // first=B with col-major (N,K,N), second=A with col-major (K,M,K), both N.
   const float alpha=1.0f;
   const float beta=0.0f;
-  cublasStatus_t status=LtMatMulExecuteCached(lt_handle,
-                                              stream,
-                                              CUBLAS_OP_N,
-                                              CUBLAS_OP_N,
-                                              cols_b,rows_a,cols_a,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              cols_b,cols_a,cols_b,
-                                              a.DeviceDataRaw(),
-                                              cols_a,rows_a,cols_a,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              cols_b,
-                                              0,
-                                              0,0,0,
-                                              mat_type,
-                                              compute_type,
-                                              bias.DeviceDataRaw(),
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(lt_handle,
+                                                                    stream,
+                                                                    CUBLAS_OP_N,
+                                                                    CUBLAS_OP_N,
+                                                                    cols_b,rows_a,cols_a,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    cols_b,cols_a,cols_b,
+                                                                    a.DeviceDataRaw(),
+                                                                    cols_a,rows_a,cols_a,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    cols_b,
+                                                                    0,
+                                                                    0,0,0,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    bias.DeviceDataRaw(),
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt MatMulBias failed");
@@ -812,14 +245,14 @@ void CAIF_Ops::MatMulTransposeADevice(const CAIF_DeviceTensor &a,
     THROW_CAIFE("MatMulTransposeA: output shape mismatch");
   }
 
-  RequireMatchingDtype(a,b,output,"MatMulTransposeA");
+  RequireMatchingDtype(a,b,output,g_caif_op_matmul_transpose_a);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   const cudaStream_t stream=output.Stream().Handle();
 
   const float alpha=1.0f;
   const float beta=0.0f;
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -827,26 +260,26 @@ void CAIF_Ops::MatMulTransposeADevice(const CAIF_DeviceTensor &a,
   // (layout M,K,M). Lt m,n,k = N,M,K. Matches the legacy cublasGemmEx(N,T,...)
   // formulation but routed through the cached-algo path.
   (void)a_cols;(void)b_cols;(void)a_rows;(void)b_rows;
-  cublasStatus_t status=LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
-                                              stream,
-                                              CUBLAS_OP_N,
-                                              CUBLAS_OP_T,
-                                              n,m,k,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              n,k,n,
-                                              a.DeviceDataRaw(),
-                                              m,k,m,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              n,
-                                              0,
-                                              0,0,0,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
+                                                                    stream,
+                                                                    CUBLAS_OP_N,
+                                                                    CUBLAS_OP_T,
+                                                                    n,m,k,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    n,k,n,
+                                                                    a.DeviceDataRaw(),
+                                                                    m,k,m,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    n,
+                                                                    0,
+                                                                    0,0,0,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt MatMulTransposeA failed");
@@ -899,40 +332,40 @@ void CAIF_Ops::MatMulTransposeBDevice(const CAIF_DeviceTensor &a,
     THROW_CAIFE("MatMulTransposeB: output shape mismatch");
   }
 
-  RequireMatchingDtype(a,b,output,"MatMulTransposeB");
+  RequireMatchingDtype(a,b,output,g_caif_op_matmul_transpose_b);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   const cudaStream_t stream=output.Stream().Handle();
 
   const float alpha=1.0f;
   const float beta=0.0f;
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
   // Row-major: C = A * B^T. Lt-side: op_a=T on B (layout K,N,K), op_b=N on A
   // (layout K,M,K). Lt m,n,k = N,M,K.
   (void)a_rows;(void)b_rows;(void)a_cols;(void)b_cols;
-  cublasStatus_t status=LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
-                                              stream,
-                                              CUBLAS_OP_T,
-                                              CUBLAS_OP_N,
-                                              n,m,k,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              k,n,k,
-                                              a.DeviceDataRaw(),
-                                              k,m,k,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              n,
-                                              0,
-                                              0,0,0,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
+                                                                    stream,
+                                                                    CUBLAS_OP_T,
+                                                                    CUBLAS_OP_N,
+                                                                    n,m,k,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    k,n,k,
+                                                                    a.DeviceDataRaw(),
+                                                                    k,m,k,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    n,
+                                                                    0,
+                                                                    0,0,0,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt MatMulTransposeB failed");
@@ -962,14 +395,14 @@ void CAIF_Ops::BatchedMatMulDevice(const CAIF_DeviceTensor &a,
                          const CAIF_DataType::CAIF_DataType_e compute_dtype)
 {
 #ifdef USE_CAIF_CUDA
-  RequireMatchingDtype(a,b,output,"BatchedMatMul");
+  RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   const cudaStream_t stream=output.Stream().Handle();
 
   const float alpha=1.0f;
   const float beta=0.0f;
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -977,26 +410,26 @@ void CAIF_Ops::BatchedMatMulDevice(const CAIF_DeviceTensor &a,
   const long long int stride_b=static_cast<long long int>(k)*n;
   const long long int stride_c=static_cast<long long int>(m)*n;
 
-  cublasStatus_t status=LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
-                                              stream,
-                                              CUBLAS_OP_N,
-                                              CUBLAS_OP_N,
-                                              n,m,k,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              n,k,n,
-                                              a.DeviceDataRaw(),
-                                              k,m,k,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              n,
-                                              batch_count,
-                                              stride_b,stride_a,stride_c,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
+                                                                    stream,
+                                                                    CUBLAS_OP_N,
+                                                                    CUBLAS_OP_N,
+                                                                    n,m,k,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    n,k,n,
+                                                                    a.DeviceDataRaw(),
+                                                                    k,m,k,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    n,
+                                                                    batch_count,
+                                                                    stride_b,stride_a,stride_c,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt BatchedMatMul failed");
@@ -1027,14 +460,14 @@ void CAIF_Ops::BatchedMatMulTransposeADevice(const CAIF_DeviceTensor &a,
 {
 #ifdef USE_CAIF_CUDA
   // C = A^T * B per batch. A[K,M], B[K,N], C[M,N].
-  RequireMatchingDtype(a,b,output,"BatchedMatMulTransposeA");
+  RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul_transpose_a);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   const cudaStream_t stream=output.Stream().Handle();
 
   const float alpha=1.0f;
   const float beta=0.0f;
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -1042,26 +475,26 @@ void CAIF_Ops::BatchedMatMulTransposeADevice(const CAIF_DeviceTensor &a,
   const long long int stride_b=static_cast<long long int>(k)*n;
   const long long int stride_c=static_cast<long long int>(m)*n;
 
-  cublasStatus_t status=LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
-                                              stream,
-                                              CUBLAS_OP_N,
-                                              CUBLAS_OP_T,
-                                              n,m,k,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              n,k,n,
-                                              a.DeviceDataRaw(),
-                                              m,k,m,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              n,
-                                              batch_count,
-                                              stride_b,stride_a,stride_c,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
+                                                                    stream,
+                                                                    CUBLAS_OP_N,
+                                                                    CUBLAS_OP_T,
+                                                                    n,m,k,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    n,k,n,
+                                                                    a.DeviceDataRaw(),
+                                                                    m,k,m,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    n,
+                                                                    batch_count,
+                                                                    stride_b,stride_a,stride_c,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt BatchedMatMulTransposeA failed");
@@ -1092,14 +525,14 @@ void CAIF_Ops::BatchedMatMulTransposeBDevice(const CAIF_DeviceTensor &a,
 {
 #ifdef USE_CAIF_CUDA
   // C = A * B^T per batch. A[M,K], B[N,K], C[M,N].
-  RequireMatchingDtype(a,b,output,"BatchedMatMulTransposeB");
+  RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul_transpose_b);
 
   CAIF_DeviceContext &device_ctx=CAIF_DeviceContext::Instance();
   const cudaStream_t stream=output.Stream().Handle();
 
   const float alpha=1.0f;
   const float beta=0.0f;
-  const cudaDataType_t mat_type=MatrixTypeFor(a.Dtype());
+  const cudaDataType_t mat_type=CAIF_MatMulAlgoCache::MatrixTypeFor(a.Dtype());
   const cublasComputeType_t compute_type=static_cast<cublasComputeType_t>(ctx.ComputeTypeFor(a.Dtype(),
                                                                                              compute_dtype));
 
@@ -1107,26 +540,26 @@ void CAIF_Ops::BatchedMatMulTransposeBDevice(const CAIF_DeviceTensor &a,
   const long long int stride_b=static_cast<long long int>(n)*k;
   const long long int stride_c=static_cast<long long int>(m)*n;
 
-  cublasStatus_t status=LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
-                                              stream,
-                                              CUBLAS_OP_T,
-                                              CUBLAS_OP_N,
-                                              n,m,k,
-                                              &alpha,
-                                              b.DeviceDataRaw(),
-                                              k,n,k,
-                                              a.DeviceDataRaw(),
-                                              k,m,k,
-                                              &beta,
-                                              output.DeviceDataRaw(),
-                                              n,
-                                              batch_count,
-                                              stride_b,stride_a,stride_c,
-                                              mat_type,
-                                              compute_type,
-                                              nullptr,
-                                              device_ctx.CublasLtWorkspace(),
-                                              device_ctx.CublasLtWorkspaceSize());
+  cublasStatus_t status=CAIF_MatMulAlgoCache::LtMatMulExecuteCached(device_ctx.CublasLtHandle(),
+                                                                    stream,
+                                                                    CUBLAS_OP_T,
+                                                                    CUBLAS_OP_N,
+                                                                    n,m,k,
+                                                                    &alpha,
+                                                                    b.DeviceDataRaw(),
+                                                                    k,n,k,
+                                                                    a.DeviceDataRaw(),
+                                                                    k,m,k,
+                                                                    &beta,
+                                                                    output.DeviceDataRaw(),
+                                                                    n,
+                                                                    batch_count,
+                                                                    stride_b,stride_a,stride_c,
+                                                                    mat_type,
+                                                                    compute_type,
+                                                                    nullptr,
+                                                                    device_ctx.CublasLtWorkspace(),
+                                                                    device_ctx.CublasLtWorkspaceSize());
   if(status!=CUBLAS_STATUS_SUCCESS)
   {
     THROW_CAIFE("cublasLt BatchedMatMulTransposeB failed");
@@ -1261,7 +694,7 @@ void CAIF_Ops::AddDevice(const CAIF_DeviceTensor &a,const CAIF_DeviceTensor &b,C
     THROW_CAIFE("Add: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(a.Dtype())
   {
@@ -1300,7 +733,7 @@ void CAIF_Ops::AddDevice(const CAIF_DeviceTensor &a,const CAIF_DeviceTensor &b,C
 void CAIF_Ops::ScaleDevice(CAIF_DeviceTensor &tensor,float scale)
 {
 #ifdef USE_CAIF_CUDA
-  const int n=static_cast<int>(tensor.TotalElements());
+  const int64_t n=static_cast<int64_t>(tensor.TotalElements());
   if(n==0)
   {
     return;
@@ -1340,6 +773,48 @@ void CAIF_Ops::ScaleDevice(CAIF_DeviceTensor &tensor,float scale)
 #endif
 }
 
+void CAIF_Ops::UnscaleCheckInfDevice(CAIF_DeviceTensor &grad,
+                                     float inv_scale,
+                                     CAIF_DeviceTensor &found_inf)
+{
+#ifdef USE_CAIF_CUDA
+  const int64_t n=static_cast<int64_t>(grad.TotalElements());
+  if(n==0)
+  {
+    return;
+  }
+  if(found_inf.Dtype()!=CAIF_DataType::CAIF_DataType_e::Float32)
+  {
+    THROW_CAIFE("UnscaleCheckInf: found_inf must be fp32");
+  }
+  if(found_inf.TotalElements()!=1)
+  {
+    THROW_CAIFE("UnscaleCheckInf: found_inf must have exactly 1 element");
+  }
+  const cudaStream_t stream=grad.Stream().Handle();
+  float *flag=found_inf.DevicePtr<float>();
+  switch(grad.Dtype())
+  {
+    case CAIF_DataType::CAIF_DataType_e::Float32:
+      launch_unscale_check_inf<float>(grad.DevicePtr<float>(),inv_scale,flag,n,stream);
+      break;
+    case CAIF_DataType::CAIF_DataType_e::Float16:
+      launch_unscale_check_inf<__half>(grad.DevicePtr<__half>(),inv_scale,flag,n,stream);
+      break;
+    case CAIF_DataType::CAIF_DataType_e::BFloat16:
+      launch_unscale_check_inf<__nv_bfloat16>(grad.DevicePtr<__nv_bfloat16>(),inv_scale,flag,n,stream);
+      break;
+    default:
+      THROW_CAIFE("UnscaleCheckInf: unsupported grad dtype");
+  }
+#else
+  (void)grad;
+  (void)inv_scale;
+  (void)found_inf;
+  THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
+#endif
+}
+
 void CAIF_Ops::AddScaledDevice(CAIF_DeviceTensor &target,const CAIF_DeviceTensor &source,float scale)
 {
 #ifdef USE_CAIF_CUDA
@@ -1352,7 +827,7 @@ void CAIF_Ops::AddScaledDevice(CAIF_DeviceTensor &target,const CAIF_DeviceTensor
     THROW_CAIFE("AddScaled: target and source dtype must match");
   }
 
-  const int n=static_cast<int>(target.TotalElements());
+  const int64_t n=static_cast<int64_t>(target.TotalElements());
   if(n==0)
   {
     return;
@@ -1439,7 +914,9 @@ void CAIF_Ops::AddScaledDevice(CAIF_DeviceTensor &target,const CAIF_DeviceTensor
 // Bias Operations
 //------------------------------------------------------------------------------
 
-void CAIF_Ops::BiasAddDevice(const CAIF_DeviceTensor &input,const CAIF_DeviceTensor &bias,CAIF_DeviceTensor &output)
+void CAIF_Ops::BiasAddDevice(const CAIF_DeviceTensor &input,
+                             const CAIF_DeviceTensor &bias,
+                             CAIF_DeviceTensor &output)
 {
 #ifdef USE_CAIF_CUDA
   const auto &shape=input.Shape();
@@ -1879,13 +1356,13 @@ void CAIF_Ops::AccumulateRelativePositionBiasGradientDevice(const CAIF_DeviceTen
 }
 
 
-void slice_validate_and_dims(const CAIF_DeviceTensor &input,
-                             const CAIF_DeviceTensor &output,
-                             uint32_t col_start,
-                             const char *op_name,
-                             int &rows,
-                             int &in_cols,
-                             int &out_cols)
+void CAIF_Ops::SliceValidateAndDims(const CAIF_DeviceTensor &input,
+                                    const CAIF_DeviceTensor &output,
+                                    uint32_t col_start,
+                                    const std::string &op_name,
+                                    int &rows,
+                                    int &in_cols,
+                                    int &out_cols)
 {
   const auto &in_shape=input.Shape();
   const auto &out_shape=output.Shape();
@@ -1942,7 +1419,7 @@ void CAIF_Ops::CastDevice(const CAIF_DeviceTensor &input,
 
   (void)ctx;
   cudaStream_t raw_stream=output.Stream().Handle();
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
 
   if(src==dst)
   {
@@ -2062,7 +1539,7 @@ void CAIF_Ops::QuantizeInt8Device(const CAIF_DeviceTensor &input,
     THROW_CAIFE("QuantizeInt8: input/output shape mismatch");
   }
   cudaStream_t stream=output.Stream().Handle();
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
 
   if(scheme==CAIF_Ops::QuantScheme_e::PerTensor_e)
   {
@@ -2129,7 +1606,7 @@ void CAIF_Ops::DequantizeInt8Device(const CAIF_DeviceTensor &input,
     THROW_CAIFE("DequantizeInt8: input/output shape mismatch");
   }
   cudaStream_t stream=output.Stream().Handle();
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
 
   if(scheme==CAIF_Ops::QuantScheme_e::PerTensor_e)
   {
@@ -2195,7 +1672,7 @@ void CAIF_Ops::QuantizeInt4PerGroupDevice(const CAIF_DeviceTensor &input,
   {
     THROW_CAIFE("QuantizeInt4PerGroup: group_size must be > 0");
   }
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const size_t num_groups=(static_cast<size_t>(n)+group_size-1)/group_size;
   if(scales.TotalElements()!=num_groups)
   {
@@ -2242,7 +1719,7 @@ void CAIF_Ops::DequantizeInt4PerGroupDevice(const CAIF_DeviceTensor &input,
   {
     THROW_CAIFE("DequantizeInt4PerGroup: group_size must be > 0");
   }
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   const size_t num_groups=(static_cast<size_t>(n)+group_size-1)/group_size;
   if(scales.TotalElements()!=num_groups)
   {
@@ -2273,7 +1750,7 @@ void CAIF_Ops::SliceLastDimDevice(const CAIF_DeviceTensor &input,
   int rows=0;
   int in_cols=0;
   int out_cols=0;
-  slice_validate_and_dims(input,output,col_start,"SliceLastDim",rows,in_cols,out_cols);
+  SliceValidateAndDims(input,output,col_start,"SliceLastDim",rows,in_cols,out_cols);
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2323,8 +1800,8 @@ void CAIF_Ops::SliceLastDimBackwardDevice(const CAIF_DeviceTensor &grad_output,
   int rows=0;
   int in_cols=0;
   int out_cols=0;
-  slice_validate_and_dims(grad_input,grad_output,col_start,
-                          "SliceLastDimBackward",rows,in_cols,out_cols);
+  SliceValidateAndDims(grad_input,grad_output,col_start,
+                       "SliceLastDimBackward",rows,in_cols,out_cols);
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -2454,7 +1931,7 @@ void CAIF_Ops::ReLUDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outp
   {
     THROW_CAIFE("ReLU: input/output dtype mismatch");
   }
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2497,7 +1974,7 @@ void CAIF_Ops::SigmoidDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &o
   {
     THROW_CAIFE("Sigmoid: input/output dtype mismatch");
   }
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2540,7 +2017,7 @@ void CAIF_Ops::TanhDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outp
   {
     THROW_CAIFE("Tanh: input/output dtype mismatch");
   }
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2645,7 +2122,7 @@ void CAIF_Ops::ReLUBackwardDevice(const CAIF_DeviceTensor &grad_output,
   {
     THROW_CAIFE("ReLUBackward: dtype mismatch");
   }
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2696,7 +2173,7 @@ void CAIF_Ops::SigmoidBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("SigmoidBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -2747,7 +2224,7 @@ void CAIF_Ops::TanhBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("TanhBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -2858,7 +2335,7 @@ void CAIF_Ops::LeakyReLUDevice(const CAIF_DeviceTensor &input,
     THROW_CAIFE("LeakyReLU: input/output dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2902,7 +2379,7 @@ void CAIF_Ops::ELUDevice(const CAIF_DeviceTensor &input,
     THROW_CAIFE("ELU: input/output dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -2932,7 +2409,9 @@ void CAIF_Ops::ELUDevice(const CAIF_DeviceTensor &input,
 #endif
 }
 
-void CAIF_Ops::GELUDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)
+void CAIF_Ops::GELUDevice(const CAIF_DeviceTensor &input,
+                          CAIF_DeviceTensor &output,
+                          const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
 #ifdef USE_CAIF_CUDA
   if(input.TotalElements()!=output.TotalElements())
@@ -2944,24 +2423,52 @@ void CAIF_Ops::GELUDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outp
     THROW_CAIFE("GELU: input/output dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
+  const bool exact=(approx==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact);
   switch(input.Dtype())
   {
     case CAIF_DataType::CAIF_DataType_e::Float32:
-      launch_gelu_forward<float>(input.DevicePtr<float>(),
-                                 output.DevicePtr<float>(),
-                                 n,stream);
+      if(exact==true)
+      {
+        launch_gelu_forward_erf<float>(input.DevicePtr<float>(),
+                                       output.DevicePtr<float>(),
+                                       n,stream);
+      }
+      else
+      {
+        launch_gelu_forward<float>(input.DevicePtr<float>(),
+                                   output.DevicePtr<float>(),
+                                   n,stream);
+      }
       break;
     case CAIF_DataType::CAIF_DataType_e::Float16:
-      launch_gelu_forward<__half>(input.DevicePtr<__half>(),
-                                  output.DevicePtr<__half>(),
-                                  n,stream);
+      if(exact==true)
+      {
+        launch_gelu_forward_erf<__half>(input.DevicePtr<__half>(),
+                                        output.DevicePtr<__half>(),
+                                        n,stream);
+      }
+      else
+      {
+        launch_gelu_forward<__half>(input.DevicePtr<__half>(),
+                                    output.DevicePtr<__half>(),
+                                    n,stream);
+      }
       break;
     case CAIF_DataType::CAIF_DataType_e::BFloat16:
-      launch_gelu_forward<__nv_bfloat16>(input.DevicePtr<__nv_bfloat16>(),
-                                         output.DevicePtr<__nv_bfloat16>(),
-                                         n,stream);
+      if(exact==true)
+      {
+        launch_gelu_forward_erf<__nv_bfloat16>(input.DevicePtr<__nv_bfloat16>(),
+                                               output.DevicePtr<__nv_bfloat16>(),
+                                               n,stream);
+      }
+      else
+      {
+        launch_gelu_forward<__nv_bfloat16>(input.DevicePtr<__nv_bfloat16>(),
+                                           output.DevicePtr<__nv_bfloat16>(),
+                                           n,stream);
+      }
       break;
     default:
       THROW_CAIFE("GELU: unsupported dtype");
@@ -2969,6 +2476,7 @@ void CAIF_Ops::GELUDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outp
 #else
   (void)input;
   (void)output;
+  (void)approx;
   THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif
 }
@@ -2985,7 +2493,7 @@ void CAIF_Ops::SwishDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &out
     THROW_CAIFE("Swish: input/output dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(input.Dtype())
   {
@@ -3030,7 +2538,7 @@ void CAIF_Ops::LeakyReLUBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("LeakyReLUBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -3083,7 +2591,7 @@ void CAIF_Ops::ELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("ELUBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -3122,8 +2630,9 @@ void CAIF_Ops::ELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
 }
 
 void CAIF_Ops::GELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
-                  const CAIF_DeviceTensor &input,
-                  CAIF_DeviceTensor &grad_input)
+                                  const CAIF_DeviceTensor &input,
+                                  CAIF_DeviceTensor &grad_input,
+                                  const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
 #ifdef USE_CAIF_CUDA
   if(grad_output.TotalElements()!=input.TotalElements()||
@@ -3136,27 +2645,58 @@ void CAIF_Ops::GELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("GELUBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
+  const bool exact=(approx==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact);
   switch(grad_output.Dtype())
   {
     case CAIF_DataType::CAIF_DataType_e::Float32:
-      launch_gelu_backward<float>(grad_output.DevicePtr<float>(),
-                                  input.DevicePtr<float>(),
-                                  grad_input.DevicePtr<float>(),
-                                  n,stream);
+      if(exact==true)
+      {
+        launch_gelu_backward_erf<float>(grad_output.DevicePtr<float>(),
+                                        input.DevicePtr<float>(),
+                                        grad_input.DevicePtr<float>(),
+                                        n,stream);
+      }
+      else
+      {
+        launch_gelu_backward<float>(grad_output.DevicePtr<float>(),
+                                    input.DevicePtr<float>(),
+                                    grad_input.DevicePtr<float>(),
+                                    n,stream);
+      }
       break;
     case CAIF_DataType::CAIF_DataType_e::Float16:
-      launch_gelu_backward<__half>(grad_output.DevicePtr<__half>(),
-                                   input.DevicePtr<__half>(),
-                                   grad_input.DevicePtr<__half>(),
-                                   n,stream);
+      if(exact==true)
+      {
+        launch_gelu_backward_erf<__half>(grad_output.DevicePtr<__half>(),
+                                         input.DevicePtr<__half>(),
+                                         grad_input.DevicePtr<__half>(),
+                                         n,stream);
+      }
+      else
+      {
+        launch_gelu_backward<__half>(grad_output.DevicePtr<__half>(),
+                                     input.DevicePtr<__half>(),
+                                     grad_input.DevicePtr<__half>(),
+                                     n,stream);
+      }
       break;
     case CAIF_DataType::CAIF_DataType_e::BFloat16:
-      launch_gelu_backward<__nv_bfloat16>(grad_output.DevicePtr<__nv_bfloat16>(),
-                                          input.DevicePtr<__nv_bfloat16>(),
-                                          grad_input.DevicePtr<__nv_bfloat16>(),
-                                          n,stream);
+      if(exact==true)
+      {
+        launch_gelu_backward_erf<__nv_bfloat16>(grad_output.DevicePtr<__nv_bfloat16>(),
+                                                input.DevicePtr<__nv_bfloat16>(),
+                                                grad_input.DevicePtr<__nv_bfloat16>(),
+                                                n,stream);
+      }
+      else
+      {
+        launch_gelu_backward<__nv_bfloat16>(grad_output.DevicePtr<__nv_bfloat16>(),
+                                            input.DevicePtr<__nv_bfloat16>(),
+                                            grad_input.DevicePtr<__nv_bfloat16>(),
+                                            n,stream);
+      }
       break;
     default:
       THROW_CAIFE("GELUBackward: unsupported dtype");
@@ -3165,6 +2705,7 @@ void CAIF_Ops::GELUBackwardDevice(const CAIF_DeviceTensor &grad_output,
   (void)grad_output;
   (void)input;
   (void)grad_input;
+  (void)approx;
   THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
 #endif
 }
@@ -3187,7 +2728,7 @@ void CAIF_Ops::SwishBackwardDevice(const CAIF_DeviceTensor &grad_output,
     THROW_CAIFE("SwishBackward: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   const cudaStream_t stream=grad_input.Stream().Handle();
   switch(grad_output.Dtype())
   {
@@ -3231,7 +2772,7 @@ void CAIF_Ops::SwishBackwardDevice(const CAIF_DeviceTensor &grad_output,
 float CAIF_Ops::ReduceSumDevice(const CAIF_DeviceTensor &tensor)
 {
 #ifdef USE_CAIF_CUDA
-  const int n=static_cast<int>(tensor.TotalElements());
+  const int64_t n=static_cast<int64_t>(tensor.TotalElements());
   if(n==0)
   {
     return 0.0f;
@@ -3303,7 +2844,9 @@ float CAIF_Ops::ReduceMeanDevice(const CAIF_DeviceTensor &tensor)
 // Loss Functions
 //------------------------------------------------------------------------------
 
-void CAIF_Ops::MSELossDevice(const CAIF_DeviceTensor &pred,const CAIF_DeviceTensor &target,CAIF_DeviceTensor &loss)
+void CAIF_Ops::MSELossDevice(const CAIF_DeviceTensor &pred,
+                             const CAIF_DeviceTensor &target,
+                             CAIF_DeviceTensor &loss)
 {
 #ifdef USE_CAIF_CUDA
   if(pred.TotalElements()!=target.TotalElements())
@@ -3319,7 +2862,7 @@ void CAIF_Ops::MSELossDevice(const CAIF_DeviceTensor &pred,const CAIF_DeviceTens
     THROW_CAIFE("MSELoss: pred and target dtype must match");
   }
 
-  const int n=static_cast<int>(pred.TotalElements());
+  const int64_t n=static_cast<int64_t>(pred.TotalElements());
   // Loss scalar is always fp32; pred/target carry their declared storage.
   float *loss_ptr=loss.DevicePtr<float>();
   const cudaStream_t stream=loss.Stream().Handle();
@@ -3372,7 +2915,7 @@ void CAIF_Ops::MSELossBackwardDevice(const CAIF_DeviceTensor &pred,
     THROW_CAIFE("MSELossBackward: pred/target/grad dtype must match");
   }
 
-  const int n=static_cast<int>(pred.TotalElements());
+  const int64_t n=static_cast<int64_t>(pred.TotalElements());
   const cudaStream_t stream=grad.Stream().Handle();
   switch(pred.Dtype())
   {
@@ -3431,7 +2974,7 @@ void CAIF_Ops::AdamUpdateDevice(CAIF_DeviceTensor &param,
     THROW_CAIFE("AdamUpdate: tensor size mismatch");
   }
 
-  const int n=static_cast<int>(param.TotalElements());
+  const int64_t n=static_cast<int64_t>(param.TotalElements());
   if(n==0)
   {
     return;
@@ -3507,7 +3050,7 @@ void CAIF_Ops::MultiplyDevice(const CAIF_DeviceTensor &a,const CAIF_DeviceTensor
     THROW_CAIFE("Multiply: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   const cudaStream_t stream=output.Stream().Handle();
   switch(a.Dtype())
   {
@@ -3555,7 +3098,7 @@ void CAIF_Ops::ScaleDevice(const CAIF_DeviceTensor &input,float scale,CAIF_Devic
     THROW_CAIFE("Scale: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3619,7 +3162,7 @@ void CAIF_Ops::SiLUBackwardDevice(const CAIF_DeviceTensor &input,
     THROW_CAIFE("SiLUBackward: tensor size mismatch");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
 
   // SiLU == Swish. The templated swish_backward needs the post-activation
   // output as its third argument; recompute it here via swish_forward into
@@ -3676,7 +3219,9 @@ void CAIF_Ops::SiLUBackwardDevice(const CAIF_DeviceTensor &input,
 #endif
 }
 
-void CAIF_Ops::AddBiasDevice(const CAIF_DeviceTensor &input,const CAIF_DeviceTensor &bias,CAIF_DeviceTensor &output)
+void CAIF_Ops::AddBiasDevice(const CAIF_DeviceTensor &input,
+                             const CAIF_DeviceTensor &bias,
+                             CAIF_DeviceTensor &output)
 {
 #ifdef USE_CAIF_CUDA
   BiasAddDevice(input,bias,output);
@@ -3700,7 +3245,7 @@ void CAIF_Ops::AddScalarDevice(const CAIF_DeviceTensor &input,float scalar,CAIF_
     THROW_CAIFE("AddScalar: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3753,7 +3298,7 @@ void CAIF_Ops::SubtractDevice(const CAIF_DeviceTensor &a,const CAIF_DeviceTensor
     THROW_CAIFE("Subtract: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3806,7 +3351,7 @@ void CAIF_Ops::SubtractScalarDevice(const CAIF_DeviceTensor &input,float scalar,
     THROW_CAIFE("SubtractScalar: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3859,7 +3404,7 @@ void CAIF_Ops::DivideDevice(const CAIF_DeviceTensor &a,const CAIF_DeviceTensor &
     THROW_CAIFE("Divide: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3912,7 +3457,7 @@ void CAIF_Ops::DivideScalarDevice(const CAIF_DeviceTensor &input,float scalar,CA
     THROW_CAIFE("DivideScalar: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -3965,7 +3510,7 @@ void CAIF_Ops::SqrtDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outp
     THROW_CAIFE("Sqrt: tensor dtype mismatch");
   }
 
-  const int n=static_cast<int>(output.TotalElements());
+  const int64_t n=static_cast<int64_t>(output.TotalElements());
   if(n==0)
   {
     return;
@@ -4117,7 +3662,7 @@ void CAIF_Ops::SumDevice(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outpu
     THROW_CAIFE("Sum: output must have exactly 1 element");
   }
 
-  const int n=static_cast<int>(input.TotalElements());
+  const int64_t n=static_cast<int64_t>(input.TotalElements());
   // Reduction always accumulates into fp32 to avoid fp16/bf16 overflow.
   // The kernel writes 4 bytes (fp32). If the caller's `output` tensor is
   // bf16 / fp16 (2 bytes), reinterpreting its buffer as `float*` overruns
@@ -5044,6 +4589,94 @@ void CAIF_Ops::MoEZLossGradAddDevice(const CAIF_DeviceTensor &logsumexp_scaled,
 #endif
 }
 
+void CAIF_Ops::MoEGroupMask(CAIF_DeviceTensor &selection,uint32_t n_group,uint32_t topk_group)
+{
+#ifdef USE_CAIF_CUDA
+  const auto &shape=selection.Shape();
+  if(shape.size()!=2)
+  {
+    THROW_CAIFE("MoEGroupMask: selection must be 2D [num_tokens x num_experts]");
+  }
+  if(n_group==0||shape[1]%n_group!=0)
+  {
+    THROW_CAIFE("MoEGroupMask: num_experts must be divisible by n_group");
+  }
+  if(topk_group==0||topk_group>n_group)
+  {
+    THROW_CAIFE("MoEGroupMask: topk_group must be in [1, n_group]");
+  }
+  typedef CAIF_DataType::CAIF_DataType_e Dtype_e;
+  const Dtype_e dt=selection.Dtype();
+  const int num_tokens=static_cast<int>(shape[0]);
+  const int num_experts=static_cast<int>(shape[1]);
+  const int groups=static_cast<int>(n_group);
+  const int top_groups=static_cast<int>(topk_group);
+  cudaStream_t stream=selection.Stream().Handle();
+  if(dt==Dtype_e::Float32)
+  {
+    launch_moe_group_mask<float>(selection.DevicePtr<float>(),num_tokens,num_experts,groups,top_groups,stream);
+  }
+  else if(dt==Dtype_e::Float16)
+  {
+    launch_moe_group_mask<__half>(selection.DevicePtr<__half>(),num_tokens,num_experts,groups,top_groups,stream);
+  }
+  else if(dt==Dtype_e::BFloat16)
+  {
+    launch_moe_group_mask<__nv_bfloat16>(selection.DevicePtr<__nv_bfloat16>(),
+                                         num_tokens,
+                                         num_experts,
+                                         groups,
+                                         top_groups,
+                                         stream);
+  }
+  else
+  {
+    THROW_CAIFE("MoEGroupMask: unsupported selection dtype");
+  }
+#else
+  (void)selection;
+  (void)n_group;
+  (void)topk_group;
+  THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
+#endif
+}
+
+void CAIF_Ops::MoEBiasUpdate(CAIF_DeviceTensor &bias,const CAIF_DeviceTensor &expert_counts,float rate)
+{
+#ifdef USE_CAIF_CUDA
+  if(expert_counts.TotalElements()!=bias.TotalElements())
+  {
+    THROW_CAIFE("MoEBiasUpdate: expert_counts must match bias length");
+  }
+  typedef CAIF_DataType::CAIF_DataType_e Dtype_e;
+  const Dtype_e dt=bias.Dtype();
+  const int num_experts=static_cast<int>(bias.TotalElements());
+  const int *counts=expert_counts.DevicePtr<int32_t>();
+  cudaStream_t stream=bias.Stream().Handle();
+  if(dt==Dtype_e::Float32)
+  {
+    launch_moe_bias_update<float>(bias.DevicePtr<float>(),counts,num_experts,rate,stream);
+  }
+  else if(dt==Dtype_e::Float16)
+  {
+    launch_moe_bias_update<__half>(bias.DevicePtr<__half>(),counts,num_experts,rate,stream);
+  }
+  else if(dt==Dtype_e::BFloat16)
+  {
+    launch_moe_bias_update<__nv_bfloat16>(bias.DevicePtr<__nv_bfloat16>(),counts,num_experts,rate,stream);
+  }
+  else
+  {
+    THROW_CAIFE("MoEBiasUpdate: unsupported bias dtype");
+  }
+#else
+  (void)bias;
+  (void)expert_counts;
+  (void)rate;
+  THROW_CAIFE("CUDA support not built (USE_CAIF_CUDA not defined)");
+#endif
+}
+
 void CAIF_Ops::MoECountPerExpertDevice(const CAIF_DeviceTensor &expert_indices,
                        uint32_t num_experts,
                        uint32_t top_k,
@@ -5533,7 +5166,7 @@ void CAIF_Ops::SgdUpdateDevice(CAIF_DeviceTensor &param,
   {
     THROW_CAIFE("SgdUpdate: tensor size mismatch");
   }
-  const int n=static_cast<int>(param.TotalElements());
+  const int64_t n=static_cast<int64_t>(param.TotalElements());
   if(n==0)
   {
     return;
@@ -5583,7 +5216,7 @@ void CAIF_Ops::MomentumUpdateDevice(CAIF_DeviceTensor &param,
   {
     THROW_CAIFE("MomentumUpdate: tensor size mismatch");
   }
-  const int n=static_cast<int>(param.TotalElements());
+  const int64_t n=static_cast<int64_t>(param.TotalElements());
   if(n==0)
   {
     return;
@@ -5642,7 +5275,7 @@ void CAIF_Ops::RmspropUpdateDevice(CAIF_DeviceTensor &param,
   {
     THROW_CAIFE("RmspropUpdate: tensor size mismatch");
   }
-  const int n=static_cast<int>(param.TotalElements());
+  const int64_t n=static_cast<int64_t>(param.TotalElements());
   if(n==0)
   {
     return;
@@ -5701,7 +5334,7 @@ void CAIF_Ops::AdaGradUpdateDevice(CAIF_DeviceTensor &param,
   {
     THROW_CAIFE("AdaGradUpdate: tensor size mismatch");
   }
-  const int n=static_cast<int>(param.TotalElements());
+  const int64_t n=static_cast<int64_t>(param.TotalElements());
   if(n==0)
   {
     return;

@@ -12,46 +12,108 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//------------------------------------------------------------------------------
+// CAIF - AI Framework
+// Test: Flash attention backward NaN/Inf checks across GQA configs.
+//------------------------------------------------------------------------------
 #include "caif_device_multi_head_attention.h"
 #include "caif_test_harness.h"
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
 #include "caif_constants.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
 #include <vector>
 #include <cstring>
 #include <cmath>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
 #ifdef USE_CAIF_CUDA
 
 //------------------------------------------------------------------------------
 // Bitwise NaN/Inf check safe with -ffast-math (host code)
 //------------------------------------------------------------------------------
-struct NanCheckResult_t
+struct CAIF_NanCheckResult_t
 {
-  uint32_t nan_count;
-  uint32_t inf_count;
-  uint32_t total;
-  float min_val;
-  float max_val;
+  public:
+    CAIF_NanCheckResult_t():_nan_count(0),
+                            _inf_count(0),
+                            _total(0),
+                            _min_val(1e30f),
+                            _max_val(-1e30f)
+    {
+    }
+
+    uint32_t NanCount()const{return _nan_count;}
+    uint32_t InfCount()const{return _inf_count;}
+    uint32_t Total()const{return _total;}
+    float MinVal()const{return _min_val;}
+    float MaxVal()const{return _max_val;}
+    void SetNanCount(const uint32_t v){_nan_count=v;}
+    void SetInfCount(const uint32_t v){_inf_count=v;}
+    void SetTotal(const uint32_t v){_total=v;}
+    void SetMinVal(const float v){_min_val=v;}
+    void SetMaxVal(const float v){_max_val=v;}
+    void IncrNanCount(){++_nan_count;}
+    void IncrInfCount(){++_inf_count;}
+
+  private:
+    uint32_t _nan_count;
+    uint32_t _inf_count;
+    uint32_t _total;
+    float _min_val;
+    float _max_val;
 };
 
-static NanCheckResult_t BitwiseNanCheck(const float *data,const uint32_t count)
+//------------------------------------------------------------------------------
+// MHA backward NaN/Inf correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_FlashAttnBackwardNanTests
 {
-  NanCheckResult_t result;
-  result.nan_count=0;
-  result.inf_count=0;
-  result.total=count;
-  result.min_val=1e30f;
-  result.max_val=-1e30f;
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static CAIF_NanCheckResult_t BitwiseNanCheck(const float *data,const uint32_t count);
+    static void FillDeterministic(float *data,
+                                  const uint32_t count,
+                                  const float lo,
+                                  const float hi,
+                                  const uint32_t seed);
+    static CAIF_DeviceMultiHeadAttentionConfig MakeQwenConfig(
+                                                                           const uint32_t dim,
+                                                                           const uint32_t num_heads,
+                                                                           const uint32_t num_kv_heads,
+                                                                           const uint32_t head_dim);
+    static bool RunMHABackwardNanCheck(const char *test_label,
+                                       const uint32_t dim,
+                                       const uint32_t num_heads,
+                                       const uint32_t num_kv_heads,
+                                       const uint32_t head_dim,
+                                       const uint32_t batch,
+                                       const uint32_t seq_len,
+                                       const float input_lo,
+                                       const float input_hi,
+                                       const uint32_t seed);
+
+    static void TestSmallGQA();
+    static void TestMediumGQA();
+    static void TestQwenShortSeq();
+    static void TestQwenFullSeq();
+    static void TestQwenLargeInputs();
+    static void TestQwenMultipleSeeds();
+    static void TestMHAFullHeads();
+};
+
+CAIF_NanCheckResult_t CAIF_FlashAttnBackwardNanTests::BitwiseNanCheck(const float *data,
+                                                                        const uint32_t count)
+{
+  CAIF_NanCheckResult_t result;
+  result.SetTotal(count);
 
   for(uint32_t i=0;i<count;++i)
   {
@@ -64,22 +126,22 @@ static NanCheckResult_t BitwiseNanCheck(const float *data,const uint32_t count)
     {
       if(mantissa!=0)
       {
-        ++result.nan_count;
+        result.IncrNanCount();
       }
       else
       {
-        ++result.inf_count;
+        result.IncrInfCount();
       }
     }
     else
     {
-      if(data[i]<result.min_val)
+      if(data[i]<result.MinVal())
       {
-        result.min_val=data[i];
+        result.SetMinVal(data[i]);
       }
-      if(data[i]>result.max_val)
+      if(data[i]>result.MaxVal())
       {
-        result.max_val=data[i];
+        result.SetMaxVal(data[i]);
       }
     }
   }
@@ -87,14 +149,11 @@ static NanCheckResult_t BitwiseNanCheck(const float *data,const uint32_t count)
   return result;
 }
 
-//------------------------------------------------------------------------------
-// Fill buffer with deterministic pseudo-random data in [lo, hi]
-//------------------------------------------------------------------------------
-static void FillDeterministic(float *data,
-                              const uint32_t count,
-                              const float lo,
-                              const float hi,
-                              const uint32_t seed)
+void CAIF_FlashAttnBackwardNanTests::FillDeterministic(float *data,
+                                                        const uint32_t count,
+                                                        const float lo,
+                                                        const float hi,
+                                                        const uint32_t seed)
 {
   uint32_t state=seed;
   const float range=hi-lo;
@@ -107,24 +166,20 @@ static void FillDeterministic(float *data,
   }
 }
 
-//------------------------------------------------------------------------------
-// Helper: create GQA config matching Qwen2.5-Coder-1.5B
-//------------------------------------------------------------------------------
-static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeQwenConfig(
-  const uint32_t dim,
-  const uint32_t num_heads,
-  const uint32_t num_kv_heads,
-  const uint32_t head_dim)
+CAIF_DeviceMultiHeadAttentionConfig
+CAIF_FlashAttnBackwardNanTests::MakeQwenConfig(const uint32_t dim,
+                                                const uint32_t num_heads,
+                                                const uint32_t num_kv_heads,
+                                                const uint32_t head_dim)
 {
-  CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t config;
-  config.dim=dim;
-  config.num_heads=num_heads;
-  config.num_kv_heads=num_kv_heads;
-  config.head_dim=head_dim;
-  config.causal=true;
-  config.use_rope=true;
-  config.rope_base=g_caif_rope_default_base;
-  config.dropout_rate=0.0f;
+  CAIF_DeviceMultiHeadAttentionConfig config(dim,
+                                             num_heads,
+                                             num_kv_heads,
+                                             head_dim,
+                                             true,
+                                             true,
+                                             g_caif_rope_default_base,
+                                             0.0f);
   return config;
 }
 
@@ -132,16 +187,16 @@ static CAIF_DeviceMultiHeadAttention<float,float>::AttentionConfig_t MakeQwenCon
 // Run MHA forward+backward, check all gradients for NaN
 // Returns true if NaN-free, false if NaN found
 //------------------------------------------------------------------------------
-static bool RunMHABackwardNanCheck(const char *test_label,
-                                   const uint32_t dim,
-                                   const uint32_t num_heads,
-                                   const uint32_t num_kv_heads,
-                                   const uint32_t head_dim,
-                                   const uint32_t batch,
-                                   const uint32_t seq_len,
-                                   const float input_lo,
-                                   const float input_hi,
-                                   const uint32_t seed)
+bool CAIF_FlashAttnBackwardNanTests::RunMHABackwardNanCheck(const char *test_label,
+                                                             const uint32_t dim,
+                                                             const uint32_t num_heads,
+                                                             const uint32_t num_kv_heads,
+                                                             const uint32_t head_dim,
+                                                             const uint32_t batch,
+                                                             const uint32_t seq_len,
+                                                             const float input_lo,
+                                                             const float input_hi,
+                                                             const uint32_t seed)
 {
   CAIF_CudaStream stream;
   CAIF_RunContext ctx;
@@ -149,13 +204,25 @@ static bool RunMHABackwardNanCheck(const char *test_label,
   auto config=MakeQwenConfig(dim,num_heads,num_kv_heads,head_dim);
   CAIF_DeviceMultiHeadAttention<float,float> mha(config,stream);
 
-  std::cout<<"  "<<test_label<<": dim="<<dim
-           <<" heads="<<num_heads
-           <<" kv_heads="<<num_kv_heads
-           <<" head_dim="<<head_dim
-           <<" batch="<<batch
-           <<" seq="<<seq_len
-           <<" input=["<<input_lo<<","<<input_hi<<"]\n";
+  ISE_Out::Out()<<"  "
+                <<test_label
+                <<": dim="
+                <<dim
+                <<" heads="
+                <<num_heads
+                <<" kv_heads="
+                <<num_kv_heads
+                <<" head_dim="
+                <<head_dim
+                <<" batch="
+                <<batch
+                <<" seq="
+                <<seq_len
+                <<" input=["
+                <<input_lo
+                <<","
+                <<input_hi
+                <<"]\n";
 
   // Create input data
   const uint32_t input_elems=batch*seq_len*dim;
@@ -163,8 +230,8 @@ static bool RunMHABackwardNanCheck(const char *test_label,
   FillDeterministic(host_input.data(),input_elems,input_lo,input_hi,seed);
 
   CAIF_DeviceTensor input=CAIF_DeviceTensor::FromHostData(host_input.data(),
-                                                        {batch,seq_len,dim},
-                                                        stream);
+                                                          {batch,seq_len,dim},
+                                                          stream);
 
   // Forward with training=true
   ctx.SetTraining(true);
@@ -173,42 +240,55 @@ static bool RunMHABackwardNanCheck(const char *test_label,
 
   // Check forward output
   CAIF_HostTensor h_output=output.ToHost();
-  NanCheckResult_t fwd_check=BitwiseNanCheck(h_output.Data(),
-                                              h_output.TotalElements());
-  if(fwd_check.nan_count>0||fwd_check.inf_count>0)
+  CAIF_NanCheckResult_t fwd_check=BitwiseNanCheck(h_output.Data(),
+                                                   h_output.TotalElements());
+  if(fwd_check.NanCount()>0 || fwd_check.InfCount()>0)
   {
-    std::cout<<"  Forward output: nan="<<fwd_check.nan_count
-             <<" inf="<<fwd_check.inf_count
-             <<" / "<<fwd_check.total
-             <<" min="<<fwd_check.min_val
-             <<" max="<<fwd_check.max_val<<"\n";
+    ISE_Out::Out()<<"  Forward output: nan="
+                  <<fwd_check.NanCount()
+                  <<" inf="
+                  <<fwd_check.InfCount()
+                  <<" / "
+                  <<fwd_check.Total()
+                  <<" min="
+                  <<fwd_check.MinVal()
+                  <<" max="
+                  <<fwd_check.MaxVal()
+                  <<"\n";
   }
   else
   {
-    std::cout<<"  Forward output OK: min="<<fwd_check.min_val
-             <<" max="<<fwd_check.max_val<<"\n";
+    ISE_Out::Out()<<"  Forward output OK: min="
+                  <<fwd_check.MinVal()
+                  <<" max="
+                  <<fwd_check.MaxVal()
+                  <<"\n";
   }
 
   // Backward with grad_output = ones
   std::vector<float> grad_ones(input_elems,1.0f);
   CAIF_DeviceTensor grad_out=CAIF_DeviceTensor::FromHostData(grad_ones.data(),
-                                                           {batch,seq_len,dim},
-                                                           stream);
+                                                             {batch,seq_len,dim},
+                                                             stream);
   ctx.SetPass(CAIF_RunContext::Pass_e::Backward_e);
   CAIF_DeviceTensor grad_input=mha.Backward(grad_out,ctx);
 
   // Check input gradient
   CAIF_HostTensor h_grad_input=grad_input.ToHost();
-  NanCheckResult_t dx_check=BitwiseNanCheck(h_grad_input.Data(),
-                                             h_grad_input.TotalElements());
+  CAIF_NanCheckResult_t dx_check=BitwiseNanCheck(h_grad_input.Data(),
+                                                  h_grad_input.TotalElements());
 
   bool all_clean=true;
 
-  if(dx_check.nan_count>0||dx_check.inf_count>0)
+  if(dx_check.NanCount()>0 || dx_check.InfCount()>0)
   {
-    std::cout<<"  grad_input: nan="<<dx_check.nan_count
-             <<" inf="<<dx_check.inf_count
-             <<" / "<<dx_check.total<<"\n";
+    ISE_Out::Out()<<"  grad_input: nan="
+                  <<dx_check.NanCount()
+                  <<" inf="
+                  <<dx_check.InfCount()
+                  <<" / "
+                  <<dx_check.Total()
+                  <<"\n";
     all_clean=false;
   }
 
@@ -216,21 +296,29 @@ static bool RunMHABackwardNanCheck(const char *test_label,
   for(uint32_t p=0;p<mha.ParameterTensorCount();++p)
   {
     CAIF_HostTensor h_grad=mha.GradientTensor(p).ToHost();
-    NanCheckResult_t pg=BitwiseNanCheck(h_grad.Data(),h_grad.TotalElements());
-    if(pg.nan_count>0||pg.inf_count>0)
+    CAIF_NanCheckResult_t pg=BitwiseNanCheck(h_grad.Data(),h_grad.TotalElements());
+    if(pg.NanCount()>0 || pg.InfCount()>0)
     {
-      std::cout<<"  grad_param["<<p<<"]: nan="<<pg.nan_count
-               <<" inf="<<pg.inf_count
-               <<" / "<<pg.total
-               <<" min="<<pg.min_val
-               <<" max="<<pg.max_val<<"\n";
+      ISE_Out::Out()<<"  grad_param["
+                    <<p
+                    <<"]: nan="
+                    <<pg.NanCount()
+                    <<" inf="
+                    <<pg.InfCount()
+                    <<" / "
+                    <<pg.Total()
+                    <<" min="
+                    <<pg.MinVal()
+                    <<" max="
+                    <<pg.MaxVal()
+                    <<"\n";
       all_clean=false;
     }
   }
 
   if(all_clean==true)
   {
-    std::cout<<"  All gradients NaN-free\n";
+    ISE_Out::Out()<<"  All gradients NaN-free\n";
   }
 
   return all_clean;
@@ -240,106 +328,62 @@ static bool RunMHABackwardNanCheck(const char *test_label,
 // Test 1: Small GQA config — quick sanity check
 // heads=4, kv_heads=2, dim=128, head_dim=32
 //------------------------------------------------------------------------------
-static void TestSmallGQA()
+void CAIF_FlashAttnBackwardNanTests::TestSmallGQA()
 {
-  bool passed=RunMHABackwardNanCheck("SmallGQA",
-                                     128,
-                                     4,
-                                     2,
-                                     32,
-                                     1,
-                                     16,
-                                     -1.0f,
-                                     1.0f,
-                                     42);
-  ReportResult("MHABackward::SmallGQA",passed);
+  bool passed=RunMHABackwardNanCheck("SmallGQA",128,4,2,32,1,16,-1.0f,1.0f,42);
+  CAIF_TestHarness::Report("MHABackward::SmallGQA",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 2: Medium GQA config
 // heads=8, kv_heads=2, dim=512, head_dim=64
 //------------------------------------------------------------------------------
-static void TestMediumGQA()
+void CAIF_FlashAttnBackwardNanTests::TestMediumGQA()
 {
-  bool passed=RunMHABackwardNanCheck("MediumGQA",
-                                     512,
-                                     8,
-                                     2,
-                                     64,
-                                     2,
-                                     64,
-                                     -0.15f,
-                                     0.14f,
-                                     42);
-  ReportResult("MHABackward::MediumGQA",passed);
+  bool passed=RunMHABackwardNanCheck("MediumGQA",512,8,2,64,2,64,-0.15f,0.14f,42);
+  CAIF_TestHarness::Report("MHABackward::MediumGQA",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 3: Qwen-like config with reduced seq_len
 // heads=12, kv_heads=2, dim=1536, head_dim=128, seq=32
 //------------------------------------------------------------------------------
-static void TestQwenShortSeq()
+void CAIF_FlashAttnBackwardNanTests::TestQwenShortSeq()
 {
-  bool passed=RunMHABackwardNanCheck("QwenShortSeq",
-                                     1536,
-                                     12,
-                                     2,
-                                     128,
-                                     1,
-                                     32,
-                                     -0.15f,
-                                     0.14f,
-                                     42);
-  ReportResult("MHABackward::QwenShortSeq",passed);
+  bool passed=RunMHABackwardNanCheck("QwenShortSeq",1536,12,2,128,1,32,-0.15f,0.14f,42);
+  CAIF_TestHarness::Report("MHABackward::QwenShortSeq",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 4: Qwen-like config with training-length seq
 // heads=12, kv_heads=2, dim=1536, head_dim=128, seq=512, batch=2
 //------------------------------------------------------------------------------
-static void TestQwenFullSeq()
+void CAIF_FlashAttnBackwardNanTests::TestQwenFullSeq()
 {
-  bool passed=RunMHABackwardNanCheck("QwenFullSeq",
-                                     1536,
-                                     12,
-                                     2,
-                                     128,
-                                     2,
-                                     512,
-                                     -0.15f,
-                                     0.14f,
-                                     42);
-  ReportResult("MHABackward::QwenFullSeq",passed);
+  bool passed=RunMHABackwardNanCheck("QwenFullSeq",1536,12,2,128,2,512,-0.15f,0.14f,42);
+  CAIF_TestHarness::Report("MHABackward::QwenFullSeq",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 5: Qwen config with larger input values
 // Same as test 4 but inputs in [-5, 5]
 //------------------------------------------------------------------------------
-static void TestQwenLargeInputs()
+void CAIF_FlashAttnBackwardNanTests::TestQwenLargeInputs()
 {
-  bool passed=RunMHABackwardNanCheck("QwenLargeInputs",
-                                     1536,
-                                     12,
-                                     2,
-                                     128,
-                                     2,
-                                     512,
-                                     -5.0f,
-                                     5.0f,
-                                     123);
-  ReportResult("MHABackward::QwenLargeInputs",passed);
+  bool passed=RunMHABackwardNanCheck("QwenLargeInputs",1536,12,2,128,2,512,-5.0f,5.0f,123);
+  CAIF_TestHarness::Report("MHABackward::QwenLargeInputs",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 6: Multiple seeds for Qwen config to catch non-deterministic NaN
 //------------------------------------------------------------------------------
-static void TestQwenMultipleSeeds()
+void CAIF_FlashAttnBackwardNanTests::TestQwenMultipleSeeds()
 {
   const uint32_t num_runs=5;
 
-  std::cout<<"  Running "<<num_runs
-           <<" seeds with Qwen-like config (dim=1536, seq=512, batch=2)\n";
+  ISE_Out::Out()<<"  Running "
+                <<num_runs
+                <<" seeds with Qwen-like config (dim=1536, seq=512, batch=2)\n";
 
   bool all_passed=true;
   uint32_t nan_runs=0;
@@ -347,16 +391,7 @@ static void TestQwenMultipleSeeds()
   for(uint32_t run=0;run<num_runs;++run)
   {
     const uint32_t seed=run*7919+31;
-    bool clean=RunMHABackwardNanCheck("QwenSeed",
-                                      1536,
-                                      12,
-                                      2,
-                                      128,
-                                      2,
-                                      512,
-                                      -0.15f,
-                                      0.14f,
-                                      seed);
+    bool clean=RunMHABackwardNanCheck("QwenSeed",1536,12,2,128,2,512,-0.15f,0.14f,seed);
     if(clean==false)
     {
       all_passed=false;
@@ -366,38 +401,29 @@ static void TestQwenMultipleSeeds()
 
   if(nan_runs>0)
   {
-    std::cout<<"  NaN in "<<nan_runs<<" / "<<num_runs<<" runs\n";
+    ISE_Out::Out()<<"  NaN in "
+                  <<nan_runs
+                  <<" / "
+                  <<num_runs
+                  <<" runs\n";
   }
 
-  ReportResult("MHABackward::QwenMultipleSeeds",all_passed);
+  CAIF_TestHarness::Report("MHABackward::QwenMultipleSeeds",all_passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 7: Standard MHA (kv_heads==heads) with matching dims
 // heads=12, kv_heads=12, dim=1536, head_dim=128
 //------------------------------------------------------------------------------
-static void TestMHAFullHeads()
+void CAIF_FlashAttnBackwardNanTests::TestMHAFullHeads()
 {
-  bool passed=RunMHABackwardNanCheck("MHAFullHeads",
-                                     1536,
-                                     12,
-                                     12,
-                                     128,
-                                     1,
-                                     128,
-                                     -0.15f,
-                                     0.14f,
-                                     42);
-  ReportResult("MHABackward::MHAFullHeads",passed);
+  bool passed=RunMHABackwardNanCheck("MHAFullHeads",1536,12,12,128,1,128,-0.15f,0.14f,42);
+  CAIF_TestHarness::Report("MHABackward::MHAFullHeads",passed);
 }
 
-#endif  // USE_CAIF_CUDA
-
-int main()
+void CAIF_FlashAttnBackwardNanTests::RunAll()
 {
-  std::cout<<"=== MHA Backward NaN Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== MHA Backward NaN Tests ===\n\n";
   TestSmallGQA();
   TestMediumGQA();
   TestQwenShortSeq();
@@ -405,9 +431,19 @@ int main()
   TestQwenLargeInputs();
   TestQwenMultipleSeeds();
   TestMHAFullHeads();
-#else
-  std::cout<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_FlashAttnBackwardNanTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)\n";
+  return 0;
+#endif
 }

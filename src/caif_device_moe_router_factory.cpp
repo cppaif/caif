@@ -29,7 +29,7 @@ std::unique_ptr<CAIF_DeviceLayer> MakeRouter(uint32_t input_dim,
                                               float noise_std,
                                               CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceMoERouter<ComputeT,StorageT>::Config_t cfg{
+  CAIF_DeviceMoERouterConfig cfg{
       input_dim,num_experts,top_k,
       static_cast<typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RoutingType_e>(routing_type),
       use_bias,noise_std};

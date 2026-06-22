@@ -35,15 +35,17 @@ CAIF_HostTensor::CAIF_HostTensor(const std::vector<uint32_t> &shape,bool allocat
                                                                                   _size_bytes(0)
 {
   // Calculate total elements
-  for(const uint32_t dim:_shape)
+  size_t total=1;
+  for(const uint32_t dim:Shape())
   {
-    _total_elements*=dim;
+    total*=dim;
   }
-  _size_bytes=_total_elements*sizeof(float);
+  SetTotalElements(total);
+  SetSizeBytes(total*sizeof(float));
 
-  if(allocate==true&&_total_elements>0)
+  if(allocate==true&&TotalElements()>0)
   {
-    _data=std::make_unique<float[]>(_total_elements);
+    _data=std::make_unique<float[]>(TotalElements());
   }
 }
 
@@ -110,9 +112,9 @@ CAIF_HostTensor &CAIF_HostTensor::operator=(const CAIF_HostTensor &other)
 CAIF_HostTensor CAIF_HostTensor::Zeros(const std::vector<uint32_t> &shape)
 {
   CAIF_HostTensor tensor(shape,true);
-  if(tensor._data!=nullptr)
+  if(tensor.HasData()==true)
   {
-    std::memset(tensor._data.get(),0,tensor._size_bytes);
+    std::memset(tensor.Data(),0,tensor.SizeBytes());
   }
   return tensor;
 }
@@ -125,9 +127,9 @@ CAIF_HostTensor CAIF_HostTensor::FromData(const float *data,const std::vector<ui
   }
 
   CAIF_HostTensor tensor(shape,true);
-  if(tensor._data!=nullptr)
+  if(tensor.HasData()==true)
   {
-    std::memcpy(tensor._data.get(),data,tensor._size_bytes);
+    std::memcpy(tensor.Data(),data,tensor.SizeBytes());
   }
   return tensor;
 }
@@ -139,7 +141,7 @@ CAIF_HostTensor CAIF_HostTensor::Uninitialized(const std::vector<uint32_t> &shap
 
 float &CAIF_HostTensor::At(size_t idx)
 {
-  if(idx>=_total_elements)
+  if(idx>=TotalElements())
   {
     THROW_CAIFE("Host tensor index out of bounds");
   }
@@ -148,7 +150,7 @@ float &CAIF_HostTensor::At(size_t idx)
 
 const float &CAIF_HostTensor::At(size_t idx)const
 {
-  if(idx>=_total_elements)
+  if(idx>=TotalElements())
   {
     THROW_CAIFE("Host tensor index out of bounds");
   }
@@ -162,11 +164,11 @@ CAIF_DeviceTensor CAIF_HostTensor::ToDevice(CAIF_CudaStream &stream)const
 
 void CAIF_HostTensor::Fill(float value)
 {
-  if(_data==nullptr)
+  if(HasData()==false)
   {
     return;
   }
-  std::fill(_data.get(),_data.get()+_total_elements,value);
+  std::fill(Data(),Data()+TotalElements(),value);
 }
 
 void CAIF_HostTensor::Reshape(const std::vector<uint32_t> &new_shape)
@@ -178,12 +180,12 @@ void CAIF_HostTensor::Reshape(const std::vector<uint32_t> &new_shape)
     new_total*=dim;
   }
 
-  if(new_total!=_total_elements)
+  if(new_total!=TotalElements())
   {
     THROW_CAIFE("Reshape requires same total elements");
   }
 
-  _shape=new_shape;
+  SetShape(new_shape);
 }
 
 }//end instance namespace

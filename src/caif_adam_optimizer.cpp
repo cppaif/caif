@@ -14,7 +14,10 @@
 
 #include "caif_adam_optimizer.h"
 #include "caif_ops.h"
+#include "caif_cuda_kernels_optimizers.cuh"
 #include "caif_exception.h"
+
+#include <cmath>
 
 namespace instance
 {
@@ -64,6 +67,54 @@ void CAIF_AdamOptimizer::UpdateOne(CAIF_DeviceTensor &target,
                          StepCount());
   }
   CAIF_CATCH_BLOCK()
+}
+
+bool CAIF_AdamOptimizer::BatchedStep(CAIF_DeviceNetwork &network)
+{
+#ifdef USE_CAIF_CUDA
+  try
+  {
+    if(BuildSharedBatch(network)==false)
+    {
+      return false;
+    }
+    const int n=BatchNumTensors();
+    HostMPtrsMut().resize(static_cast<size_t>(n));
+    HostVPtrsMut().resize(static_cast<size_t>(n));
+    for(int idx=0;idx<n;++idx)
+    {
+      HostMPtrsMut()[idx]=MStatesMut()[static_cast<size_t>(idx)].DevicePtr<float>();
+      HostVPtrsMut()[idx]=VStatesMut()[static_cast<size_t>(idx)].DevicePtr<float>();
+    }
+    UploadScratch(DeviceMPtrsMut(),HostMPtrsMut().data(),n*sizeof(float *),Stream());
+    UploadScratch(DeviceVPtrsMut(),HostVPtrsMut().data(),n*sizeof(float *),Stream());
+
+    const float t=static_cast<float>(StepCount());
+    const float bias_correction1=1.0f-std::pow(Beta1(),t);
+    const float bias_correction2=1.0f-std::pow(Beta2(),t);
+
+    launch_multi_tensor_adam<float>(BatchTargetsDevice(),
+                                    BatchGradsDevice(),
+                                    reinterpret_cast<float *const *>(DeviceMPtrsMut().DeviceDataRaw()),
+                                    reinterpret_cast<float *const *>(DeviceVPtrsMut().DeviceDataRaw()),
+                                    BatchOffsetsDevice(),
+                                    n,
+                                    BatchTotalElements(),
+                                    LearningRate(),
+                                    Beta1(),
+                                    Beta2(),
+                                    Epsilon(),
+                                    WeightDecay(),
+                                    bias_correction1,
+                                    bias_correction2,
+                                    Stream().Handle());
+    return true;
+  }
+  CAIF_CATCH_BLOCK()
+#else
+  (void)network;
+  return false;
+#endif
 }
 
 }//end instance namespace

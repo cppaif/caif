@@ -26,9 +26,17 @@
 // dispatch throws for unsupported dtypes (documented per op).
 //------------------------------------------------------------------------------
 #include "caif_ops.h"
+#include "caif_constants.h"
 #include "caif_run_context.h"
 #include "caif_settings.h"
 #include "caif_exception.h"
+#include "caif_host_fp_cast.h"
+#include "caif_host_gemm.h"
+#include "caif_host_slice_helper.h"
+#include "caif_host_float_read_view.h"
+#include "caif_host_float_write_view.h"
+#include "caif_host_float_readwrite_view.h"
+#include "caif_topk_descending_compare.h"
 #include "openblas/cblas.h"
 #include <algorithm>
 #include <cmath>
@@ -38,485 +46,6 @@
 
 namespace instance
 {
-
-
-//------------------------------------------------------------------------------
-// Anonymous helpers
-//------------------------------------------------------------------------------
-
-
-//----------------------------------------------------------------------------
-// Dtype helpers (FP16/BF16 <-> FP32 bit-level conversion).
-//----------------------------------------------------------------------------
-
-float Fp16ToFloat(uint16_t h)
-{
-  const uint32_t sign=static_cast<uint32_t>((h>>15)&0x1);
-  const uint32_t exp=static_cast<uint32_t>((h>>10)&0x1F);
-  const uint32_t mant=static_cast<uint32_t>(h&0x3FF);
-  uint32_t bits=0;
-  if(exp==0)
-  {
-    if(mant==0)
-    {
-      bits=sign<<31;
-    }
-    else
-    {
-      uint32_t m=mant;
-      uint32_t e=1;
-      while((m&0x400)==0)
-      {
-        m<<=1;
-        e++;
-      }
-      m&=0x3FF;
-      bits=(sign<<31)|((127-15-e+1)<<23)|(m<<13);
-    }
-  }
-  else
-  {
-    if(exp==31)
-    {
-      bits=(sign<<31)|(0xFF<<23)|(mant<<13);
-    }
-    else
-    {
-      bits=(sign<<31)|((exp+(127-15))<<23)|(mant<<13);
-    }
-  }
-  float out;
-  std::memcpy(&out,&bits,sizeof(out));
-  return out;
-}
-
-uint16_t FloatToFp16(float f)
-{
-  uint32_t bits;
-  std::memcpy(&bits,&f,sizeof(bits));
-  const uint32_t sign=(bits>>31)&0x1;
-  const int32_t exp=static_cast<int32_t>((bits>>23)&0xFF);
-  const uint32_t mant=bits&0x7FFFFF;
-  uint16_t out=0;
-  if(exp==0xFF)
-  {
-    const uint32_t half_mant=mant>>13;
-    out=static_cast<uint16_t>((sign<<15)|(0x1F<<10)|half_mant);
-    return out;
-  }
-  const int32_t unbiased=exp-127;
-  if(unbiased>15)
-  {
-    out=static_cast<uint16_t>((sign<<15)|(0x1F<<10));
-    return out;
-  }
-  if(unbiased<-14)
-  {
-    if(unbiased<-24)
-    {
-      out=static_cast<uint16_t>(sign<<15);
-      return out;
-    }
-    const uint32_t m=(mant|0x800000)>>(-unbiased-14+13);
-    out=static_cast<uint16_t>((sign<<15)|m);
-    return out;
-  }
-  out=static_cast<uint16_t>((sign<<15)|((unbiased+15)<<10)|(mant>>13));
-  return out;
-}
-
-float Bf16ToFloat(uint16_t b)
-{
-  uint32_t bits=static_cast<uint32_t>(b)<<16;
-  float out;
-  std::memcpy(&out,&bits,sizeof(out));
-  return out;
-}
-
-uint16_t FloatToBf16(float f)
-{
-  uint32_t bits;
-  std::memcpy(&bits,&f,sizeof(bits));
-  const uint32_t rounded=bits+0x7FFF+((bits>>16)&0x1);
-  return static_cast<uint16_t>(rounded>>16);
-}
-
-//----------------------------------------------------------------------------
-// Up/down-cast a host-backed tensor between FP16/BF16 and FP32 scratch arrays.
-//----------------------------------------------------------------------------
-
-std::vector<float> UpcastToFloat(const CAIF_DeviceTensor &t)
-{
-  const size_t n=t.TotalElements();
-  std::vector<float> out(n);
-  const CAIF_DataType::CAIF_DataType_e dt=t.Dtype();
-  if(dt==CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    std::memcpy(out.data(),t.DeviceDataRaw(),n*sizeof(float));
-    return out;
-  }
-  if(dt==CAIF_DataType::CAIF_DataType_e::Float16)
-  {
-    const uint16_t *p=static_cast<const uint16_t*>(t.DeviceDataRaw());
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
-    {
-      out[i]=Fp16ToFloat(p[i]);
-    }
-    return out;
-  }
-  if(dt==CAIF_DataType::CAIF_DataType_e::BFloat16)
-  {
-    const uint16_t *p=static_cast<const uint16_t*>(t.DeviceDataRaw());
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
-    {
-      out[i]=Bf16ToFloat(p[i]);
-    }
-    return out;
-  }
-  THROW_CAIFE("CAIF_Ops host backend: UpcastToFloat unsupported dtype");
-}
-
-void DowncastFromFloat(const std::vector<float> &src,CAIF_DeviceTensor &out)
-{
-  const size_t n=out.TotalElements();
-  if(src.size()!=n)
-  {
-    THROW_CAIFE("CAIF_Ops host backend: DowncastFromFloat size mismatch");
-  }
-  const CAIF_DataType::CAIF_DataType_e dt=out.Dtype();
-  if(dt==CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    std::memcpy(out.DeviceDataRaw(),src.data(),n*sizeof(float));
-    return;
-  }
-  if(dt==CAIF_DataType::CAIF_DataType_e::Float16)
-  {
-    uint16_t *p=static_cast<uint16_t*>(out.DeviceDataRaw());
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
-    {
-      p[i]=FloatToFp16(src[i]);
-    }
-    return;
-  }
-  if(dt==CAIF_DataType::CAIF_DataType_e::BFloat16)
-  {
-    uint16_t *p=static_cast<uint16_t*>(out.DeviceDataRaw());
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
-    {
-      p[i]=FloatToBf16(src[i]);
-    }
-    return;
-  }
-  THROW_CAIFE("CAIF_Ops host backend: DowncastFromFloat unsupported dtype");
-}
-
-//----------------------------------------------------------------------------
-// Direct FP32 accessors for ops that only handle FP32 on host.
-//----------------------------------------------------------------------------
-
-// HostFp32: helper used by the strict fp32-only host ops (gemm, the
-// FP32 fast path of the float-view classes below). Callers throw above
-// the cast on dtype mismatch, so the cast is fp32-by-precondition.
-
-float *HostFp32(CAIF_DeviceTensor &t,const char *op)
-{
-  if(t.Dtype()!=CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    (void)op;
-    THROW_CAIFE("CAIF_Ops host backend: op requires Float32 dtype");
-  }
-  // fp32 by gate above
-  return static_cast<float*>(t.DeviceDataRaw());
-}
-
-const float *HostFp32(const CAIF_DeviceTensor &t,const char *op)
-{
-  if(t.Dtype()!=CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    (void)op;
-    THROW_CAIFE("CAIF_Ops host backend: op requires Float32 dtype");
-  }
-  // fp32 by gate above
-  return static_cast<const float*>(t.DeviceDataRaw());
-}
-
-//----------------------------------------------------------------------------
-// Numerical constants used across ops.
-//
-// DIVISION_EPSILON: protects row-sum/top-k-weight renormalisation from
-// division-by-zero when the gating probabilities all underflow to zero.
-// Matches the device kernel epsilon in caif_cuda_kernels.cu.
-//----------------------------------------------------------------------------
-
-constexpr float DIVISION_EPSILON=1.0e-12f;
-
-//----------------------------------------------------------------------------
-// Top-K descending comparator: orders indices so that higher-valued entries
-// come first, breaking ties by ascending index for determinism. Used in
-// TopKHost and MoETopKGatingHost (named functor instead of a lambda to
-// comply with the "no lambdas" coding guideline).
-//----------------------------------------------------------------------------
-
-class TopKDescendingCompare
-{
-  public:
-    TopKDescendingCompare(const float *values):_values(values)
-    {
-    }
-    bool operator()(const uint32_t x,const uint32_t y)const
-    {
-      if(_values[x]!=_values[y])
-      {
-        return _values[x]>_values[y];
-      }
-      return x<y;
-    }
-  protected:
-  private:
-    const float *_values;
-};
-
-//----------------------------------------------------------------------------
-// RAII float-view helpers so element-wise / activation / reduction ops
-// work on FP32, FP16, and BF16 host tensors without each op open-coding
-// the up/down-cast. FP32 path is zero-copy; FP16/BF16 path converts on
-// construction (read view) and on destruction (write view).
-//----------------------------------------------------------------------------
-
-class HostFloatReadView
-{
-  public:
-    HostFloatReadView(const CAIF_DeviceTensor &t):_size(t.TotalElements())
-    {
-      if(t.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
-      {
-        // fp32 by branch gate
-        _ptr=static_cast<const float*>(t.DeviceDataRaw());
-      }
-      else
-      {
-        _scratch=UpcastToFloat(t);
-        _ptr=_scratch.data();
-      }
-    }
-    const float *Data()const{return _ptr;}
-    size_t Size()const{return _size;}
-  protected:
-  private:
-    const float *_ptr=nullptr;
-    std::vector<float> _scratch;
-    size_t _size=0;
-};
-
-class HostFloatWriteView
-{
-  public:
-    HostFloatWriteView(CAIF_DeviceTensor &t):_tensor(t),_size(t.TotalElements())
-    {
-      if(t.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
-      {
-        // fp32 by branch gate
-        _ptr=static_cast<float*>(t.DeviceDataRaw());
-      }
-      else
-      {
-        _scratch.resize(_size);
-        _ptr=_scratch.data();
-        _needs_writeback=true;
-      }
-    }
-    ~HostFloatWriteView()
-    {
-      if(_needs_writeback==true)
-      {
-        try
-        {
-          DowncastFromFloat(_scratch,_tensor);
-        }
-        catch(...)
-        {
-        }
-      }
-    }
-    float *Data(){return _ptr;}
-    size_t Size()const{return _size;}
-  protected:
-  private:
-    CAIF_DeviceTensor &_tensor;
-    float *_ptr=nullptr;
-    std::vector<float> _scratch;
-    size_t _size=0;
-    bool _needs_writeback=false;
-};
-
-class HostFloatReadWriteView
-{
-  public:
-    HostFloatReadWriteView(CAIF_DeviceTensor &t):_tensor(t),_size(t.TotalElements())
-    {
-      if(t.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
-      {
-        // fp32 by branch gate
-        _ptr=static_cast<float*>(t.DeviceDataRaw());
-      }
-      else
-      {
-        _scratch=UpcastToFloat(t);
-        _ptr=_scratch.data();
-        _needs_writeback=true;
-      }
-    }
-    ~HostFloatReadWriteView()
-    {
-      if(_needs_writeback==true)
-      {
-        try
-        {
-          DowncastFromFloat(_scratch,_tensor);
-        }
-        catch(...)
-        {
-        }
-      }
-    }
-    float *Data(){return _ptr;}
-    size_t Size()const{return _size;}
-  protected:
-  private:
-    CAIF_DeviceTensor &_tensor;
-    float *_ptr=nullptr;
-    std::vector<float> _scratch;
-    size_t _size=0;
-    bool _needs_writeback=false;
-};
-
-//----------------------------------------------------------------------------
-// 2D BLAS matrix multiply helper: C = alpha * op(A) * op(B) + beta * C.
-// m=rows of op(A), n=cols of op(B), k=inner dim. lda/ldb/ldc are physical
-// row strides (row-major).
-//----------------------------------------------------------------------------
-
-void GemmFloat(const float *a_data,
-               const float *b_data,
-               float *c_data,
-               int m,
-               int n,
-               int k,
-               int lda,
-               int ldb,
-               int ldc,
-               bool trans_a,
-               bool trans_b,
-               float alpha,
-               float beta)
-{
-  CBLAS_TRANSPOSE op_a=CblasNoTrans;
-  if(trans_a==true)
-  {
-    op_a=CblasTrans;
-  }
-  CBLAS_TRANSPOSE op_b=CblasNoTrans;
-  if(trans_b==true)
-  {
-    op_b=CblasTrans;
-  }
-  cblas_sgemm(CblasRowMajor,
-              op_a,
-              op_b,
-              m,
-              n,
-              k,
-              alpha,
-              a_data,
-              lda,
-              b_data,
-              ldb,
-              beta,
-              c_data,
-              ldc);
-}
-
-//----------------------------------------------------------------------------
-// Helper: materialise input/output as FP32 buffers when dtype requires
-// upcast, GEMM into an FP32 scratch, then downcast to output dtype.
-//----------------------------------------------------------------------------
-
-void MatMul2DFloat(const CAIF_DeviceTensor &a,
-                   const CAIF_DeviceTensor &b,
-                   CAIF_DeviceTensor &output,
-                   bool trans_a,
-                   bool trans_b)
-{
-  const auto &sa=a.Shape();
-  const auto &sb=b.Shape();
-  const int a_rows=static_cast<int>(sa[0]);
-  const int a_cols=static_cast<int>(sa[1]);
-  const int b_rows=static_cast<int>(sb[0]);
-  const int b_cols=static_cast<int>(sb[1]);
-  int m=a_rows;
-  int k_a=a_cols;
-  if(trans_a==true)
-  {
-    m=a_cols;
-    k_a=a_rows;
-  }
-  int k_b=b_rows;
-  int n=b_cols;
-  if(trans_b==true)
-  {
-    k_b=b_cols;
-    n=b_rows;
-  }
-  if(k_a!=k_b)
-  {
-    THROW_CAIFE("CAIF_Ops host MatMul: inner dimensions do not match");
-  }
-  const int lda=a_cols;
-  const int ldb=b_cols;
-  const int ldc=n;
-  if(a.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32
-     &&b.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32
-     &&output.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    // fp32 by branch gate (a/b/output dtypes verified above)
-    GemmFloat(static_cast<const float*>(a.DeviceDataRaw()),
-              static_cast<const float*>(b.DeviceDataRaw()),
-              static_cast<float*>(output.DeviceDataRaw()),
-              m,
-              n,
-              k_a,
-              lda,
-              ldb,
-              ldc,
-              trans_a,
-              trans_b,
-              1.0f,
-              0.0f);
-    return;
-  }
-  std::vector<float> af=UpcastToFloat(a);
-  std::vector<float> bf=UpcastToFloat(b);
-  std::vector<float> cf(static_cast<size_t>(m)*static_cast<size_t>(n));
-  GemmFloat(af.data(),
-            bf.data(),
-            cf.data(),
-            m,
-            n,
-            k_a,
-            lda,
-            ldb,
-            ldc,
-            trans_a,
-            trans_b,
-            1.0f,
-            0.0f);
-  DowncastFromFloat(cf,output);
-}
-
 
 //------------------------------------------------------------------------------
 // Matrix
@@ -530,6 +59,7 @@ void CAIF_Ops::MatMulHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
+    RequireMatchingDtype(a,b,output,g_caif_op_matmul);
     const auto &sa=a.Shape();
     const auto &sb=b.Shape();
     const auto &so=output.Shape();
@@ -545,7 +75,7 @@ void CAIF_Ops::MatMulHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("MatMul host: output shape mismatch");
     }
-    MatMul2DFloat(a,b,output,false,false);
+    CAIF_HostGemm::MatMul2DFloat(a,b,output,false,false);
   }
   CAIF_CATCH_BLOCK();
 }
@@ -558,6 +88,7 @@ void CAIF_Ops::MatMulTransposeAHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
+    RequireMatchingDtype(a,b,output,g_caif_op_matmul_transpose_a);
     const auto &sa=a.Shape();
     const auto &sb=b.Shape();
     const auto &so=output.Shape();
@@ -573,7 +104,7 @@ void CAIF_Ops::MatMulTransposeAHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("MatMulTransposeA host: output shape mismatch");
     }
-    MatMul2DFloat(a,b,output,true,false);
+    CAIF_HostGemm::MatMul2DFloat(a,b,output,true,false);
   }
   CAIF_CATCH_BLOCK();
 }
@@ -586,6 +117,7 @@ void CAIF_Ops::MatMulTransposeBHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
+    RequireMatchingDtype(a,b,output,g_caif_op_matmul_transpose_b);
     const auto &sa=a.Shape();
     const auto &sb=b.Shape();
     const auto &so=output.Shape();
@@ -601,88 +133,9 @@ void CAIF_Ops::MatMulTransposeBHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("MatMulTransposeB host: output shape mismatch");
     }
-    MatMul2DFloat(a,b,output,false,true);
+    CAIF_HostGemm::MatMul2DFloat(a,b,output,false,true);
   }
   CAIF_CATCH_BLOCK();
-}
-
-
-void BatchedMatMulFloatInternal(const CAIF_DeviceTensor &a,
-                                const CAIF_DeviceTensor &b,
-                                CAIF_DeviceTensor &output,
-                                int m,
-                                int k,
-                                int n,
-                                int batch_count,
-                                bool trans_a,
-                                bool trans_b)
-{
-  const size_t a_slice=static_cast<size_t>(m)*static_cast<size_t>(k);
-  const size_t b_slice=static_cast<size_t>(k)*static_cast<size_t>(n);
-  const size_t c_slice=static_cast<size_t>(m)*static_cast<size_t>(n);
-  const int lda_notrans=k;
-  const int lda_trans=m;
-  const int ldb_notrans=n;
-  const int ldb_trans=k;
-  int lda=lda_notrans;
-  int ldb=ldb_notrans;
-  if(trans_a==true)
-  {
-    lda=lda_trans;
-  }
-  if(trans_b==true)
-  {
-    ldb=ldb_trans;
-  }
-  const int ldc=n;
-  if(a.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32
-     &&b.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32
-     &&output.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
-  {
-    // fp32 by branch gate (a/b/output dtypes verified above)
-    const float *a_base=static_cast<const float*>(a.DeviceDataRaw());
-    const float *b_base=static_cast<const float*>(b.DeviceDataRaw());
-    float *c_base=static_cast<float*>(output.DeviceDataRaw());
-    #pragma omp parallel for
-    for(int batch=0;batch<batch_count;++batch)
-    {
-      GemmFloat(a_base+static_cast<size_t>(batch)*a_slice,
-                b_base+static_cast<size_t>(batch)*b_slice,
-                c_base+static_cast<size_t>(batch)*c_slice,
-                m,
-                n,
-                k,
-                lda,
-                ldb,
-                ldc,
-                trans_a,
-                trans_b,
-                1.0f,
-                0.0f);
-    }
-    return;
-  }
-  std::vector<float> af=UpcastToFloat(a);
-  std::vector<float> bf=UpcastToFloat(b);
-  std::vector<float> cf(static_cast<size_t>(batch_count)*c_slice);
-  #pragma omp parallel for
-  for(int batch=0;batch<batch_count;++batch)
-  {
-    GemmFloat(af.data()+static_cast<size_t>(batch)*a_slice,
-              bf.data()+static_cast<size_t>(batch)*b_slice,
-              cf.data()+static_cast<size_t>(batch)*c_slice,
-              m,
-              n,
-              k,
-              lda,
-              ldb,
-              ldc,
-              trans_a,
-              trans_b,
-              1.0f,
-              0.0f);
-  }
-  DowncastFromFloat(cf,output);
 }
 
 
@@ -698,7 +151,8 @@ void CAIF_Ops::BatchedMatMulHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
-    BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,false,false);
+    RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul);
+    CAIF_HostGemm::BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,false,false);
   }
   CAIF_CATCH_BLOCK();
 }
@@ -715,7 +169,8 @@ void CAIF_Ops::BatchedMatMulTransposeAHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
-    BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,true,false);
+    RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul_transpose_a);
+    CAIF_HostGemm::BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,true,false);
   }
   CAIF_CATCH_BLOCK();
 }
@@ -732,7 +187,8 @@ void CAIF_Ops::BatchedMatMulTransposeBHost(const CAIF_DeviceTensor &a,
   try
   {
     (void)ctx;
-    BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,false,true);
+    RequireMatchingDtype(a,b,output,g_caif_op_batched_matmul_transpose_b);
+    CAIF_HostGemm::BatchedMatMulFloatInternal(a,b,output,m,k,n,batch_count,false,true);
   }
   CAIF_CATCH_BLOCK();
 }
@@ -781,9 +237,9 @@ void CAIF_Ops::AddHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("Add host: element count mismatch");
     }
-    HostFloatReadView av(a);
-    HostFloatReadView bv(b);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView av(a);
+    CAIF_HostFloatReadView bv(b);
+    CAIF_HostFloatWriteView ov(output);
     const float *ap=av.Data();
     const float *bp=bv.Data();
     float *op=ov.Data();
@@ -801,12 +257,44 @@ void CAIF_Ops::ScaleHost(CAIF_DeviceTensor &tensor,float scale)
   try
   {
     const size_t n=tensor.TotalElements();
-    HostFloatReadWriteView tv(tensor);
+    CAIF_HostFloatReadWriteView tv(tensor);
     float *tp=tv.Data();
     #pragma omp parallel for
     for(int64_t i=0;i<static_cast<int64_t>(n);++i)
     {
       tp[i]*=scale;
+    }
+  }
+  CAIF_CATCH_BLOCK();
+}
+
+void CAIF_Ops::UnscaleCheckInfHost(CAIF_DeviceTensor &grad,
+                                   float inv_scale,
+                                   CAIF_DeviceTensor &found_inf)
+{
+  try
+  {
+    if(found_inf.TotalElements()!=1)
+    {
+      THROW_CAIFE("UnscaleCheckInf host: found_inf must have exactly 1 element");
+    }
+    const size_t n=grad.TotalElements();
+    CAIF_HostFloatReadWriteView gv(grad);
+    float *gp=gv.Data();
+    bool overflow=false;
+    #pragma omp parallel for reduction(||:overflow)
+    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+    {
+      gp[i]*=inv_scale;
+      if(std::isfinite(gp[i])==false)
+      {
+        overflow=true;
+      }
+    }
+    if(overflow==true)
+    {
+      CAIF_HostFloatReadWriteView fv(found_inf);
+      fv.Data()[0]=1.0f;
     }
   }
   CAIF_CATCH_BLOCK();
@@ -823,8 +311,8 @@ void CAIF_Ops::ScaleHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("Scale host: element count mismatch");
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -847,8 +335,8 @@ void CAIF_Ops::AddScaledHost(CAIF_DeviceTensor &target,
     {
       THROW_CAIFE("AddScaled host: element count mismatch");
     }
-    HostFloatReadWriteView tv(target);
-    HostFloatReadView sv(source);
+    CAIF_HostFloatReadWriteView tv(target);
+    CAIF_HostFloatReadView sv(source);
     float *tp=tv.Data();
     const float *sp=sv.Data();
     #pragma omp parallel for
@@ -877,9 +365,9 @@ void CAIF_Ops::BiasAddHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("BiasAdd host: bias length must equal input cols");
     }
-    HostFloatReadView iv(input);
-    HostFloatReadView bv(bias);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatReadView bv(bias);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     const float *bp=bv.Data();
     float *op=ov.Data();
@@ -918,8 +406,8 @@ void CAIF_Ops::MatMulBiasHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("MatMulBias host: bias length must equal output cols");
     }
-    HostFloatReadWriteView ov(output);
-    HostFloatReadView bv(bias);
+    CAIF_HostFloatReadWriteView ov(output);
+    CAIF_HostFloatReadView bv(bias);
     float *op=ov.Data();
     const float *bp=bv.Data();
     #pragma omp parallel for
@@ -950,8 +438,8 @@ void CAIF_Ops::BiasGradientHost(const CAIF_DeviceTensor &grad,
     {
       THROW_CAIFE("BiasGradient host: bias_grad length must equal grad cols");
     }
-    HostFloatReadView gv(grad);
-    HostFloatWriteView bv(bias_grad);
+    CAIF_HostFloatReadView gv(grad);
+    CAIF_HostFloatWriteView bv(bias_grad);
     const float *gp=gv.Data();
     float *bp=bv.Data();
     #pragma omp parallel for
@@ -992,9 +480,9 @@ void CAIF_Ops::AddPositionalEncodingHost(const CAIF_DeviceTensor &input,
       THROW_CAIFE("AddPositionalEncoding host: pe_table dim mismatch");
     }
     const int pe_rows=static_cast<int>(sp[0]);
-    const float *ip=HostFp32(input,"AddPositionalEncoding");
-    const float *pp=HostFp32(pe_table,"AddPositionalEncoding");
-    float *op=HostFp32(output,"AddPositionalEncoding");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"AddPositionalEncoding");
+    const float *pp=CAIF_HostFpCast::HostFp32(pe_table,"AddPositionalEncoding");
+    float *op=CAIF_HostFpCast::HostFp32(output,"AddPositionalEncoding");
     #pragma omp parallel for collapse(2)
     for(int b=0;b<batch;++b)
     {
@@ -1033,8 +521,8 @@ void CAIF_Ops::PositionalEncodingBackwardHost(const CAIF_DeviceTensor &grad_outp
     {
       THROW_CAIFE("PositionalEncodingBackward host: dim mismatch");
     }
-    const float *gp=HostFp32(grad_output,"PositionalEncodingBackward");
-    float *tp=HostFp32(grad_table,"PositionalEncodingBackward");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad_output,"PositionalEncodingBackward");
+    float *tp=CAIF_HostFpCast::HostFp32(grad_table,"PositionalEncodingBackward");
     std::memset(tp,0,st[0]*st[1]*sizeof(float));
     for(int b=0;b<batch;++b)
     {
@@ -1055,10 +543,10 @@ void CAIF_Ops::PositionalEncodingBackwardHost(const CAIF_DeviceTensor &grad_outp
 }
 
 
-int32_t RelativePositionBucket(int32_t relative_position,
-                               uint32_t max_distance,
-                               bool bidirectional,
-                               uint32_t num_buckets)
+int32_t CAIF_Ops::RelativePositionBucket(int32_t relative_position,
+                                         uint32_t max_distance,
+                                         bool bidirectional,
+                                         uint32_t num_buckets)
 {
   int32_t ret=0;
   int32_t n=-relative_position;
@@ -1125,8 +613,8 @@ void CAIF_Ops::ComputeRelativePositionBiasHost(const CAIF_DeviceTensor &embeddin
     {
       THROW_CAIFE("ComputeRelativePositionBias host: head mismatch");
     }
-    const float *ep=HostFp32(embedding,"ComputeRelativePositionBias");
-    float *op=HostFp32(output,"ComputeRelativePositionBias");
+    const float *ep=CAIF_HostFpCast::HostFp32(embedding,"ComputeRelativePositionBias");
+    float *op=CAIF_HostFpCast::HostFp32(output,"ComputeRelativePositionBias");
     #pragma omp parallel for collapse(2)
     for(int h=0;h<num_heads;++h)
     {
@@ -1166,8 +654,8 @@ void CAIF_Ops::AccumulateRelativePositionBiasGradientHost(const CAIF_DeviceTenso
     const int q_len=static_cast<int>(sg[1]);
     const int k_len=static_cast<int>(sg[2]);
     const int num_buckets=static_cast<int>(se[1]);
-    const float *gp=HostFp32(grad_output,"RelativePositionBiasBackward");
-    float *ep=HostFp32(grad_embedding,"RelativePositionBiasBackward");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad_output,"RelativePositionBiasBackward");
+    float *ep=CAIF_HostFpCast::HostFp32(grad_embedding,"RelativePositionBiasBackward");
     for(int h=0;h<num_heads;++h)
     {
       for(int q=0;q<q_len;++q)
@@ -1194,22 +682,6 @@ void CAIF_Ops::AccumulateRelativePositionBiasGradientHost(const CAIF_DeviceTenso
 //------------------------------------------------------------------------------
 
 
-void SliceDimsForLastDim(const CAIF_DeviceTensor &t,size_t &rows,size_t &cols)
-{
-  const auto &s=t.Shape();
-  if(s.size()==0)
-  {
-    THROW_CAIFE("SliceLastDim host: tensor has no dimensions");
-  }
-  cols=s.back();
-  rows=1;
-  for(size_t i=0;i+1<s.size();++i)
-  {
-    rows*=s[i];
-  }
-}
-
-
 void CAIF_Ops::CastHost(const CAIF_DeviceTensor &input,
               CAIF_DeviceTensor &output,
               CAIF_RunContext &ctx)
@@ -1226,8 +698,8 @@ void CAIF_Ops::CastHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("Cast host: host backend only supports fp32<->fp32");
     }
-    const float *ip=HostFp32(input,"Cast");
-    float *op=HostFp32(output,"Cast");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"Cast");
+    float *op=CAIF_HostFpCast::HostFp32(output,"Cast");
     std::memcpy(op,ip,input.TotalElements()*sizeof(float));
   }
   CAIF_CATCH_BLOCK();
@@ -1243,8 +715,8 @@ void CAIF_Ops::SliceLastDimHost(const CAIF_DeviceTensor &input,
     size_t in_cols=0;
     size_t out_rows=0;
     size_t out_cols=0;
-    SliceDimsForLastDim(input,in_rows,in_cols);
-    SliceDimsForLastDim(output,out_rows,out_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(input,in_rows,in_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(output,out_rows,out_cols);
     if(in_rows!=out_rows)
     {
       THROW_CAIFE("SliceLastDim host: row count mismatch");
@@ -1253,8 +725,8 @@ void CAIF_Ops::SliceLastDimHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("SliceLastDim host: slice out of bounds");
     }
-    const float *ip=HostFp32(input,"SliceLastDim");
-    float *op=HostFp32(output,"SliceLastDim");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"SliceLastDim");
+    float *op=CAIF_HostFpCast::HostFp32(output,"SliceLastDim");
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(in_rows);++r)
     {
@@ -1276,8 +748,8 @@ void CAIF_Ops::SliceLastDimBackwardHost(const CAIF_DeviceTensor &grad_output,
     size_t out_cols=0;
     size_t in_rows=0;
     size_t in_cols=0;
-    SliceDimsForLastDim(grad_output,out_rows,out_cols);
-    SliceDimsForLastDim(grad_input,in_rows,in_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(grad_output,out_rows,out_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(grad_input,in_rows,in_cols);
     if(in_rows!=out_rows)
     {
       THROW_CAIFE("SliceLastDimBackward host: row count mismatch");
@@ -1286,8 +758,8 @@ void CAIF_Ops::SliceLastDimBackwardHost(const CAIF_DeviceTensor &grad_output,
     {
       THROW_CAIFE("SliceLastDimBackward host: slice out of bounds");
     }
-    const float *gp=HostFp32(grad_output,"SliceLastDimBackward");
-    float *ip=HostFp32(grad_input,"SliceLastDimBackward");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad_output,"SliceLastDimBackward");
+    float *ip=CAIF_HostFpCast::HostFp32(grad_input,"SliceLastDimBackward");
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(in_rows);++r)
     {
@@ -1313,16 +785,16 @@ void CAIF_Ops::ConcatLastDimHost(const CAIF_DeviceTensor &a,
     size_t b_cols=0;
     size_t o_rows=0;
     size_t o_cols=0;
-    SliceDimsForLastDim(a,a_rows,a_cols);
-    SliceDimsForLastDim(b,b_rows,b_cols);
-    SliceDimsForLastDim(output,o_rows,o_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(a,a_rows,a_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(b,b_rows,b_cols);
+    CAIF_HostSliceHelper::SliceDimsForLastDim(output,o_rows,o_cols);
     if(a_rows!=b_rows||a_rows!=o_rows||a_cols+b_cols!=o_cols)
     {
       THROW_CAIFE("ConcatLastDim host: shape mismatch");
     }
-    const float *ap=HostFp32(a,"ConcatLastDim");
-    const float *bp=HostFp32(b,"ConcatLastDim");
-    float *op=HostFp32(output,"ConcatLastDim");
+    const float *ap=CAIF_HostFpCast::HostFp32(a,"ConcatLastDim");
+    const float *bp=CAIF_HostFpCast::HostFp32(b,"ConcatLastDim");
+    float *op=CAIF_HostFpCast::HostFp32(output,"ConcatLastDim");
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(a_rows);++r)
     {
@@ -1346,8 +818,8 @@ void CAIF_Ops::ReLUHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1369,8 +841,8 @@ void CAIF_Ops::SigmoidHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &out
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1387,8 +859,8 @@ void CAIF_Ops::TanhHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1415,8 +887,8 @@ void CAIF_Ops::SoftmaxHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &out
     {
       rows*=s[i];
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1456,8 +928,8 @@ void CAIF_Ops::LeakyReLUHost(const CAIF_DeviceTensor &input,
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1484,8 +956,8 @@ void CAIF_Ops::ELUHost(const CAIF_DeviceTensor &input,
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1505,23 +977,37 @@ void CAIF_Ops::ELUHost(const CAIF_DeviceTensor &input,
   CAIF_CATCH_BLOCK();
 }
 
-void CAIF_Ops::GELUHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)
+void CAIF_Ops::GELUHost(const CAIF_DeviceTensor &input,
+                        CAIF_DeviceTensor &output,
+                        const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
-    const float k=0.7978845608028654f;
-    const float c=0.044715f;
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+    if(approx==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact)
     {
-      const float x=ip[i];
-      const float inner=k*(x+c*x*x*x);
-      op[i]=0.5f*x*(1.0f+std::tanh(inner));
+      #pragma omp parallel for
+      for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+      {
+        const float x=ip[i];
+        op[i]=0.5f*x*(1.0f+std::erf(x*g_caif_gelu_inv_sqrt2));
+      }
+    }
+    else
+    {
+      const float k=g_caif_gelu_sqrt_2_over_pi;
+      const float c=g_caif_gelu_coeff;
+      #pragma omp parallel for
+      for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+      {
+        const float x=ip[i];
+        const float inner=k*(x+c*x*x*x);
+        op[i]=0.5f*x*(1.0f+std::tanh(inner));
+      }
     }
   }
   CAIF_CATCH_BLOCK();
@@ -1532,8 +1018,8 @@ void CAIF_Ops::SwishHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &outpu
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -1557,9 +1043,9 @@ void CAIF_Ops::ReLUBackwardHost(const CAIF_DeviceTensor &grad_output,
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *ip=iv.Data();
     float *op=ov.Data();
@@ -1586,9 +1072,9 @@ void CAIF_Ops::SigmoidBackwardHost(const CAIF_DeviceTensor &grad_output,
   try
   {
     const size_t n=output.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView yv(output);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView yv(output);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *yp=yv.Data();
     float *op=ov.Data();
@@ -1608,9 +1094,9 @@ void CAIF_Ops::TanhBackwardHost(const CAIF_DeviceTensor &grad_output,
   try
   {
     const size_t n=output.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView yv(output);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView yv(output);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *yp=yv.Data();
     float *op=ov.Data();
@@ -1640,9 +1126,9 @@ void CAIF_Ops::SoftmaxBackwardHost(const CAIF_DeviceTensor &grad_output,
     {
       rows*=s[i];
     }
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView yv(output);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView yv(output);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *yp=yv.Data();
     float *ip=ov.Data();
@@ -1674,9 +1160,9 @@ void CAIF_Ops::LeakyReLUBackwardHost(const CAIF_DeviceTensor &grad_output,
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *ip=iv.Data();
     float *op=ov.Data();
@@ -1706,9 +1192,9 @@ void CAIF_Ops::ELUBackwardHost(const CAIF_DeviceTensor &grad_output,
   {
     (void)output;
     const size_t n=input.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *ip=iv.Data();
     float *op=ov.Data();
@@ -1729,29 +1215,44 @@ void CAIF_Ops::ELUBackwardHost(const CAIF_DeviceTensor &grad_output,
 }
 
 void CAIF_Ops::GELUBackwardHost(const CAIF_DeviceTensor &grad_output,
-                      const CAIF_DeviceTensor &input,
-                      CAIF_DeviceTensor &grad_input)
+                                const CAIF_DeviceTensor &input,
+                                CAIF_DeviceTensor &grad_input,
+                                const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx)
 {
   try
   {
     const size_t n=input.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *ip=iv.Data();
     float *op=ov.Data();
-    const float k=0.7978845608028654f;
-    const float c=0.044715f;
-    #pragma omp parallel for
-    for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+    if(approx==CAIF_GELUApproximation::CAIF_GELUApproximation_e::Exact)
     {
-      const float x=ip[i];
-      const float inner=k*(x+c*x*x*x);
-      const float th=std::tanh(inner);
-      const float d_inner=k*(1.0f+3.0f*c*x*x);
-      const float d=0.5f*(1.0f+th)+0.5f*x*(1.0f-th*th)*d_inner;
-      op[i]=gp[i]*d;
+      #pragma omp parallel for
+      for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+      {
+        const float x=ip[i];
+        const float cdf=0.5f*(1.0f+std::erf(x*g_caif_gelu_inv_sqrt2));
+        const float pdf=g_caif_gelu_inv_sqrt2pi*std::exp(-0.5f*x*x);
+        op[i]=gp[i]*(cdf+x*pdf);
+      }
+    }
+    else
+    {
+      const float k=g_caif_gelu_sqrt_2_over_pi;
+      const float c=g_caif_gelu_coeff;
+      #pragma omp parallel for
+      for(int64_t i=0;i<static_cast<int64_t>(n);++i)
+      {
+        const float x=ip[i];
+        const float inner=k*(x+c*x*x*x);
+        const float th=std::tanh(inner);
+        const float d_inner=k*(1.0f+3.0f*c*x*x);
+        const float d=0.5f*(1.0f+th)+0.5f*x*(1.0f-th*th)*d_inner;
+        op[i]=gp[i]*d;
+      }
     }
   }
   CAIF_CATCH_BLOCK();
@@ -1766,9 +1267,9 @@ void CAIF_Ops::SwishBackwardHost(const CAIF_DeviceTensor &grad_output,
   {
     (void)output;
     const size_t n=input.TotalElements();
-    HostFloatReadView gv(grad_output);
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(grad_input);
+    CAIF_HostFloatReadView gv(grad_output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(grad_input);
     const float *gp=gv.Data();
     const float *ip=iv.Data();
     float *op=ov.Data();
@@ -1792,7 +1293,7 @@ float CAIF_Ops::ReduceSumHost(const CAIF_DeviceTensor &tensor)
   try
   {
     const size_t n=tensor.TotalElements();
-    HostFloatReadView tv(tensor);
+    CAIF_HostFloatReadView tv(tensor);
     const float *tp=tv.Data();
     float total=0.0f;
     #pragma omp parallel for reduction(+:total)
@@ -1833,9 +1334,9 @@ void CAIF_Ops::MSELossHost(const CAIF_DeviceTensor &pred,
     {
       THROW_CAIFE("MSELoss host: shape mismatch");
     }
-    HostFloatReadView pv(pred);
-    HostFloatReadView tv(target);
-    HostFloatWriteView lv(loss);
+    CAIF_HostFloatReadView pv(pred);
+    CAIF_HostFloatReadView tv(target);
+    CAIF_HostFloatWriteView lv(loss);
     const float *pp=pv.Data();
     const float *tp=tv.Data();
     float *lp=lv.Data();
@@ -1862,9 +1363,9 @@ void CAIF_Ops::MSELossBackwardHost(const CAIF_DeviceTensor &pred,
     {
       THROW_CAIFE("MSELossBackward host: shape mismatch");
     }
-    HostFloatReadView pv(pred);
-    HostFloatReadView tv(target);
-    HostFloatWriteView gv(grad);
+    CAIF_HostFloatReadView pv(pred);
+    CAIF_HostFloatReadView tv(target);
+    CAIF_HostFloatWriteView gv(grad);
     const float *pp=pv.Data();
     const float *tp=tv.Data();
     float *gp=gv.Data();
@@ -1896,10 +1397,10 @@ void CAIF_Ops::AdamUpdateHost(CAIF_DeviceTensor &param,
     {
       THROW_CAIFE("AdamUpdate host: shape mismatch");
     }
-    float *pp=HostFp32(param,"AdamUpdate");
-    const float *gp=HostFp32(grad,"AdamUpdate");
-    float *mp=HostFp32(m,"AdamUpdate");
-    float *vp=HostFp32(v,"AdamUpdate");
+    float *pp=CAIF_HostFpCast::HostFp32(param,"AdamUpdate");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad,"AdamUpdate");
+    float *mp=CAIF_HostFpCast::HostFp32(m,"AdamUpdate");
+    float *vp=CAIF_HostFpCast::HostFp32(v,"AdamUpdate");
     const float bc1=1.0f-std::pow(beta1,static_cast<float>(t));
     const float bc2=1.0f-std::pow(beta2,static_cast<float>(t));
     #pragma omp parallel for
@@ -1928,8 +1429,8 @@ void CAIF_Ops::SgdUpdateHost(CAIF_DeviceTensor &param,
     {
       THROW_CAIFE("SgdUpdate host: shape mismatch");
     }
-    float *pp=HostFp32(param,"SgdUpdate");
-    const float *gp=HostFp32(grad,"SgdUpdate");
+    float *pp=CAIF_HostFpCast::HostFp32(param,"SgdUpdate");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad,"SgdUpdate");
     #pragma omp parallel for
     for(int64_t i=0;i<static_cast<int64_t>(n);++i)
     {
@@ -1954,9 +1455,9 @@ void CAIF_Ops::MomentumUpdateHost(CAIF_DeviceTensor &param,
     {
       THROW_CAIFE("MomentumUpdate host: shape mismatch");
     }
-    float *pp=HostFp32(param,"MomentumUpdate");
-    const float *gp=HostFp32(grad,"MomentumUpdate");
-    float *vp=HostFp32(velocity,"MomentumUpdate");
+    float *pp=CAIF_HostFpCast::HostFp32(param,"MomentumUpdate");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad,"MomentumUpdate");
+    float *vp=CAIF_HostFpCast::HostFp32(velocity,"MomentumUpdate");
     #pragma omp parallel for
     for(int64_t i=0;i<static_cast<int64_t>(n);++i)
     {
@@ -1983,9 +1484,9 @@ void CAIF_Ops::RmspropUpdateHost(CAIF_DeviceTensor &param,
     {
       THROW_CAIFE("RmspropUpdate host: shape mismatch");
     }
-    float *pp=HostFp32(param,"RmspropUpdate");
-    const float *gp=HostFp32(grad,"RmspropUpdate");
-    float *ap=HostFp32(avg_sq,"RmspropUpdate");
+    float *pp=CAIF_HostFpCast::HostFp32(param,"RmspropUpdate");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad,"RmspropUpdate");
+    float *ap=CAIF_HostFpCast::HostFp32(avg_sq,"RmspropUpdate");
     #pragma omp parallel for
     for(int64_t i=0;i<static_cast<int64_t>(n);++i)
     {
@@ -2011,9 +1512,9 @@ void CAIF_Ops::AdaGradUpdateHost(CAIF_DeviceTensor &param,
     {
       THROW_CAIFE("AdaGradUpdate host: shape mismatch");
     }
-    float *pp=HostFp32(param,"AdaGradUpdate");
-    const float *gp=HostFp32(grad,"AdaGradUpdate");
-    float *ap=HostFp32(accum,"AdaGradUpdate");
+    float *pp=CAIF_HostFpCast::HostFp32(param,"AdaGradUpdate");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad,"AdaGradUpdate");
+    float *ap=CAIF_HostFpCast::HostFp32(accum,"AdaGradUpdate");
     #pragma omp parallel for
     for(int64_t i=0;i<static_cast<int64_t>(n);++i)
     {
@@ -2036,9 +1537,9 @@ void CAIF_Ops::MultiplyHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("Multiply host: shape mismatch");
     }
-    HostFloatReadView av(a);
-    HostFloatReadView bv(b);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView av(a);
+    CAIF_HostFloatReadView bv(b);
+    CAIF_HostFloatWriteView ov(output);
     const float *ap=av.Data();
     const float *bp=bv.Data();
     float *op=ov.Data();
@@ -2093,8 +1594,8 @@ void CAIF_Ops::AddScalarHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("AddScalar host: shape mismatch");
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -2117,9 +1618,9 @@ void CAIF_Ops::SubtractHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("Subtract host: shape mismatch");
     }
-    HostFloatReadView av(a);
-    HostFloatReadView bv(b);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView av(a);
+    CAIF_HostFloatReadView bv(b);
+    CAIF_HostFloatWriteView ov(output);
     const float *ap=av.Data();
     const float *bp=bv.Data();
     float *op=ov.Data();
@@ -2143,8 +1644,8 @@ void CAIF_Ops::SubtractScalarHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("SubtractScalar host: shape mismatch");
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -2167,9 +1668,9 @@ void CAIF_Ops::DivideHost(const CAIF_DeviceTensor &a,
     {
       THROW_CAIFE("Divide host: shape mismatch");
     }
-    HostFloatReadView av(a);
-    HostFloatReadView bv(b);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView av(a);
+    CAIF_HostFloatReadView bv(b);
+    CAIF_HostFloatWriteView ov(output);
     const float *ap=av.Data();
     const float *bp=bv.Data();
     float *op=ov.Data();
@@ -2194,8 +1695,8 @@ void CAIF_Ops::DivideScalarHost(const CAIF_DeviceTensor &input,
       THROW_CAIFE("DivideScalar host: shape mismatch");
     }
     const float inv=1.0f/scalar;
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -2216,8 +1717,8 @@ void CAIF_Ops::SqrtHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output
     {
       THROW_CAIFE("Sqrt host: shape mismatch");
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -2251,8 +1752,8 @@ void CAIF_Ops::SumAxisHost(const CAIF_DeviceTensor &input,
     {
       inner*=s[i];
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     const size_t total=outer*inner;
@@ -2279,7 +1780,7 @@ void CAIF_Ops::SumHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)
     {
       THROW_CAIFE("Sum host: output must be scalar");
     }
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatWriteView ov(output);
     float *op=ov.Data();
     op[0]=ReduceSumHost(input);
   }
@@ -2301,8 +1802,8 @@ void CAIF_Ops::LogSumExpHost(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &o
     {
       rows*=s[i];
     }
-    HostFloatReadView iv(input);
-    HostFloatWriteView ov(output);
+    CAIF_HostFloatReadView iv(input);
+    CAIF_HostFloatWriteView ov(output);
     const float *ip=iv.Data();
     float *op=ov.Data();
     #pragma omp parallel for
@@ -2350,8 +1851,8 @@ void CAIF_Ops::TopKHost(const CAIF_DeviceTensor &input,
     {
       THROW_CAIFE("TopK host: k out of range");
     }
-    const float *ip=HostFp32(input,"TopK");
-    float *vp=HostFp32(values,"TopK");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"TopK");
+    float *vp=CAIF_HostFpCast::HostFp32(values,"TopK");
     if(indices.Dtype()!=CAIF_DataType::CAIF_DataType_e::Int32
        &&indices.Dtype()!=CAIF_DataType::CAIF_DataType_e::UInt32)
     {
@@ -2367,7 +1868,7 @@ void CAIF_Ops::TopKHost(const CAIF_DeviceTensor &input,
       {
         order[c]=static_cast<uint32_t>(c);
       }
-      TopKDescendingCompare cmp(row);
+      CAIF_TopKDescendingCompare cmp(row);
       std::partial_sort(order.begin(),
                         order.begin()+k,
                         order.end(),
@@ -2398,8 +1899,8 @@ void CAIF_Ops::NormalizeRowsHost(const CAIF_DeviceTensor &input,CAIF_DeviceTenso
     {
       rows*=s[i];
     }
-    const float *ip=HostFp32(input,"NormalizeRows");
-    float *op=HostFp32(output,"NormalizeRows");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"NormalizeRows");
+    float *op=CAIF_HostFpCast::HostFp32(output,"NormalizeRows");
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(rows);++r)
     {
@@ -2410,7 +1911,7 @@ void CAIF_Ops::NormalizeRowsHost(const CAIF_DeviceTensor &input,CAIF_DeviceTenso
       {
         sum+=in[c];
       }
-      const float inv=1.0f/(sum+DIVISION_EPSILON);
+      const float inv=1.0f/(sum+g_caif_division_epsilon);
       for(size_t c=0;c<last;++c)
       {
         out[c]=in[c]*inv;
@@ -2439,9 +1940,9 @@ void CAIF_Ops::NormalizeRowsBackwardTopKGatherHost(const CAIF_DeviceTensor &grad
       THROW_CAIFE("NormalizeRowsBackwardTopKGather host: probs shape mismatch");
     }
     const int num_experts=static_cast<int>(probs.Shape()[1]);
-    const float *gw=HostFp32(grad_w,"NormalizeRowsBackwardTopKGather");
-    const float *pp=HostFp32(probs,"NormalizeRowsBackwardTopKGather");
-    float *gp=HostFp32(grad_p_topk,"NormalizeRowsBackwardTopKGather");
+    const float *gw=CAIF_HostFpCast::HostFp32(grad_w,"NormalizeRowsBackwardTopKGather");
+    const float *pp=CAIF_HostFpCast::HostFp32(probs,"NormalizeRowsBackwardTopKGather");
+    float *gp=CAIF_HostFpCast::HostFp32(grad_p_topk,"NormalizeRowsBackwardTopKGather");
     const uint32_t *idx=static_cast<const uint32_t*>(indices.DeviceDataRaw());
     #pragma omp parallel for
     for(int r=0;r<rows;++r)
@@ -2453,7 +1954,7 @@ void CAIF_Ops::NormalizeRowsBackwardTopKGatherHost(const CAIF_DeviceTensor &grad
                        +static_cast<size_t>(idx[static_cast<size_t>(r)*static_cast<size_t>(k)
                                                +static_cast<size_t>(j)])];
       }
-      const float inv=1.0f/(sum_p_topk+DIVISION_EPSILON);
+      const float inv=1.0f/(sum_p_topk+g_caif_division_epsilon);
       const float inv2=inv*inv;
       float dot=0.0f;
       for(int j=0;j<k;++j)
@@ -2490,8 +1991,8 @@ void CAIF_Ops::GatherTopKValuesHost(const CAIF_DeviceTensor &scores,
     const size_t rows=s_shape[0];
     const size_t num_experts=s_shape[1];
     const size_t k=i_shape[1];
-    const float *sp=HostFp32(scores,"GatherTopKValues");
-    float *op=HostFp32(out,"GatherTopKValues");
+    const float *sp=CAIF_HostFpCast::HostFp32(scores,"GatherTopKValues");
+    float *op=CAIF_HostFpCast::HostFp32(out,"GatherTopKValues");
     const uint32_t *idx=static_cast<const uint32_t*>(indices.DeviceDataRaw());
     #pragma omp parallel for
     for(size_t r=0;r<rows;++r)
@@ -2517,8 +2018,8 @@ void CAIF_Ops::ScatterAddHost(const CAIF_DeviceTensor &values,
     {
       THROW_CAIFE("ScatterAdd host: values/indices length mismatch");
     }
-    const float *vp=HostFp32(values,"ScatterAdd");
-    float *op=HostFp32(output,"ScatterAdd");
+    const float *vp=CAIF_HostFpCast::HostFp32(values,"ScatterAdd");
+    float *op=CAIF_HostFpCast::HostFp32(output,"ScatterAdd");
     const uint32_t *idx=static_cast<const uint32_t*>(indices.DeviceDataRaw());
     for(size_t i=0;i<n;++i)
     {
@@ -2547,7 +2048,7 @@ void CAIF_Ops::MoEDispatchHost(const CAIF_DeviceTensor &input,
     }
     const size_t num_tokens=si[0];
     const size_t dim=si[1];
-    const float *ip=HostFp32(input,"MoEDispatch");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"MoEDispatch");
     const uint32_t *idx=static_cast<const uint32_t*>(expert_indices.DeviceDataRaw());
     std::vector<size_t> cursors(expert_inputs.size(),0);
     for(size_t tok=0;tok<num_tokens;++tok)
@@ -2563,7 +2064,7 @@ void CAIF_Ops::MoEDispatchHost(const CAIF_DeviceTensor &input,
         {
           continue;
         }
-        float *eo=HostFp32(expert_inputs[e],"MoEDispatch");
+        float *eo=CAIF_HostFpCast::HostFp32(expert_inputs[e],"MoEDispatch");
         std::memcpy(eo+cursors[e]*dim,ip+tok*dim,dim*sizeof(float));
         cursors[e]++;
       }
@@ -2588,10 +2089,10 @@ void CAIF_Ops::MoECombineHost(const std::vector<CAIF_DeviceTensor> &expert_outpu
     }
     const size_t num_tokens=so[0];
     const size_t dim=so[1];
-    float *op=HostFp32(output,"MoECombine");
+    float *op=CAIF_HostFpCast::HostFp32(output,"MoECombine");
     std::memset(op,0,num_tokens*dim*sizeof(float));
     const uint32_t *idx=static_cast<const uint32_t*>(expert_indices.DeviceDataRaw());
-    const float *wp=HostFp32(expert_weights,"MoECombine");
+    const float *wp=CAIF_HostFpCast::HostFp32(expert_weights,"MoECombine");
     std::vector<size_t> cursors(expert_outputs.size(),0);
     (void)token_counts;
     for(size_t tok=0;tok<num_tokens;++tok)
@@ -2604,7 +2105,7 @@ void CAIF_Ops::MoECombineHost(const std::vector<CAIF_DeviceTensor> &expert_outpu
           continue;
         }
         const float w=wp[tok*top_k+k];
-        const float *eo=HostFp32(expert_outputs[e],"MoECombine");
+        const float *eo=CAIF_HostFpCast::HostFp32(expert_outputs[e],"MoECombine");
         for(size_t d=0;d<dim;++d)
         {
           op[tok*dim+d]+=w*eo[cursors[e]*dim+d];
@@ -2634,13 +2135,13 @@ void CAIF_Ops::MoECombineBackwardHost(const CAIF_DeviceTensor &grad_output,
     }
     const size_t num_tokens=sg[0];
     const size_t dim=sg[1];
-    const float *gp=HostFp32(grad_output,"MoECombineBackward");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad_output,"MoECombineBackward");
     const uint32_t *idx=static_cast<const uint32_t*>(expert_indices.DeviceDataRaw());
-    const float *wp=HostFp32(expert_weights,"MoECombineBackward");
-    float *gwp=HostFp32(grad_weights,"MoECombineBackward");
+    const float *wp=CAIF_HostFpCast::HostFp32(expert_weights,"MoECombineBackward");
+    float *gwp=CAIF_HostFpCast::HostFp32(grad_weights,"MoECombineBackward");
     for(size_t i=0;i<grad_expert_outputs.size();++i)
     {
-      float *p=HostFp32(grad_expert_outputs[i],"MoECombineBackward");
+      float *p=CAIF_HostFpCast::HostFp32(grad_expert_outputs[i],"MoECombineBackward");
       std::memset(p,0,grad_expert_outputs[i].TotalElements()*sizeof(float));
     }
     std::memset(gwp,0,num_tokens*top_k*sizeof(float));
@@ -2656,8 +2157,8 @@ void CAIF_Ops::MoECombineBackwardHost(const CAIF_DeviceTensor &grad_output,
           continue;
         }
         const float w=wp[tok*top_k+k];
-        const float *eo=HostFp32(expert_outputs[e],"MoECombineBackward");
-        float *geo=HostFp32(grad_expert_outputs[e],"MoECombineBackward");
+        const float *eo=CAIF_HostFpCast::HostFp32(expert_outputs[e],"MoECombineBackward");
+        float *geo=CAIF_HostFpCast::HostFp32(grad_expert_outputs[e],"MoECombineBackward");
         float dot=0.0f;
         for(size_t d=0;d<dim;++d)
         {
@@ -2687,7 +2188,7 @@ void CAIF_Ops::MoEDispatchBackwardHost(const std::vector<CAIF_DeviceTensor> &gra
     }
     const size_t num_tokens=sg[0];
     const size_t dim=sg[1];
-    float *gp=HostFp32(grad_input,"MoEDispatchBackward");
+    float *gp=CAIF_HostFpCast::HostFp32(grad_input,"MoEDispatchBackward");
     std::memset(gp,0,num_tokens*dim*sizeof(float));
     const uint32_t *idx=static_cast<const uint32_t*>(expert_indices.DeviceDataRaw());
     std::vector<size_t> cursors(grad_expert_inputs.size(),0);
@@ -2701,7 +2202,7 @@ void CAIF_Ops::MoEDispatchBackwardHost(const std::vector<CAIF_DeviceTensor> &gra
         {
           continue;
         }
-        const float *ge=HostFp32(grad_expert_inputs[e],"MoEDispatchBackward");
+        const float *ge=CAIF_HostFpCast::HostFp32(grad_expert_inputs[e],"MoEDispatchBackward");
         for(size_t d=0;d<dim;++d)
         {
           gp[tok*dim+d]+=ge[cursors[e]*dim+d];
@@ -2728,9 +2229,9 @@ void CAIF_Ops::MoETopKGatingHost(const CAIF_DeviceTensor &router_logits,
       THROW_CAIFE("MoETopKGating host: router_logits shape mismatch");
     }
     const size_t rows=s[0];
-    const float *lp=HostFp32(router_logits,"MoETopKGating");
-    float *probs=HostFp32(router_probs,"MoETopKGating");
-    float *wp=HostFp32(expert_weights,"MoETopKGating");
+    const float *lp=CAIF_HostFpCast::HostFp32(router_logits,"MoETopKGating");
+    float *probs=CAIF_HostFpCast::HostFp32(router_probs,"MoETopKGating");
+    float *wp=CAIF_HostFpCast::HostFp32(expert_weights,"MoETopKGating");
     uint32_t *idx=static_cast<uint32_t*>(expert_indices.DeviceDataRaw());
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(rows);++r)
@@ -2762,7 +2263,7 @@ void CAIF_Ops::MoETopKGatingHost(const CAIF_DeviceTensor &router_logits,
       {
         order[e]=e;
       }
-      TopKDescendingCompare cmp(pr);
+      CAIF_TopKDescendingCompare cmp(pr);
       std::partial_sort(order.begin(),
                         order.begin()+top_k,
                         order.end(),
@@ -2772,7 +2273,7 @@ void CAIF_Ops::MoETopKGatingHost(const CAIF_DeviceTensor &router_logits,
       {
         sum_topk+=pr[order[k]];
       }
-      const float inv_topk=1.0f/(sum_topk+DIVISION_EPSILON);
+      const float inv_topk=1.0f/(sum_topk+g_caif_division_epsilon);
       for(uint32_t k=0;k<top_k;++k)
       {
         idx[static_cast<size_t>(r)*top_k+k]=order[k];
@@ -2825,9 +2326,9 @@ void CAIF_Ops::MoEZLossGradAddHost(const CAIF_DeviceTensor &logsumexp_scaled,
     }
     const size_t rows=sg[0];
     const size_t num_experts=sg[1];
-    const float *lse=HostFp32(logsumexp_scaled,"MoEZLossGradAdd");
-    const float *pp=HostFp32(probs,"MoEZLossGradAdd");
-    float *gp=HostFp32(grad_logits,"MoEZLossGradAdd");
+    const float *lse=CAIF_HostFpCast::HostFp32(logsumexp_scaled,"MoEZLossGradAdd");
+    const float *pp=CAIF_HostFpCast::HostFp32(probs,"MoEZLossGradAdd");
+    float *gp=CAIF_HostFpCast::HostFp32(grad_logits,"MoEZLossGradAdd");
     #pragma omp parallel for
     for(int64_t r=0;r<static_cast<int64_t>(rows);++r)
     {
@@ -2860,8 +2361,8 @@ void CAIF_Ops::MoEDispatchGPUHost(const CAIF_DeviceTensor &input,
     }
     const size_t num_tokens=si[0];
     const size_t dim=si[1];
-    const float *ip=HostFp32(input,"MoEDispatchGPU");
-    float *bp=HostFp32(expert_buffer,"MoEDispatchGPU");
+    const float *ip=CAIF_HostFpCast::HostFp32(input,"MoEDispatchGPU");
+    float *bp=CAIF_HostFpCast::HostFp32(expert_buffer,"MoEDispatchGPU");
     const uint32_t *dmap=static_cast<const uint32_t*>(dispatch_map.DeviceDataRaw());
     std::memset(bp,0,expert_buffer.TotalElements()*sizeof(float));
     for(size_t tok=0;tok<num_tokens;++tok)
@@ -2899,9 +2400,9 @@ void CAIF_Ops::MoECombineGPUHost(const CAIF_DeviceTensor &expert_buffer,
     }
     const size_t num_tokens=so[0];
     const size_t dim=so[1];
-    const float *bp=HostFp32(expert_buffer,"MoECombineGPU");
-    const float *wp=HostFp32(expert_weights,"MoECombineGPU");
-    float *op=HostFp32(output,"MoECombineGPU");
+    const float *bp=CAIF_HostFpCast::HostFp32(expert_buffer,"MoECombineGPU");
+    const float *wp=CAIF_HostFpCast::HostFp32(expert_weights,"MoECombineGPU");
+    float *op=CAIF_HostFpCast::HostFp32(output,"MoECombineGPU");
     std::memset(op,0,num_tokens*dim*sizeof(float));
     const uint32_t *dmap=static_cast<const uint32_t*>(dispatch_map.DeviceDataRaw());
     for(size_t tok=0;tok<num_tokens;++tok)
@@ -2985,11 +2486,11 @@ void CAIF_Ops::MoECombineBackwardGPUHost(const CAIF_DeviceTensor &grad_output,
     }
     const size_t num_tokens=sg[0];
     const size_t dim=sg[1];
-    const float *gp=HostFp32(grad_output,"MoECombineBackwardGPU");
-    const float *bp=HostFp32(expert_buffer,"MoECombineBackwardGPU");
-    const float *wp=HostFp32(expert_weights,"MoECombineBackwardGPU");
-    float *gb=HostFp32(grad_expert_buffer,"MoECombineBackwardGPU");
-    float *gw=HostFp32(grad_weights,"MoECombineBackwardGPU");
+    const float *gp=CAIF_HostFpCast::HostFp32(grad_output,"MoECombineBackwardGPU");
+    const float *bp=CAIF_HostFpCast::HostFp32(expert_buffer,"MoECombineBackwardGPU");
+    const float *wp=CAIF_HostFpCast::HostFp32(expert_weights,"MoECombineBackwardGPU");
+    float *gb=CAIF_HostFpCast::HostFp32(grad_expert_buffer,"MoECombineBackwardGPU");
+    float *gw=CAIF_HostFpCast::HostFp32(grad_weights,"MoECombineBackwardGPU");
     const uint32_t *dmap=static_cast<const uint32_t*>(dispatch_map.DeviceDataRaw());
     std::memset(gb,0,grad_expert_buffer.TotalElements()*sizeof(float));
     std::memset(gw,0,num_tokens*top_k*sizeof(float));
@@ -3034,8 +2535,8 @@ void CAIF_Ops::MoEDispatchBackwardGPUHost(const CAIF_DeviceTensor &grad_expert_b
     }
     const size_t num_tokens=sg[0];
     const size_t dim=sg[1];
-    const float *gb=HostFp32(grad_expert_buffer,"MoEDispatchBackwardGPU");
-    float *gp=HostFp32(grad_input,"MoEDispatchBackwardGPU");
+    const float *gb=CAIF_HostFpCast::HostFp32(grad_expert_buffer,"MoEDispatchBackwardGPU");
+    float *gp=CAIF_HostFpCast::HostFp32(grad_input,"MoEDispatchBackwardGPU");
     std::memset(gp,0,num_tokens*dim*sizeof(float));
     const uint32_t *dmap=static_cast<const uint32_t*>(dispatch_map.DeviceDataRaw());
     for(size_t tok=0;tok<num_tokens;++tok)

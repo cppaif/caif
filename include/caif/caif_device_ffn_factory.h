@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_device_activation.h"
 #include "caif_data_type.h"
@@ -29,11 +30,10 @@
 namespace instance
 {
 
-class CAIF_DeviceFFNFactory
+class CAIF_DeviceFFNFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceFFNFactory()=delete;
-    ~CAIF_DeviceFFNFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(uint32_t dim,

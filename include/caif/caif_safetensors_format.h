@@ -23,6 +23,7 @@
 #include "caif_device_tensor.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
+#include "caif_serialization_constants.h"
 #include <vector>
 #include <map>
 #include <string>
@@ -196,12 +197,40 @@ class CAIF_SafeTensorsFormat:public CAIF_ModelFormat
                                      const std::string &tensor_name,
                                      CAIF_CudaStream &stream)const;
 
-    std::string Extension()const override{return ".safetensors";}
-    std::string FormatName()const override{return "SafeTensors";}
+    std::string Extension()const override{return g_serial_extension;}
+    std::string FormatName()const override{return g_serial_format_name;}
+
+    /**
+     * @brief Map a CAIF dtype to its SafeTensors string form (e.g.
+     * Float32 → "F32", BFloat16 → "BF16"). Throws on the unsupported
+     * cell; SafeTensors does not have a designated name for every CAIF
+     * dtype.
+     */
+    static const std::string &DtypeToSafeTensorsName(const CAIF_DataType::CAIF_DataType_e dt);
+
+    /**
+     * @brief Map a SafeTensors string form back to a CAIF dtype.
+     * Throws if `name` is not a recognised SafeTensors dtype.
+     */
+    static CAIF_DataType::CAIF_DataType_e DtypeFromSafeTensorsName(const std::string &name);
+
+    /**
+     * @brief Read-only access to the static const dtype→name map. Used
+     * by callers that need to iterate all pairs (e.g. enumerating
+     * supported dtypes for diagnostics).
+     */
+    static const std::map<CAIF_DataType::CAIF_DataType_e,std::string> &
+    DtypeToSafeTensorsNameMap(){return _dtype_to_safetensors_name;}
 
   protected:
 
   private:
+    // Static const map of CAIF dtype → SafeTensors string form. Defined
+    // at file scope in caif_safetensors_format.cpp; initialised before
+    // main() via the static-storage rules. Strings come from
+    // g_serial_dtype_* in caif_serialization_constants.h.
+    static const std::map<CAIF_DataType::CAIF_DataType_e,std::string> _dtype_to_safetensors_name;
+
     // JSON building helpers
     static std::string BuildJsonHeader(
         const std::vector<std::pair<std::string,const CAIF_DeviceTensor*>> &tensors,

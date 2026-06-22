@@ -22,7 +22,7 @@ namespace instance
 std::unique_ptr<CAIF_DeviceLayer>
 CAIF_DevicePositionalEncodingFactory::Create(uint32_t max_seq_len,
                                               uint32_t dim,
-                                              PositionalEncodingMode_e mode,
+                                              CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e mode,
                                               CAIF_CudaStream &stream,
                                               CAIF_DataType::CAIF_DataType_e compute_dtype,
                                               CAIF_DataType::CAIF_DataType_e storage_dtype)
@@ -33,19 +33,18 @@ CAIF_DevicePositionalEncodingFactory::Create(uint32_t max_seq_len,
     (void)compute_dtype;
     if(storage_dtype==Dtype_e::Float32)
     {
-      CAIF_DevicePositionalEncoding<float,float>::Config_t cfg{max_seq_len,dim,mode};
+      CAIF_DevicePositionalEncodingConfig cfg{max_seq_len,dim,mode};
       return std::make_unique<CAIF_DevicePositionalEncoding<float,float>>(cfg,stream);
     }
 #ifdef USE_CAIF_CUDA
     if(storage_dtype==Dtype_e::Float16)
     {
-      CAIF_DevicePositionalEncoding<__half,__half>::Config_t cfg{max_seq_len,dim,mode};
+      CAIF_DevicePositionalEncodingConfig cfg{max_seq_len,dim,mode};
       return std::make_unique<CAIF_DevicePositionalEncoding<__half,__half>>(cfg,stream);
     }
     if(storage_dtype==Dtype_e::BFloat16)
     {
-      CAIF_DevicePositionalEncoding<__nv_bfloat16,__nv_bfloat16>::Config_t
-                                                  cfg{max_seq_len,dim,mode};
+      CAIF_DevicePositionalEncodingConfig cfg{max_seq_len,dim,mode};
       return std::make_unique<CAIF_DevicePositionalEncoding<__nv_bfloat16,
                                                             __nv_bfloat16>>(cfg,stream);
     }

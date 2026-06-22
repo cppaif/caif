@@ -25,7 +25,8 @@
 #include "caif_host_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include <iostream>
+#include "ise_lib/ise_out.h"
+
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -36,37 +37,63 @@
 #include <cuda_bf16.h>
 #endif
 
-using namespace instance;
-
-namespace
+namespace instance
 {
 
-constexpr uint32_t g_batch=2;
-constexpr uint32_t g_dec_seq=4;
-constexpr uint32_t g_enc_seq=5;
-constexpr uint32_t g_dim=16;
-constexpr uint32_t g_heads=4;
-constexpr uint32_t g_kv_heads=4;
-constexpr uint32_t g_head_dim=4;
-constexpr uint32_t g_seed_init=7;
+#ifdef USE_CAIF_CUDA
 
-void ReportResult(const char *test_name,const bool passed)
+constexpr uint32_t g_caif_crossattn_test_batch=2;
+constexpr uint32_t g_caif_crossattn_test_dec_seq=4;
+constexpr uint32_t g_caif_crossattn_test_enc_seq=5;
+constexpr uint32_t g_caif_crossattn_test_dim=16;
+constexpr uint32_t g_caif_crossattn_test_heads=4;
+constexpr uint32_t g_caif_crossattn_test_kv_heads=4;
+constexpr uint32_t g_caif_crossattn_test_head_dim=4;
+constexpr uint32_t g_caif_crossattn_test_seed_init=7;
+constexpr int32_t g_caif_crossattn_test_data_mod=29;
+constexpr float g_caif_crossattn_test_data_scale=0.11f;
+constexpr float g_caif_crossattn_test_data_shift=1.5f;
+constexpr float g_caif_crossattn_test_data_range=0.35f;
+constexpr float g_caif_crossattn_test_grad_fill=0.5f;
+
+//------------------------------------------------------------------------------
+// Shape/finiteness and dtype-sweep tests for CAIF_DeviceCrossAttention.
+//------------------------------------------------------------------------------
+class CAIF_CrossAttentionTests
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
+  public:
+    static void RunAll();
 
-std::vector<float> MakeData(const size_t n,const int32_t seed)
+  protected:
+
+  private:
+    static std::vector<float> MakeData(const size_t n,const int32_t seed);
+    static bool IsFinite(const float *p,const size_t n);
+    static CAIF_DeviceTensor MakeFp32Device(const std::vector<float> &data,
+                                             const std::vector<uint32_t> &shape,
+                                             CAIF_CudaStream &stream);
+
+    template<typename StorageT>
+    static bool RunCrossAttentionDtype(const CAIF_DataType::CAIF_DataType_e storage_dt);
+
+    static void TestCrossAttentionForwardShape();
+    static void TestCrossAttentionBackward();
+    static void TestCrossAttentionDtypeSweep();
+};
+
+std::vector<float> CAIF_CrossAttentionTests::MakeData(const size_t n,const int32_t seed)
 {
   std::vector<float> v(n);
   for(size_t i=0;i<n;++i)
   {
-    const float t=static_cast<float>((i+seed)%29)*0.11f;
-    v[i]=(t-1.5f)*0.35f;
+    const float t=static_cast<float>((static_cast<int32_t>(i)+seed)%g_caif_crossattn_test_data_mod)*
+                  g_caif_crossattn_test_data_scale;
+    v[i]=(t-g_caif_crossattn_test_data_shift)*g_caif_crossattn_test_data_range;
   }
   return v;
 }
 
-bool IsFinite(const float *p,const size_t n)
+bool CAIF_CrossAttentionTests::IsFinite(const float *p,const size_t n)
 {
   for(size_t i=0;i<n;++i)
   {
@@ -78,114 +105,49 @@ bool IsFinite(const float *p,const size_t n)
   return true;
 }
 
-#ifdef USE_CAIF_CUDA
-
-CAIF_DeviceTensor MakeFp32Device(const std::vector<float> &data,
-                                 const std::vector<uint32_t> &shape,
-                                 CAIF_CudaStream &stream)
+CAIF_DeviceTensor CAIF_CrossAttentionTests::MakeFp32Device(const std::vector<float> &data,
+                                                             const std::vector<uint32_t> &shape,
+                                                             CAIF_CudaStream &stream)
 {
   return CAIF_DeviceTensor::FromHostData(data.data(),shape,stream);
 }
 
-void TestCrossAttentionForwardShape()
-{
-  try
-  {
-    CAIF_CudaStream stream;
-    CAIF_RunContext ctx;
-    ctx.SetStream(stream);
-    ctx.SetTraining(true);
-
-    typename CAIF_DeviceCrossAttention<float,float>::CrossAttentionConfig_t cfg=
-      {g_dim,g_heads,g_kv_heads,g_head_dim};
-    CAIF_DeviceCrossAttention<float,float> layer(cfg,stream);
-    layer.InitializeWeights(g_seed_init);
-
-    const std::vector<float> dec_host=MakeData(g_batch*g_dec_seq*g_dim,11);
-    const std::vector<float> enc_host=MakeData(g_batch*g_enc_seq*g_dim,12);
-    CAIF_DeviceTensor dec=MakeFp32Device(dec_host,{g_batch,g_dec_seq,g_dim},stream);
-    CAIF_DeviceTensor enc=MakeFp32Device(enc_host,{g_batch,g_enc_seq,g_dim},stream);
-
-    CAIF_DeviceTensor out=layer.ForwardCross(dec,enc,ctx);
-    CAIF_HostTensor host_out=out.ToHost();
-
-    bool ok=out.Shape().size()==3 &&
-            out.Shape()[0]==g_batch &&
-            out.Shape()[1]==g_dec_seq &&
-            out.Shape()[2]==g_dim;
-    if(ok==true)
-    {
-      ok=IsFinite(host_out.Data(),host_out.TotalElements());
-    }
-    ReportResult("CrossAttention::Forward fp32 shape+finite",ok);
-  }
-  CAIF_TEST_CATCH_BLOCK("CrossAttention::Forward fp32")
-}
-
-void TestCrossAttentionBackward()
-{
-  try
-  {
-    CAIF_CudaStream stream;
-    CAIF_RunContext ctx;
-    ctx.SetStream(stream);
-    ctx.SetTraining(true);
-
-    typename CAIF_DeviceCrossAttention<float,float>::CrossAttentionConfig_t cfg=
-      {g_dim,g_heads,g_kv_heads,g_head_dim};
-    CAIF_DeviceCrossAttention<float,float> layer(cfg,stream);
-    layer.InitializeWeights(g_seed_init+1);
-
-    const std::vector<float> dec_host=MakeData(g_batch*g_dec_seq*g_dim,21);
-    const std::vector<float> enc_host=MakeData(g_batch*g_enc_seq*g_dim,22);
-    CAIF_DeviceTensor dec=MakeFp32Device(dec_host,{g_batch,g_dec_seq,g_dim},stream);
-    CAIF_DeviceTensor enc=MakeFp32Device(enc_host,{g_batch,g_enc_seq,g_dim},stream);
-
-    layer.ZeroGradients();
-    CAIF_DeviceTensor out=layer.ForwardCross(dec,enc,ctx);
-
-    std::vector<float> grad_host(g_batch*g_dec_seq*g_dim,0.5f);
-    CAIF_DeviceTensor grad_out=MakeFp32Device(grad_host,
-                                              {g_batch,g_dec_seq,g_dim},stream);
-    CAIF_DeviceTensor grad_enc=CAIF_DeviceTensor::Uninitialized(
-                                 {g_batch,g_enc_seq,g_dim},stream,
-                                 CAIF_DataType::CAIF_DataType_e::Float32);
-    CAIF_DeviceTensor grad_dec=layer.BackwardCross(grad_out,grad_enc,ctx);
-
-    CAIF_HostTensor host_gd=grad_dec.ToHost();
-    CAIF_HostTensor host_ge=grad_enc.ToHost();
-
-    bool ok=grad_dec.Shape()==std::vector<uint32_t>{g_batch,g_dec_seq,g_dim} &&
-            grad_enc.Shape()==std::vector<uint32_t>{g_batch,g_enc_seq,g_dim};
-    if(ok==true)
-    {
-      ok=IsFinite(host_gd.Data(),host_gd.TotalElements()) &&
-         IsFinite(host_ge.Data(),host_ge.TotalElements());
-    }
-    ReportResult("CrossAttention::Backward fp32 shape+finite",ok);
-  }
-  CAIF_TEST_CATCH_BLOCK("CrossAttention::Backward fp32")
-}
-
 template<typename StorageT>
-bool RunCrossAttentionDtype(const CAIF_DataType::CAIF_DataType_e storage_dt)
+bool CAIF_CrossAttentionTests::RunCrossAttentionDtype(
+  const CAIF_DataType::CAIF_DataType_e storage_dt)
 {
   CAIF_CudaStream stream;
   CAIF_RunContext ctx;
   ctx.SetStream(stream);
   ctx.SetTraining(true);
 
-  typename CAIF_DeviceCrossAttention<float,StorageT>::CrossAttentionConfig_t cfg=
-    {g_dim,g_heads,g_kv_heads,g_head_dim};
+  CAIF_DeviceCrossAttentionConfig cfg=
+    {g_caif_crossattn_test_dim,
+     g_caif_crossattn_test_dim,
+     g_caif_crossattn_test_heads,
+     g_caif_crossattn_test_kv_heads,
+     g_caif_crossattn_test_head_dim};
   CAIF_DeviceCrossAttention<float,StorageT> layer(cfg,stream);
-  layer.InitializeWeights(g_seed_init+2);
+  layer.InitializeWeights(g_caif_crossattn_test_seed_init+2);
 
-  const std::vector<float> dec_host=MakeData(g_batch*g_dec_seq*g_dim,31);
-  const std::vector<float> enc_host=MakeData(g_batch*g_enc_seq*g_dim,32);
-  CAIF_DeviceTensor dec_fp32=MakeFp32Device(dec_host,
-                                            {g_batch,g_dec_seq,g_dim},stream);
-  CAIF_DeviceTensor enc_fp32=MakeFp32Device(enc_host,
-                                            {g_batch,g_enc_seq,g_dim},stream);
+  const std::vector<float> dec_host=
+    MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_dec_seq*
+             g_caif_crossattn_test_dim,31);
+  const std::vector<float> enc_host=
+    MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_enc_seq*
+             g_caif_crossattn_test_dim,32);
+  CAIF_DeviceTensor dec_fp32=
+    MakeFp32Device(dec_host,
+                   {g_caif_crossattn_test_batch,
+                    g_caif_crossattn_test_dec_seq,
+                    g_caif_crossattn_test_dim},
+                   stream);
+  CAIF_DeviceTensor enc_fp32=
+    MakeFp32Device(enc_host,
+                   {g_caif_crossattn_test_batch,
+                    g_caif_crossattn_test_enc_seq,
+                    g_caif_crossattn_test_dim},
+                   stream);
   CAIF_DeviceTensor dec=dec_fp32.To(storage_dt);
   CAIF_DeviceTensor enc=enc_fp32.To(storage_dt);
 
@@ -194,40 +156,176 @@ bool RunCrossAttentionDtype(const CAIF_DataType::CAIF_DataType_e storage_dt)
   CAIF_HostTensor host_out=out_fp32.ToHost();
 
   return out.Shape().size()==3 &&
-         out.Shape()[0]==g_batch &&
-         out.Shape()[1]==g_dec_seq &&
-         out.Shape()[2]==g_dim &&
+         out.Shape()[0]==g_caif_crossattn_test_batch &&
+         out.Shape()[1]==g_caif_crossattn_test_dec_seq &&
+         out.Shape()[2]==g_caif_crossattn_test_dim &&
          IsFinite(host_out.Data(),host_out.TotalElements());
 }
 
-void TestCrossAttentionDtypeSweep()
+void CAIF_CrossAttentionTests::TestCrossAttentionForwardShape()
 {
   try
   {
-    using Dtype_e=CAIF_DataType::CAIF_DataType_e;
-    ReportResult("CrossAttention::Forward fp16 storage",
-                 (RunCrossAttentionDtype<__half>(Dtype_e::Float16)));
-    ReportResult("CrossAttention::Forward bf16 storage",
-                 (RunCrossAttentionDtype<__nv_bfloat16>(Dtype_e::BFloat16)));
+    CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+
+    CAIF_DeviceCrossAttentionConfig cfg=
+      {g_caif_crossattn_test_dim,
+       g_caif_crossattn_test_dim,
+       g_caif_crossattn_test_heads,
+       g_caif_crossattn_test_kv_heads,
+       g_caif_crossattn_test_head_dim};
+    CAIF_DeviceCrossAttention<float,float> layer(cfg,stream);
+    layer.InitializeWeights(g_caif_crossattn_test_seed_init);
+
+    const std::vector<float> dec_host=
+      MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_dec_seq*
+               g_caif_crossattn_test_dim,11);
+    const std::vector<float> enc_host=
+      MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_enc_seq*
+               g_caif_crossattn_test_dim,12);
+    CAIF_DeviceTensor dec=
+      MakeFp32Device(dec_host,
+                     {g_caif_crossattn_test_batch,
+                      g_caif_crossattn_test_dec_seq,
+                      g_caif_crossattn_test_dim},
+                     stream);
+    CAIF_DeviceTensor enc=
+      MakeFp32Device(enc_host,
+                     {g_caif_crossattn_test_batch,
+                      g_caif_crossattn_test_enc_seq,
+                      g_caif_crossattn_test_dim},
+                     stream);
+
+    CAIF_DeviceTensor out=layer.ForwardCross(dec,enc,ctx);
+    CAIF_HostTensor host_out=out.ToHost();
+
+    bool ok=out.Shape().size()==3 &&
+            out.Shape()[0]==g_caif_crossattn_test_batch &&
+            out.Shape()[1]==g_caif_crossattn_test_dec_seq &&
+            out.Shape()[2]==g_caif_crossattn_test_dim;
+    if(ok==true)
+    {
+      ok=IsFinite(host_out.Data(),host_out.TotalElements());
+    }
+    CAIF_TestHarness::Report("CrossAttention::Forward fp32 shape+finite",ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("CrossAttention::Forward fp32")
+}
+
+void CAIF_CrossAttentionTests::TestCrossAttentionBackward()
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
+
+    CAIF_DeviceCrossAttentionConfig cfg=
+      {g_caif_crossattn_test_dim,
+       g_caif_crossattn_test_dim,
+       g_caif_crossattn_test_heads,
+       g_caif_crossattn_test_kv_heads,
+       g_caif_crossattn_test_head_dim};
+    CAIF_DeviceCrossAttention<float,float> layer(cfg,stream);
+    layer.InitializeWeights(g_caif_crossattn_test_seed_init+1);
+
+    const std::vector<float> dec_host=
+      MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_dec_seq*
+               g_caif_crossattn_test_dim,21);
+    const std::vector<float> enc_host=
+      MakeData(g_caif_crossattn_test_batch*g_caif_crossattn_test_enc_seq*
+               g_caif_crossattn_test_dim,22);
+    CAIF_DeviceTensor dec=
+      MakeFp32Device(dec_host,
+                     {g_caif_crossattn_test_batch,
+                      g_caif_crossattn_test_dec_seq,
+                      g_caif_crossattn_test_dim},
+                     stream);
+    CAIF_DeviceTensor enc=
+      MakeFp32Device(enc_host,
+                     {g_caif_crossattn_test_batch,
+                      g_caif_crossattn_test_enc_seq,
+                      g_caif_crossattn_test_dim},
+                     stream);
+
+    layer.ZeroGradients();
+    CAIF_DeviceTensor out=layer.ForwardCross(dec,enc,ctx);
+
+    std::vector<float> grad_host(g_caif_crossattn_test_batch*g_caif_crossattn_test_dec_seq*
+                                 g_caif_crossattn_test_dim,g_caif_crossattn_test_grad_fill);
+    CAIF_DeviceTensor grad_out=
+      MakeFp32Device(grad_host,
+                     {g_caif_crossattn_test_batch,
+                      g_caif_crossattn_test_dec_seq,
+                      g_caif_crossattn_test_dim},
+                     stream);
+    CAIF_DeviceTensor grad_enc=
+      CAIF_DeviceTensor::Uninitialized({g_caif_crossattn_test_batch,
+                                        g_caif_crossattn_test_enc_seq,
+                                        g_caif_crossattn_test_dim},
+                                       stream,
+                                       CAIF_DataType::CAIF_DataType_e::Float32);
+    CAIF_DeviceTensor grad_dec=layer.BackwardCross(grad_out,grad_enc,ctx);
+
+    CAIF_HostTensor host_gd=grad_dec.ToHost();
+    CAIF_HostTensor host_ge=grad_enc.ToHost();
+
+    bool ok=
+      grad_dec.Shape()==std::vector<uint32_t>{g_caif_crossattn_test_batch,
+                                              g_caif_crossattn_test_dec_seq,
+                                              g_caif_crossattn_test_dim} &&
+      grad_enc.Shape()==std::vector<uint32_t>{g_caif_crossattn_test_batch,
+                                              g_caif_crossattn_test_enc_seq,
+                                              g_caif_crossattn_test_dim};
+    if(ok==true)
+    {
+      ok=IsFinite(host_gd.Data(),host_gd.TotalElements()) &&
+         IsFinite(host_ge.Data(),host_ge.TotalElements());
+    }
+    CAIF_TestHarness::Report("CrossAttention::Backward fp32 shape+finite",ok);
+  }
+  CAIF_TEST_CATCH_BLOCK("CrossAttention::Backward fp32")
+}
+
+void CAIF_CrossAttentionTests::TestCrossAttentionDtypeSweep()
+{
+  try
+  {
+    typedef CAIF_DataType::CAIF_DataType_e Dtype_e;
+    CAIF_TestHarness::Report("CrossAttention::Forward fp16 storage",
+                             RunCrossAttentionDtype<__half>(Dtype_e::Float16));
+    CAIF_TestHarness::Report("CrossAttention::Forward bf16 storage",
+                             RunCrossAttentionDtype<__nv_bfloat16>(Dtype_e::BFloat16));
   }
   CAIF_TEST_CATCH_BLOCK("CrossAttention::dtype-sweep")
 }
 
-#endif // USE_CAIF_CUDA
-
-}//end anonymous namespace
-
-int main()
+void CAIF_CrossAttentionTests::RunAll()
 {
+  ISE_Out::Out()<<"Cross-Attention Tests\n";
+  ISE_Out::Out()<<"=====================\n";
   CAIF_TestHarness::Reset();
-#ifdef USE_CAIF_CUDA
-  std::cout<<"Cross-Attention Tests\n";
-  std::cout<<"=====================\n";
   TestCrossAttentionForwardShape();
   TestCrossAttentionBackward();
   TestCrossAttentionDtypeSweep();
+}
+
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_CrossAttentionTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 #else
-  std::cout<<"USE_CAIF_CUDA off — cross-attention tests skipped.\n";
+  ISE_Out::Out()<<"USE_CAIF_CUDA off — cross-attention tests skipped."
+                <<"\n";
+  return 0;
 #endif
-  return CAIF_TestHarness::FinalExitCode();
 }

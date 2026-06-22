@@ -40,15 +40,225 @@
 #include <random>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
 
-std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed)
+constexpr float g_caif_visionports_test_rand_lo=-0.5f;
+constexpr float g_caif_visionports_test_rand_hi=0.5f;
+constexpr float g_caif_visionports_test_bn_mean_tol=5.0e-3f;
+constexpr float g_caif_visionports_test_bn_var_tol=5.0e-3f;
+constexpr float g_caif_visionports_test_reldiff_floor=1e-6f;
+constexpr float g_caif_visionports_test_dropout_rate_a=0.3f;
+constexpr float g_caif_visionports_test_dropout_rate_b=0.5f;
+constexpr float g_caif_visionports_test_dropout_rate_c=0.25f;
+constexpr uint64_t g_caif_visionports_test_seed_a=7777ULL;
+constexpr uint64_t g_caif_visionports_test_seed_b=8888ULL;
+constexpr float g_caif_visionports_test_tol_fp32=1e-5f;
+constexpr float g_caif_visionports_test_tol_fp16_pool=5e-3f;
+constexpr float g_caif_visionports_test_tol_bf16_pool=2e-2f;
+constexpr float g_caif_visionports_test_tol_fp32_conv=1e-3f;
+constexpr float g_caif_visionports_test_tol_fp16_conv=5e-2f;
+constexpr float g_caif_visionports_test_tol_bf16_conv=5e-2f;
+constexpr float g_caif_visionports_test_tol_fp32_bn=1e-3f;
+constexpr float g_caif_visionports_test_tol_fp16_bn=5e-2f;
+constexpr float g_caif_visionports_test_tol_bf16_bn=5e-2f;
+constexpr float g_caif_visionports_test_tol_fp32_bn_bwd=1e-3f;
+constexpr float g_caif_visionports_test_tol_fp16_bn_bwd=8e-2f;
+constexpr float g_caif_visionports_test_tol_bf16_bn_bwd=1e-1f;
+
+//------------------------------------------------------------------------------
+// Layer-specific gradcheck functors that host each layer and drive
+// CAIF_GradCheck. Each implements only ForwardOnly; the analytical gradient
+// is produced by calling Forward+Backward once in RunFullPass prior to the
+// CAIF_GradCheck::Check invocation.
+//------------------------------------------------------------------------------
+
+class CAIF_FlattenFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    explicit CAIF_FlattenFunctor(CAIF_CudaStream &stream):_layer(stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceFlatten<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceFlatten<float,float> _layer;
+};
+
+class CAIF_ReshapeFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    CAIF_ReshapeFunctor(const std::vector<uint32_t> &target,
+                         CAIF_CudaStream &stream):_layer(target,stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceReshape<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceReshape<float,float> _layer;
+};
+
+class CAIF_BatchNormFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    CAIF_BatchNormFunctor(const uint32_t features,
+                           CAIF_CudaStream &stream):_layer(features,stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceBatchNorm<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceBatchNorm<float,float> _layer;
+};
+
+class CAIF_MaxPoolFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    CAIF_MaxPoolFunctor(const CAIF_DevicePooling2DConfig &cfg,
+                         CAIF_CudaStream &stream):_layer(cfg,stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceMaxPooling2D<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceMaxPooling2D<float,float> _layer;
+};
+
+class CAIF_AvgPoolFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    CAIF_AvgPoolFunctor(const CAIF_DevicePooling2DConfig &cfg,
+                         CAIF_CudaStream &stream):_layer(cfg,stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceAveragePooling2D<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceAveragePooling2D<float,float> _layer;
+};
+
+class CAIF_Conv2DFunctor:public CAIF_GradCheckTargetFunctor
+{
+  public:
+    CAIF_Conv2DFunctor(const CAIF_DeviceConv2DConfig &cfg,
+                        CAIF_CudaStream &stream):_layer(cfg,stream){}
+
+    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
+                                  CAIF_RunContext &ctx)override
+    {
+      return _layer.Forward(perturbed,ctx);
+    }
+
+    CAIF_DeviceConv2D<float,float> &Layer(){return _layer;}
+
+  protected:
+
+  private:
+    CAIF_DeviceConv2D<float,float> _layer;
+};
+
+//------------------------------------------------------------------------------
+// Vision-port device layer tests.
+//------------------------------------------------------------------------------
+class CAIF_VisionPortsTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed);
+    static void WriteHost(CAIF_DeviceTensor &t,const std::vector<float> &data);
+    static std::vector<float> ReadHost(const CAIF_DeviceTensor &t);
+    static CAIF_DeviceTensor MakeHostFromVec(const std::vector<uint32_t> &shape,
+                                              const std::vector<float> &data);
+    static float MaxAbs(const std::vector<float> &v);
+    static size_t Product(const std::vector<uint32_t> &shape);
+    static float MaxRelDiff(const std::vector<float> &got,
+                             const std::vector<float> &expected);
+    static bool RunGradCheckOnFunctor(CAIF_GradCheckTargetFunctor &functor,
+                                       CAIF_DeviceLayer &layer,
+                                       const std::vector<uint32_t> &input_shape,
+                                       const uint32_t seed,
+                                       CAIF_RunContext &ctx);
+
+    static bool TestFlattenForwardShape();
+    static bool TestFlattenGradCheck();
+    static bool TestReshapeForwardShape();
+    static bool TestReshapeGradCheck();
+    static bool TestDropoutInferenceIsIdentity();
+    static bool TestDropoutTrainingDeterministic();
+    static bool TestDropoutBackwardMatchesMask();
+    static bool TestBatchNormForwardStats();
+    static bool TestBatchNormGradCheck();
+    static bool TestMaxPoolForwardShape();
+    static bool TestMaxPoolGradCheck();
+    static bool TestAvgPoolForwardMean();
+    static bool TestAvgPoolGradCheck();
+    static bool TestConv2DForwardShape();
+    static bool TestConv2DGradCheck();
+
+    template<typename StorageT>
+    static bool TestMaxPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
+                                     const float tol);
+    template<typename StorageT>
+    static bool TestAvgPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
+                                     const float tol);
+    template<typename StorageT>
+    static bool TestConv2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
+                                  const float tol);
+    template<typename StorageT>
+    static bool TestBatchNormDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
+                                     const float tol);
+    // Device-path BN backward parity vs host fp32 backward. Verifies cuDNN
+    // `cudnnBatchNormalizationBackward` produces grad_input matching the
+    // host loop's analytic gradient up to dtype-appropriate tolerance.
+    template<typename StorageT>
+    static bool TestBatchNormBackwardDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
+                                             const float tol);
+};
+
+std::vector<float> CAIF_VisionPortsTests::MakeRandomVec(const size_t n,const uint32_t seed)
 {
   std::mt19937 gen(seed);
-  std::uniform_real_distribution<float> dist(-0.5f,0.5f);
+  std::uniform_real_distribution<float> dist(g_caif_visionports_test_rand_lo,
+                                             g_caif_visionports_test_rand_hi);
   std::vector<float> v(n);
   for(size_t i=0;i<n;++i)
   {
@@ -57,27 +267,27 @@ std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed)
   return v;
 }
 
-void WriteHost(CAIF_DeviceTensor &t,const std::vector<float> &data)
+void CAIF_VisionPortsTests::WriteHost(CAIF_DeviceTensor &t,const std::vector<float> &data)
 {
   std::memcpy(t.DeviceDataRaw(),data.data(),data.size()*sizeof(float));
 }
 
-std::vector<float> ReadHost(const CAIF_DeviceTensor &t)
+std::vector<float> CAIF_VisionPortsTests::ReadHost(const CAIF_DeviceTensor &t)
 {
   std::vector<float> out(t.TotalElements());
   std::memcpy(out.data(),t.DeviceDataRaw(),out.size()*sizeof(float));
   return out;
 }
 
-CAIF_DeviceTensor MakeHostFromVec(const std::vector<uint32_t> &shape,
-                                  const std::vector<float> &data)
+CAIF_DeviceTensor CAIF_VisionPortsTests::MakeHostFromVec(const std::vector<uint32_t> &shape,
+                                                           const std::vector<float> &data)
 {
   CAIF_DeviceTensor t=CAIF_DeviceTensor::ZerosHost(shape);
   WriteHost(t,data);
   return t;
 }
 
-float MaxAbs(const std::vector<float> &v)
+float CAIF_VisionPortsTests::MaxAbs(const std::vector<float> &v)
 {
   float m=0.0f;
   for(const float x:v)
@@ -91,7 +301,7 @@ float MaxAbs(const std::vector<float> &v)
   return m;
 }
 
-size_t Product(const std::vector<uint32_t> &shape)
+size_t CAIF_VisionPortsTests::Product(const std::vector<uint32_t> &shape)
 {
   size_t p=1u;
   for(const uint32_t d:shape)
@@ -101,131 +311,63 @@ size_t Product(const std::vector<uint32_t> &shape)
   return p;
 }
 
-//------------------------------------------------------------------------------
-// Layer-specific gradcheck functors that host each layer and drive
-// CAIF_GradCheck. Each implements only ForwardOnly; the analytical gradient
-// is produced by calling Forward+Backward once in RunFullPass prior to the
-// CAIF_GradCheck::Check invocation.
-//------------------------------------------------------------------------------
-
-class FlattenFunctor:public CAIF_GradCheckTargetFunctor
+float CAIF_VisionPortsTests::MaxRelDiff(const std::vector<float> &got,
+                                         const std::vector<float> &expected)
 {
-  public:
-    explicit FlattenFunctor(CAIF_CudaStream &stream):_layer(stream){}
-
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
+  // Global-denominator relative diff (matches test_device_matmul_dtype's
+  // RelClose pattern): max_abs_err / max_abs_ref. This avoids amplifying
+  // near-zero output elements into unbounded relative error.
+  float max_abs_ref=0.0f;
+  for(float r:expected)
+  {
+    if(std::fabs(r)>max_abs_ref)
     {
-      return _layer.Forward(perturbed,ctx);
+      max_abs_ref=std::fabs(r);
     }
+  }
+  const float denom=std::max(max_abs_ref,g_caif_visionports_test_reldiff_floor);
+  float worst=0.0f;
+  for(size_t i=0;i<got.size();++i)
+  {
+    const float rel=std::fabs(got[i]-expected[i])/denom;
+    if(rel>worst)
+    {
+      worst=rel;
+    }
+  }
+  return worst;
+}
 
-    CAIF_DeviceFlatten<float,float> &Layer(){return _layer;}
-
-  protected:
-  private:
-    CAIF_DeviceFlatten<float,float> _layer;
-};
-
-class ReshapeFunctor:public CAIF_GradCheckTargetFunctor
+bool CAIF_VisionPortsTests::RunGradCheckOnFunctor(CAIF_GradCheckTargetFunctor &functor,
+                                                    CAIF_DeviceLayer &layer,
+                                                    const std::vector<uint32_t> &input_shape,
+                                                    const uint32_t seed,
+                                                    CAIF_RunContext &ctx)
 {
-  public:
-    ReshapeFunctor(const std::vector<uint32_t> &target,
-                   CAIF_CudaStream &stream):_layer(target,stream){}
+  try
+  {
+    const size_t n=Product(input_shape);
+    const std::vector<float> x_host=MakeRandomVec(n,seed);
+    CAIF_DeviceTensor x=MakeHostFromVec(input_shape,x_host);
 
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
-    {
-      return _layer.Forward(perturbed,ctx);
-    }
+    CAIF_DeviceTensor y=layer.Forward(x,ctx);
+    const std::vector<uint32_t> y_shape=y.Shape();
+    const size_t ny=y.TotalElements();
+    const std::vector<float> g_host=MakeRandomVec(ny,seed+13);
+    CAIF_DeviceTensor g=MakeHostFromVec(y_shape,g_host);
 
-    CAIF_DeviceReshape<float,float> &Layer(){return _layer;}
+    CAIF_DeviceTensor dx=layer.Backward(g,ctx);
+    const std::vector<float> analytical=ReadHost(dx);
 
-  protected:
-  private:
-    CAIF_DeviceReshape<float,float> _layer;
-};
+    return CAIF_GradCheck::Check(functor,x_host,input_shape,g_host,analytical,ctx,
+                                 CAIF_Tolerances::GradcheckRel(),
+                                 CAIF_DeviceTensor::Location_e::Host_e);
+  }
+  CAIF_CATCH_BLOCK();
+  return false;
+}
 
-class BatchNormFunctor:public CAIF_GradCheckTargetFunctor
-{
-  public:
-    BatchNormFunctor(const uint32_t features,
-                     CAIF_CudaStream &stream):_layer(features,stream){}
-
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
-    {
-      return _layer.Forward(perturbed,ctx);
-    }
-
-    CAIF_DeviceBatchNorm<float,float> &Layer(){return _layer;}
-
-  protected:
-  private:
-    CAIF_DeviceBatchNorm<float,float> _layer;
-};
-
-class MaxPoolFunctor:public CAIF_GradCheckTargetFunctor
-{
-  public:
-    MaxPoolFunctor(const CAIF_DevicePooling2D<float,float>::Config_t &cfg,
-                   CAIF_CudaStream &stream):_layer(cfg,stream){}
-
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
-    {
-      return _layer.Forward(perturbed,ctx);
-    }
-
-    CAIF_DeviceMaxPooling2D<float,float> &Layer(){return _layer;}
-
-  protected:
-  private:
-    CAIF_DeviceMaxPooling2D<float,float> _layer;
-};
-
-class AvgPoolFunctor:public CAIF_GradCheckTargetFunctor
-{
-  public:
-    AvgPoolFunctor(const CAIF_DevicePooling2D<float,float>::Config_t &cfg,
-                   CAIF_CudaStream &stream):_layer(cfg,stream){}
-
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
-    {
-      return _layer.Forward(perturbed,ctx);
-    }
-
-    CAIF_DeviceAveragePooling2D<float,float> &Layer(){return _layer;}
-
-  protected:
-  private:
-    CAIF_DeviceAveragePooling2D<float,float> _layer;
-};
-
-class Conv2DFunctor:public CAIF_GradCheckTargetFunctor
-{
-  public:
-    Conv2DFunctor(const CAIF_DeviceConv2D<float,float>::Config_t &cfg,
-                  CAIF_CudaStream &stream):_layer(cfg,stream){}
-
-    CAIF_DeviceTensor ForwardOnly(const CAIF_DeviceTensor &perturbed,
-                                  CAIF_RunContext &ctx)override
-    {
-      return _layer.Forward(perturbed,ctx);
-    }
-
-    CAIF_DeviceConv2D<float,float> &Layer(){return _layer;}
-
-  protected:
-  private:
-    CAIF_DeviceConv2D<float,float> _layer;
-};
-
-//------------------------------------------------------------------------------
-// Test bodies
-//------------------------------------------------------------------------------
-
-bool TestFlattenForwardShape()
+bool CAIF_VisionPortsTests::TestFlattenForwardShape()
 {
   try
   {
@@ -262,50 +404,21 @@ bool TestFlattenForwardShape()
   return false;
 }
 
-bool RunGradCheckOnFunctor(CAIF_GradCheckTargetFunctor &functor,
-                           CAIF_DeviceLayer &layer,
-                           const std::vector<uint32_t> &input_shape,
-                           const uint32_t seed,
-                           CAIF_RunContext &ctx)
-{
-  try
-  {
-    const size_t n=Product(input_shape);
-    const std::vector<float> x_host=MakeRandomVec(n,seed);
-    CAIF_DeviceTensor x=MakeHostFromVec(input_shape,x_host);
-
-    CAIF_DeviceTensor y=layer.Forward(x,ctx);
-    const std::vector<uint32_t> y_shape=y.Shape();
-    const size_t ny=y.TotalElements();
-    const std::vector<float> g_host=MakeRandomVec(ny,seed+13);
-    CAIF_DeviceTensor g=MakeHostFromVec(y_shape,g_host);
-
-    CAIF_DeviceTensor dx=layer.Backward(g,ctx);
-    const std::vector<float> analytical=ReadHost(dx);
-
-    return CAIF_GradCheck::Check(functor,x_host,input_shape,g_host,analytical,ctx,
-                                 CAIF_Tolerances::GradcheckRel(),
-                                 CAIF_DeviceTensor::Location_e::Host_e);
-  }
-  CAIF_CATCH_BLOCK();
-  return false;
-}
-
-bool TestFlattenGradCheck()
+bool CAIF_VisionPortsTests::TestFlattenGradCheck()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    FlattenFunctor functor(stream);
+    CAIF_FlattenFunctor functor(stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{2u,3u,4u},103,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-bool TestReshapeForwardShape()
+bool CAIF_VisionPortsTests::TestReshapeForwardShape()
 {
   try
   {
@@ -339,21 +452,21 @@ bool TestReshapeForwardShape()
   return false;
 }
 
-bool TestReshapeGradCheck()
+bool CAIF_VisionPortsTests::TestReshapeGradCheck()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    ReshapeFunctor functor({2u,4u,6u},stream);
+    CAIF_ReshapeFunctor functor({2u,4u,6u},stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{2u,6u,4u},203,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-bool TestDropoutInferenceIsIdentity()
+bool CAIF_VisionPortsTests::TestDropoutInferenceIsIdentity()
 {
   try
   {
@@ -366,7 +479,7 @@ bool TestDropoutInferenceIsIdentity()
     const std::vector<float> data=MakeRandomVec(Product(shape),301);
     CAIF_DeviceTensor x=MakeHostFromVec(shape,data);
 
-    CAIF_DeviceDropout<float,float> layer(0.3f,stream);
+    CAIF_DeviceDropout<float,float> layer(g_caif_visionports_test_dropout_rate_a,stream);
     CAIF_DeviceTensor y=layer.Forward(x,ctx);
     const std::vector<float> y_vec=ReadHost(y);
     for(size_t i=0;i<data.size();++i)
@@ -383,7 +496,7 @@ bool TestDropoutInferenceIsIdentity()
   return false;
 }
 
-bool TestDropoutTrainingDeterministic()
+bool CAIF_VisionPortsTests::TestDropoutTrainingDeterministic()
 {
   try
   {
@@ -394,18 +507,18 @@ bool TestDropoutTrainingDeterministic()
     CAIF_RunContext ctx_a;
     ctx_a.SetStream(stream);
     ctx_a.SetTraining(true);
-    ctx_a.SetRandomSeed(7777ULL);
+    ctx_a.SetRandomSeed(g_caif_visionports_test_seed_a);
     CAIF_DeviceTensor x_a=MakeHostFromVec(shape,data);
-    CAIF_DeviceDropout<float,float> layer_a(0.5f,stream);
+    CAIF_DeviceDropout<float,float> layer_a(g_caif_visionports_test_dropout_rate_b,stream);
     const CAIF_DeviceTensor y_a=layer_a.Forward(x_a,ctx_a);
     const std::vector<float> y_a_vec=ReadHost(y_a);
 
     CAIF_RunContext ctx_b;
     ctx_b.SetStream(stream);
     ctx_b.SetTraining(true);
-    ctx_b.SetRandomSeed(7777ULL);
+    ctx_b.SetRandomSeed(g_caif_visionports_test_seed_a);
     CAIF_DeviceTensor x_b=MakeHostFromVec(shape,data);
-    CAIF_DeviceDropout<float,float> layer_b(0.5f,stream);
+    CAIF_DeviceDropout<float,float> layer_b(g_caif_visionports_test_dropout_rate_b,stream);
     const CAIF_DeviceTensor y_b=layer_b.Forward(x_b,ctx_b);
     const std::vector<float> y_b_vec=ReadHost(y_b);
 
@@ -427,7 +540,7 @@ bool TestDropoutTrainingDeterministic()
   return false;
 }
 
-bool TestDropoutBackwardMatchesMask()
+bool CAIF_VisionPortsTests::TestDropoutBackwardMatchesMask()
 {
   try
   {
@@ -435,7 +548,7 @@ bool TestDropoutBackwardMatchesMask()
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
     ctx.SetTraining(true);
-    ctx.SetRandomSeed(8888ULL);
+    ctx.SetRandomSeed(g_caif_visionports_test_seed_b);
 
     const std::vector<uint32_t> shape={4u,8u};
     const std::vector<float> x_data(Product(shape),1.0f);
@@ -443,7 +556,7 @@ bool TestDropoutBackwardMatchesMask()
     CAIF_DeviceTensor x=MakeHostFromVec(shape,x_data);
     CAIF_DeviceTensor g=MakeHostFromVec(shape,g_data);
 
-    CAIF_DeviceDropout<float,float> layer(0.25f,stream);
+    CAIF_DeviceDropout<float,float> layer(g_caif_visionports_test_dropout_rate_c,stream);
     const CAIF_DeviceTensor y=layer.Forward(x,ctx);
     const CAIF_DeviceTensor dx=layer.Backward(g,ctx);
     const std::vector<float> y_vec=ReadHost(y);
@@ -463,7 +576,7 @@ bool TestDropoutBackwardMatchesMask()
   return false;
 }
 
-bool TestBatchNormForwardStats()
+bool CAIF_VisionPortsTests::TestBatchNormForwardStats()
 {
   try
   {
@@ -494,11 +607,11 @@ bool TestBatchNormForwardStats()
       }
       const float mean=sum/static_cast<float>(batch);
       const float var=sum_sq/static_cast<float>(batch)-mean*mean;
-      if(std::fabs(mean)>5.0e-3f)
+      if(std::fabs(mean)>g_caif_visionports_test_bn_mean_tol)
       {
         return false;
       }
-      if(std::fabs(var-1.0f)>5.0e-3f)
+      if(std::fabs(var-1.0f)>g_caif_visionports_test_bn_var_tol)
       {
         return false;
       }
@@ -509,7 +622,7 @@ bool TestBatchNormForwardStats()
   return false;
 }
 
-bool TestBatchNormGradCheck()
+bool CAIF_VisionPortsTests::TestBatchNormGradCheck()
 {
   try
   {
@@ -517,14 +630,14 @@ bool TestBatchNormGradCheck()
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
     ctx.SetTraining(true);
-    BatchNormFunctor functor(4u,stream);
+    CAIF_BatchNormFunctor functor(4u,stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{8u,4u},403,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-bool TestMaxPoolForwardShape()
+bool CAIF_VisionPortsTests::TestMaxPoolForwardShape()
 {
   try
   {
@@ -532,12 +645,15 @@ bool TestMaxPoolForwardShape()
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    const uint32_t n=2u,h=4u,w=4u,c=3u;
+    const uint32_t n=2u;
+    const uint32_t h=4u;
+    const uint32_t w=4u;
+    const uint32_t c=3u;
     const std::vector<uint32_t> shape={n,h,w,c};
     const std::vector<float> data=MakeRandomVec(Product(shape),501);
     CAIF_DeviceTensor x=MakeHostFromVec(shape,data);
 
-    CAIF_DevicePooling2D<float,float>::Config_t cfg={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg={2u,2u,2u,2u};
     CAIF_DeviceMaxPooling2D<float,float> layer(cfg,stream);
     const CAIF_DeviceTensor y=layer.Forward(x,ctx);
     if(y.Shape().size()!=4u)
@@ -558,22 +674,22 @@ bool TestMaxPoolForwardShape()
   return false;
 }
 
-bool TestMaxPoolGradCheck()
+bool CAIF_VisionPortsTests::TestMaxPoolGradCheck()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DevicePooling2D<float,float>::Config_t cfg={2u,2u,2u,2u};
-    MaxPoolFunctor functor(cfg,stream);
+    CAIF_DevicePooling2DConfig cfg={2u,2u,2u,2u};
+    CAIF_MaxPoolFunctor functor(cfg,stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{1u,4u,4u,2u},503,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-bool TestAvgPoolForwardMean()
+bool CAIF_VisionPortsTests::TestAvgPoolForwardMean()
 {
   try
   {
@@ -585,7 +701,7 @@ bool TestAvgPoolForwardMean()
     const std::vector<float> data={1.0f,2.0f,3.0f,4.0f};
     CAIF_DeviceTensor x=MakeHostFromVec(shape,data);
 
-    CAIF_DevicePooling2D<float,float>::Config_t cfg={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg={2u,2u,2u,2u};
     CAIF_DeviceAveragePooling2D<float,float> layer(cfg,stream);
     const CAIF_DeviceTensor y=layer.Forward(x,ctx);
     const std::vector<float> y_vec=ReadHost(y);
@@ -601,22 +717,22 @@ bool TestAvgPoolForwardMean()
   return false;
 }
 
-bool TestAvgPoolGradCheck()
+bool CAIF_VisionPortsTests::TestAvgPoolGradCheck()
 {
   try
   {
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
-    CAIF_DevicePooling2D<float,float>::Config_t cfg={2u,2u,2u,2u};
-    AvgPoolFunctor functor(cfg,stream);
+    CAIF_DevicePooling2DConfig cfg={2u,2u,2u,2u};
+    CAIF_AvgPoolFunctor functor(cfg,stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{1u,4u,4u,2u},603,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-bool TestConv2DForwardShape()
+bool CAIF_VisionPortsTests::TestConv2DForwardShape()
 {
   try
   {
@@ -635,7 +751,7 @@ bool TestConv2DForwardShape()
     const std::vector<float> data=MakeRandomVec(Product(shape),701);
     CAIF_DeviceTensor x=MakeHostFromVec(shape,data);
 
-    CAIF_DeviceConv2D<float,float>::Config_t cfg={cin,cout,kh,kw,1u,1u};
+    CAIF_DeviceConv2DConfig cfg={cin,cout,kh,kw,1u,1u};
     CAIF_DeviceConv2D<float,float> layer(cfg,stream);
     const CAIF_DeviceTensor y=layer.Forward(x,ctx);
     if(y.Shape().size()!=4u || y.Shape()[0]!=n)
@@ -657,7 +773,7 @@ bool TestConv2DForwardShape()
   return false;
 }
 
-bool TestConv2DGradCheck()
+bool CAIF_VisionPortsTests::TestConv2DGradCheck()
 {
   try
   {
@@ -667,49 +783,18 @@ bool TestConv2DGradCheck()
 
     const uint32_t cin=2u;
     const uint32_t cout=3u;
-    CAIF_DeviceConv2D<float,float>::Config_t cfg={cin,cout,3u,3u,1u,1u};
-    Conv2DFunctor functor(cfg,stream);
+    CAIF_DeviceConv2DConfig cfg={cin,cout,3u,3u,1u,1u};
+    CAIF_Conv2DFunctor functor(cfg,stream);
     return RunGradCheckOnFunctor(functor,functor.Layer(),{1u,5u,5u,cin},703,ctx);
   }
   CAIF_CATCH_BLOCK();
   return false;
 }
 
-//------------------------------------------------------------------------------
-// G1 cuDNN device-path tests. Each test compares the cuDNN forward output
-// against the host fp32 reference on the same input, after converting the
-// device output back to fp32. Fp16/bf16 cells use a relaxed tolerance
-// matching their representable precision.
-//------------------------------------------------------------------------------
-
-float MaxRelDiff(const std::vector<float> &got,const std::vector<float> &expected)
-{
-  // Global-denominator relative diff (matches test_device_matmul_dtype's
-  // RelClose pattern): max_abs_err / max_abs_ref. This avoids amplifying
-  // near-zero output elements into unbounded relative error.
-  float max_abs_ref=0.0f;
-  for(float r:expected)
-  {
-    if(std::fabs(r)>max_abs_ref)
-    {
-      max_abs_ref=std::fabs(r);
-    }
-  }
-  const float denom=std::max(max_abs_ref,1e-6f);
-  float worst=0.0f;
-  for(size_t i=0;i<got.size();++i)
-  {
-    const float rel=std::fabs(got[i]-expected[i])/denom;
-    if(rel>worst)
-    {
-      worst=rel;
-    }
-  }
-  return worst;
-}
-
 template<typename StorageT>
-bool TestMaxPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const float tol)
+bool CAIF_VisionPortsTests::TestMaxPool2DDevice(
+  const CAIF_DataType::CAIF_DataType_e storage_dt,
+  const float tol)
 {
   try
   {
@@ -717,11 +802,14 @@ bool TestMaxPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    const uint32_t n=2u,h=4u,w=4u,c=3u;
+    const uint32_t n=2u;
+    const uint32_t h=4u;
+    const uint32_t w=4u;
+    const uint32_t c=3u;
     const std::vector<uint32_t> shape={n,h,w,c};
     const std::vector<float> data=MakeRandomVec(Product(shape),801);
 
-    CAIF_DevicePooling2D<float,float>::Config_t cfg_host={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg_host={2u,2u,2u,2u};
     CAIF_DeviceMaxPooling2D<float,float> host_layer(cfg_host,stream);
     CAIF_DeviceTensor x_host=MakeHostFromVec(shape,data);
     CAIF_DeviceTensor y_host=host_layer.Forward(x_host,ctx);
@@ -729,7 +817,7 @@ bool TestMaxPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
 
     CAIF_DeviceTensor x_fp32_dev=CAIF_DeviceTensor::FromHostData(data.data(),shape,stream);
     CAIF_DeviceTensor x_dev=x_fp32_dev.To(storage_dt);
-    typename CAIF_DevicePooling2D<float,StorageT>::Config_t cfg_dev={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg_dev={2u,2u,2u,2u};
     CAIF_DeviceMaxPooling2D<float,StorageT> dev_layer(cfg_dev,stream);
     CAIF_DeviceTensor y_dev=dev_layer.Forward(x_dev,ctx);
     CAIF_DeviceTensor y_dev_fp32=y_dev.To(CAIF_DataType::CAIF_DataType_e::Float32);
@@ -748,7 +836,9 @@ bool TestMaxPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
 }
 
 template<typename StorageT>
-bool TestAvgPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const float tol)
+bool CAIF_VisionPortsTests::TestAvgPool2DDevice(
+  const CAIF_DataType::CAIF_DataType_e storage_dt,
+  const float tol)
 {
   try
   {
@@ -756,11 +846,14 @@ bool TestAvgPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    const uint32_t n=2u,h=4u,w=4u,c=3u;
+    const uint32_t n=2u;
+    const uint32_t h=4u;
+    const uint32_t w=4u;
+    const uint32_t c=3u;
     const std::vector<uint32_t> shape={n,h,w,c};
     const std::vector<float> data=MakeRandomVec(Product(shape),811);
 
-    CAIF_DevicePooling2D<float,float>::Config_t cfg_host={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg_host={2u,2u,2u,2u};
     CAIF_DeviceAveragePooling2D<float,float> host_layer(cfg_host,stream);
     CAIF_DeviceTensor x_host=MakeHostFromVec(shape,data);
     CAIF_DeviceTensor y_host=host_layer.Forward(x_host,ctx);
@@ -768,7 +861,7 @@ bool TestAvgPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
 
     CAIF_DeviceTensor x_fp32_dev=CAIF_DeviceTensor::FromHostData(data.data(),shape,stream);
     CAIF_DeviceTensor x_dev=x_fp32_dev.To(storage_dt);
-    typename CAIF_DevicePooling2D<float,StorageT>::Config_t cfg_dev={2u,2u,2u,2u};
+    CAIF_DevicePooling2DConfig cfg_dev={2u,2u,2u,2u};
     CAIF_DeviceAveragePooling2D<float,StorageT> dev_layer(cfg_dev,stream);
     CAIF_DeviceTensor y_dev=dev_layer.Forward(x_dev,ctx);
     CAIF_DeviceTensor y_dev_fp32=y_dev.To(CAIF_DataType::CAIF_DataType_e::Float32);
@@ -787,7 +880,9 @@ bool TestAvgPool2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
 }
 
 template<typename StorageT>
-bool TestConv2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const float tol)
+bool CAIF_VisionPortsTests::TestConv2DDevice(
+  const CAIF_DataType::CAIF_DataType_e storage_dt,
+  const float tol)
 {
   try
   {
@@ -795,11 +890,17 @@ bool TestConv2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const floa
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    const uint32_t n=1u,h=5u,w=5u,cin=3u,cout=4u,kh=3u,kw=3u;
+    const uint32_t n=1u;
+    const uint32_t h=5u;
+    const uint32_t w=5u;
+    const uint32_t cin=3u;
+    const uint32_t cout=4u;
+    const uint32_t kh=3u;
+    const uint32_t kw=3u;
     const std::vector<uint32_t> shape={n,h,w,cin};
     const std::vector<float> data=MakeRandomVec(Product(shape),821);
 
-    CAIF_DeviceConv2D<float,float>::Config_t cfg_host={cin,cout,kh,kw,1u,1u};
+    CAIF_DeviceConv2DConfig cfg_host={cin,cout,kh,kw,1u,1u};
     CAIF_DeviceConv2D<float,float> host_layer(cfg_host,stream);
     CAIF_DeviceTensor x_host=MakeHostFromVec(shape,data);
     CAIF_DeviceTensor y_host=host_layer.Forward(x_host,ctx);
@@ -807,7 +908,7 @@ bool TestConv2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const floa
 
     CAIF_DeviceTensor x_fp32_dev=CAIF_DeviceTensor::FromHostData(data.data(),shape,stream);
     CAIF_DeviceTensor x_dev=x_fp32_dev.To(storage_dt);
-    typename CAIF_DeviceConv2D<float,StorageT>::Config_t cfg_dev={cin,cout,kh,kw,1u,1u};
+    CAIF_DeviceConv2DConfig cfg_dev={cin,cout,kh,kw,1u,1u};
     CAIF_DeviceConv2D<float,StorageT> dev_layer(cfg_dev,stream);
     CAIF_DeviceTensor y_dev=dev_layer.Forward(x_dev,ctx);
     CAIF_DeviceTensor y_dev_fp32=y_dev.To(CAIF_DataType::CAIF_DataType_e::Float32);
@@ -826,69 +927,7 @@ bool TestConv2DDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const floa
                     <<diff
                     <<" tol="
                     <<tol
-                    <<std::endl;
-    }
-    return diff<=tol;
-  }
-  CAIF_CATCH_BLOCK();
-  return false;
-}
-
-// Device-path BN backward parity vs host fp32 backward. Verifies cuDNN
-// `cudnnBatchNormalizationBackward` produces grad_input matching the
-// host loop's analytic gradient up to dtype-appropriate tolerance.
-template<typename StorageT>
-bool TestBatchNormBackwardDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,
-                                 const float tol)
-{
-  try
-  {
-    CAIF_CudaStream stream;
-    CAIF_RunContext ctx;
-    ctx.SetStream(stream);
-    ctx.SetTraining(true);
-
-    const uint32_t batch=16u;
-    const uint32_t features=8u;
-    const std::vector<uint32_t> shape={batch,features};
-    const std::vector<float> data=MakeRandomVec(Product(shape),841);
-    const std::vector<float> grad_data=MakeRandomVec(Product(shape),842);
-
-    // Reference: host fp32 forward + backward.
-    CAIF_DeviceBatchNorm<float,float> host_layer(features,stream);
-    CAIF_DeviceTensor x_host=MakeHostFromVec(shape,data);
-    CAIF_DeviceTensor y_host=host_layer.Forward(x_host,ctx);
-    CAIF_DeviceTensor go_host=MakeHostFromVec(shape,grad_data);
-    CAIF_DeviceTensor gi_host=host_layer.Backward(go_host,ctx);
-    const std::vector<float> gi_ref=ReadHost(gi_host);
-
-    // Device path on the templated cell.
-    CAIF_DeviceTensor x_fp32_dev=CAIF_DeviceTensor::FromHostData(data.data(),
-                                                                  shape,stream);
-    CAIF_DeviceTensor x_dev=x_fp32_dev.To(storage_dt);
-    CAIF_DeviceBatchNorm<float,StorageT> dev_layer(features,stream);
-    CAIF_DeviceTensor y_dev=dev_layer.Forward(x_dev,ctx);
-    CAIF_DeviceTensor go_fp32_dev=CAIF_DeviceTensor::FromHostData(
-                                    grad_data.data(),shape,stream);
-    CAIF_DeviceTensor go_dev=go_fp32_dev.To(storage_dt);
-    CAIF_DeviceTensor gi_dev=dev_layer.Backward(go_dev,ctx);
-    CAIF_DeviceTensor gi_dev_fp32=gi_dev.To(CAIF_DataType::CAIF_DataType_e::Float32);
-    std::vector<float> gi_got(gi_dev_fp32.TotalElements());
-    gi_dev_fp32.CopyToHost(gi_got.data());
-    stream.Synchronize();
-
-    if(gi_got.size()!=gi_ref.size())
-    {
-      return false;
-    }
-    const float diff=MaxRelDiff(gi_got,gi_ref);
-    if(diff>tol)
-    {
-      ISE_Out::Out()<<"  batch_norm device backward: max_rel_diff="
-                    <<diff
-                    <<" tol="
-                    <<tol
-                    <<std::endl;
+                    <<"\n";
     }
     return diff<=tol;
   }
@@ -897,7 +936,9 @@ bool TestBatchNormBackwardDevice(const CAIF_DataType::CAIF_DataType_e storage_dt
 }
 
 template<typename StorageT>
-bool TestBatchNormDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const float tol)
+bool CAIF_VisionPortsTests::TestBatchNormDevice(
+  const CAIF_DataType::CAIF_DataType_e storage_dt,
+  const float tol)
 {
   try
   {
@@ -938,7 +979,7 @@ bool TestBatchNormDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
                     <<diff
                     <<" tol="
                     <<tol
-                    <<std::endl;
+                    <<"\n";
     }
     return diff<=tol;
   }
@@ -946,9 +987,66 @@ bool TestBatchNormDevice(const CAIF_DataType::CAIF_DataType_e storage_dt,const f
   return false;
 }
 
-}  // namespace
+template<typename StorageT>
+bool CAIF_VisionPortsTests::TestBatchNormBackwardDevice(
+  const CAIF_DataType::CAIF_DataType_e storage_dt,
+  const float tol)
+{
+  try
+  {
+    CAIF_CudaStream stream;
+    CAIF_RunContext ctx;
+    ctx.SetStream(stream);
+    ctx.SetTraining(true);
 
-int main()
+    const uint32_t batch=16u;
+    const uint32_t features=8u;
+    const std::vector<uint32_t> shape={batch,features};
+    const std::vector<float> data=MakeRandomVec(Product(shape),841);
+    const std::vector<float> grad_data=MakeRandomVec(Product(shape),842);
+
+    // Reference: host fp32 forward + backward.
+    CAIF_DeviceBatchNorm<float,float> host_layer(features,stream);
+    CAIF_DeviceTensor x_host=MakeHostFromVec(shape,data);
+    CAIF_DeviceTensor y_host=host_layer.Forward(x_host,ctx);
+    CAIF_DeviceTensor go_host=MakeHostFromVec(shape,grad_data);
+    CAIF_DeviceTensor gi_host=host_layer.Backward(go_host,ctx);
+    const std::vector<float> gi_ref=ReadHost(gi_host);
+
+    // Device path on the templated cell.
+    CAIF_DeviceTensor x_fp32_dev=CAIF_DeviceTensor::FromHostData(data.data(),shape,stream);
+    CAIF_DeviceTensor x_dev=x_fp32_dev.To(storage_dt);
+    CAIF_DeviceBatchNorm<float,StorageT> dev_layer(features,stream);
+    CAIF_DeviceTensor y_dev=dev_layer.Forward(x_dev,ctx);
+    CAIF_DeviceTensor go_fp32_dev=CAIF_DeviceTensor::FromHostData(grad_data.data(),
+                                                                    shape,stream);
+    CAIF_DeviceTensor go_dev=go_fp32_dev.To(storage_dt);
+    CAIF_DeviceTensor gi_dev=dev_layer.Backward(go_dev,ctx);
+    CAIF_DeviceTensor gi_dev_fp32=gi_dev.To(CAIF_DataType::CAIF_DataType_e::Float32);
+    std::vector<float> gi_got(gi_dev_fp32.TotalElements());
+    gi_dev_fp32.CopyToHost(gi_got.data());
+    stream.Synchronize();
+
+    if(gi_got.size()!=gi_ref.size())
+    {
+      return false;
+    }
+    const float diff=MaxRelDiff(gi_got,gi_ref);
+    if(diff>tol)
+    {
+      ISE_Out::Out()<<"  batch_norm device backward: max_rel_diff="
+                    <<diff
+                    <<" tol="
+                    <<tol
+                    <<"\n";
+    }
+    return diff<=tol;
+  }
+  CAIF_CATCH_BLOCK();
+  return false;
+}
+
+void CAIF_VisionPortsTests::RunAll()
 {
   ISE_Out::Out()<<"Stage 5b Device-Layer Port Tests\n";
   ISE_Out::Out()<<"=================================\n";
@@ -979,39 +1077,65 @@ int main()
   // cuDNN device-path tests (G1). Tolerance reflects each dtype's
   // representable precision; pooling preserves exact values for max/avg
   // so fp32 matches host exactly, while fp16/bf16 lose precision.
-  using Dtype_e=CAIF_DataType::CAIF_DataType_e;
+  typedef CAIF_DataType::CAIF_DataType_e Dtype_e;
   CAIF_TestHarness::Report("MaxPool2D device fp32",
-                           (TestMaxPool2DDevice<float>(Dtype_e::Float32,1e-5f)));
+                           TestMaxPool2DDevice<float>(Dtype_e::Float32,
+                                                      g_caif_visionports_test_tol_fp32));
   CAIF_TestHarness::Report("MaxPool2D device fp16",
-                           (TestMaxPool2DDevice<__half>(Dtype_e::Float16,5e-3f)));
+                           TestMaxPool2DDevice<__half>(Dtype_e::Float16,
+                                                       g_caif_visionports_test_tol_fp16_pool));
   CAIF_TestHarness::Report("MaxPool2D device bf16",
-                           (TestMaxPool2DDevice<__nv_bfloat16>(Dtype_e::BFloat16,2e-2f)));
+                           TestMaxPool2DDevice<__nv_bfloat16>(
+                             Dtype_e::BFloat16,
+                             g_caif_visionports_test_tol_bf16_pool));
   CAIF_TestHarness::Report("AvgPool2D device fp32",
-                           (TestAvgPool2DDevice<float>(Dtype_e::Float32,1e-5f)));
+                           TestAvgPool2DDevice<float>(Dtype_e::Float32,
+                                                      g_caif_visionports_test_tol_fp32));
   CAIF_TestHarness::Report("AvgPool2D device fp16",
-                           (TestAvgPool2DDevice<__half>(Dtype_e::Float16,5e-3f)));
+                           TestAvgPool2DDevice<__half>(Dtype_e::Float16,
+                                                       g_caif_visionports_test_tol_fp16_pool));
   CAIF_TestHarness::Report("AvgPool2D device bf16",
-                           (TestAvgPool2DDevice<__nv_bfloat16>(Dtype_e::BFloat16,2e-2f)));
+                           TestAvgPool2DDevice<__nv_bfloat16>(
+                             Dtype_e::BFloat16,
+                             g_caif_visionports_test_tol_bf16_pool));
   CAIF_TestHarness::Report("Conv2D device fp32",
-                           (TestConv2DDevice<float>(Dtype_e::Float32,1e-3f)));
+                           TestConv2DDevice<float>(Dtype_e::Float32,
+                                                   g_caif_visionports_test_tol_fp32_conv));
   CAIF_TestHarness::Report("Conv2D device fp16",
-                           (TestConv2DDevice<__half>(Dtype_e::Float16,5e-2f)));
+                           TestConv2DDevice<__half>(Dtype_e::Float16,
+                                                    g_caif_visionports_test_tol_fp16_conv));
   CAIF_TestHarness::Report("Conv2D device bf16",
-                           (TestConv2DDevice<__nv_bfloat16>(Dtype_e::BFloat16,5e-2f)));
+                           TestConv2DDevice<__nv_bfloat16>(Dtype_e::BFloat16,
+                                                            g_caif_visionports_test_tol_bf16_conv));
 
   CAIF_TestHarness::Report("BatchNorm device fp32",
-                           (TestBatchNormDevice<float>(Dtype_e::Float32,1e-3f)));
+                           TestBatchNormDevice<float>(Dtype_e::Float32,
+                                                      g_caif_visionports_test_tol_fp32_bn));
   CAIF_TestHarness::Report("BatchNorm device fp16",
-                           (TestBatchNormDevice<__half>(Dtype_e::Float16,5e-2f)));
+                           TestBatchNormDevice<__half>(Dtype_e::Float16,
+                                                       g_caif_visionports_test_tol_fp16_bn));
   CAIF_TestHarness::Report("BatchNorm device bf16",
-                           (TestBatchNormDevice<__nv_bfloat16>(Dtype_e::BFloat16,5e-2f)));
+                           TestBatchNormDevice<__nv_bfloat16>(
+                             Dtype_e::BFloat16,
+                             g_caif_visionports_test_tol_bf16_bn));
   CAIF_TestHarness::Report("BatchNorm device backward fp32",
-                           (TestBatchNormBackwardDevice<float>(Dtype_e::Float32,1e-3f)));
+                           TestBatchNormBackwardDevice<float>(
+                             Dtype_e::Float32,
+                             g_caif_visionports_test_tol_fp32_bn_bwd));
   CAIF_TestHarness::Report("BatchNorm device backward fp16",
-                           (TestBatchNormBackwardDevice<__half>(Dtype_e::Float16,8e-2f)));
+                           TestBatchNormBackwardDevice<__half>(
+                             Dtype_e::Float16,
+                             g_caif_visionports_test_tol_fp16_bn_bwd));
   CAIF_TestHarness::Report("BatchNorm device backward bf16",
-                           (TestBatchNormBackwardDevice<__nv_bfloat16>(Dtype_e::BFloat16,
-                                                                       1e-1f)));
+                           TestBatchNormBackwardDevice<__nv_bfloat16>(
+                             Dtype_e::BFloat16,
+                             g_caif_visionports_test_tol_bf16_bn_bwd));
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+}//end instance namespace
+
+int main()
+{
+  instance::CAIF_VisionPortsTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 }

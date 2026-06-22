@@ -20,7 +20,7 @@
 #include "caif_cuda_stream.h"
 #include "caif_device_tensor.h"
 #include "caif_exception.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_settings.h"
 #include "caif_tolerances.h"
 #include "ise_lib/ise_out.h"

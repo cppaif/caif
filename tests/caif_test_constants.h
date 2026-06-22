@@ -36,7 +36,7 @@ constexpr float g_caif_tol_fp32_rel=5.0e-5f;
 constexpr float g_caif_tol_shape_identity=1.0e-6f;
 constexpr float g_caif_tol_gradcheck_abs_floor=1.0e-5f;
 
-// MoE frozen-expert test constants (Phase 8.5.C — TYPE_DISPATCH_FULL_PLAN.md).
+// MoE frozen-expert test constants.
 constexpr uint32_t g_caif_moe_fexp_test_input_dim=16;
 constexpr uint32_t g_caif_moe_fexp_test_hidden_dim=32;
 constexpr uint32_t g_caif_moe_fexp_test_batch=2;

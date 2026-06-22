@@ -19,6 +19,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_moe_expert_config.h"
 #include "caif_device_moe_expert_base.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
@@ -36,13 +37,6 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceMoEExpert:public CAIF_DeviceMoEExpertBase<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t input_dim;
-      uint32_t hidden_dim;
-      bool use_gated;
-      bool use_bias;
-    };
 
     struct MoEExpertProjections_t
     {
@@ -51,8 +45,8 @@ class CAIF_DeviceMoEExpert:public CAIF_DeviceMoEExpertBase<ComputeT,StorageT>
       std::unique_ptr<CAIF_DeviceLayer> down;
     };
 
-    CAIF_DeviceMoEExpert(const Config_t &config,CAIF_CudaStream &stream);
-    CAIF_DeviceMoEExpert(const Config_t &config,
+    CAIF_DeviceMoEExpert(const CAIF_DeviceMoEExpertConfig &config,CAIF_CudaStream &stream);
+    CAIF_DeviceMoEExpert(const CAIF_DeviceMoEExpertConfig &config,
                          MoEExpertProjections_t projections,
                          CAIF_CudaStream &stream);
     ~CAIF_DeviceMoEExpert()override=default;
@@ -109,10 +103,10 @@ class CAIF_DeviceMoEExpert:public CAIF_DeviceMoEExpertBase<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const Config_t &Config()const{return _config;}
-    uint32_t InputDim()const override{return _config.input_dim;}
-    uint32_t HiddenDim()const override{return _config.hidden_dim;}
-    bool UseGated()const{return _config.use_gated;}
+    const CAIF_DeviceMoEExpertConfig &Config()const{return _config;}
+    uint32_t InputDim()const override{return Config().InputDim();}
+    uint32_t HiddenDim()const override{return Config().HiddenDim();}
+    bool UseGated()const{return Config().UseGated();}
 
     // Read-side weight accessors for layer-surgery scenarios — Phase 4
     // add-MoE on a model with an existing MoE FFN (e.g. GLM layers
@@ -205,8 +199,11 @@ class CAIF_DeviceMoEExpert:public CAIF_DeviceMoEExpertBase<ComputeT,StorageT>
     void SetCachedGateOut(CAIF_DeviceTensor &&v){_cached_gate_out=std::move(v);}
     void SetCachedUpOut(CAIF_DeviceTensor &&v){_cached_up_out=std::move(v);}
     void SetCachedHidden(CAIF_DeviceTensor &&v){_cached_hidden=std::move(v);}
+    void SetConfig(const CAIF_DeviceMoEExpertConfig &c){_config=c;}
+    void SetProjections(MoEExpertProjections_t &&v){_projections=std::move(v);}
+    void SetUseProjections(const bool v){_use_projections=v;}
 
-    Config_t _config;
+    CAIF_DeviceMoEExpertConfig _config;
     MoEExpertProjections_t _projections;
     bool _use_projections;
 

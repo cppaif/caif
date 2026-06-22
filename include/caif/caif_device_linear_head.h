@@ -20,6 +20,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_linear_head_config.h"
 #include "caif_run_context.h"
 #include "caif_data_type.h"
 #include <cstdint>
@@ -34,16 +35,9 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceLinearHead:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t input_dim;
-      uint32_t output_dim;
-      bool use_bias;
-    };
+    CAIF_DeviceLinearHead(const CAIF_DeviceLinearHeadConfig &config,CAIF_CudaStream &stream);
 
-    CAIF_DeviceLinearHead(const Config_t &config,CAIF_CudaStream &stream);
-
-    CAIF_DeviceLinearHead(const Config_t &config,
+    CAIF_DeviceLinearHead(const CAIF_DeviceLinearHeadConfig &config,
                           CAIF_DeviceTensor &tied_weight,
                           CAIF_DeviceTensor &tied_weight_grad,
                           CAIF_CudaStream &stream);
@@ -69,9 +63,10 @@ class CAIF_DeviceLinearHead:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    uint32_t InputDim()const{return _config.input_dim;}
-    uint32_t OutputDim()const{return _config.output_dim;}
-    bool UseBias()const{return _config.use_bias;}
+    uint32_t InputDim()const{return Config().InputDim();}
+    uint32_t OutputDim()const{return Config().OutputDim();}
+    bool UseBias()const{return Config().UseBias();}
+    float OutputScale()const{return Config().OutputScale();}
     bool IsWeightTied()const{return _weight_tied;}
     bool Frozen()const{return _frozen;}
     void SetFrozen(bool frozen){_frozen=frozen;}
@@ -91,10 +86,43 @@ class CAIF_DeviceLinearHead:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
+    const CAIF_DeviceLinearHeadConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceLinearHeadConfig &c){_config=c;}
+    void SetWeightTied(const bool v){_weight_tied=v;}
+
+    const CAIF_DeviceTensor &Weight()const{return _weight;}
     CAIF_DeviceTensor &WeightMut(){return _weight;}
     void SetWeight(CAIF_DeviceTensor &&w){_weight=std::move(w);}
 
-    Config_t _config;
+    const CAIF_DeviceTensor &WeightGrad()const{return _weight_grad;}
+    CAIF_DeviceTensor &WeightGrad(){return _weight_grad;}
+    void SetWeightGrad(CAIF_DeviceTensor &&t){_weight_grad=std::move(t);}
+
+    CAIF_DeviceTensor *TiedWeight(){return _tied_weight;}
+    const CAIF_DeviceTensor *TiedWeight()const{return _tied_weight;}
+    void SetTiedWeight(CAIF_DeviceTensor *p){_tied_weight=p;}
+
+    CAIF_DeviceTensor *TiedWeightGrad(){return _tied_weight_grad;}
+    const CAIF_DeviceTensor *TiedWeightGrad()const{return _tied_weight_grad;}
+    void SetTiedWeightGrad(CAIF_DeviceTensor *p){_tied_weight_grad=p;}
+
+    const CAIF_DeviceTensor &Bias()const{return _bias;}
+    CAIF_DeviceTensor &Bias(){return _bias;}
+    void SetBias(CAIF_DeviceTensor &&t){_bias=std::move(t);}
+
+    const CAIF_DeviceTensor &BiasGrad()const{return _bias_grad;}
+    CAIF_DeviceTensor &BiasGrad(){return _bias_grad;}
+    void SetBiasGrad(CAIF_DeviceTensor &&t){_bias_grad=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    const std::vector<uint32_t> &CachedShape()const{return _cached_shape;}
+    std::vector<uint32_t> &CachedShape(){return _cached_shape;}
+    void SetCachedShape(std::vector<uint32_t> &&v){_cached_shape=std::move(v);}
+
+    CAIF_DeviceLinearHeadConfig _config;
     bool _weight_tied;
     bool _frozen;
 

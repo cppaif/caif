@@ -42,6 +42,7 @@
 
 #include "caif_device_frozen_linear.h"
 #include "caif_device_moe_expert_base.h"
+#include "caif_device_moe_frozen_expert_config.h"
 #include "caif_device_tensor.h"
 #include "caif_run_context.h"
 #include <cstdint>
@@ -56,12 +57,6 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceMoEFrozenExpert:public CAIF_DeviceMoEExpertBase<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t input_dim;
-      uint32_t hidden_dim;
-      bool use_gated;
-    };
 
     // Sub-layer pack — one FrozenLinear per matmul. Each can be at any
     // storage cell (fp32/fp16/bf16/int8/int4) the FrozenLinear template
@@ -75,7 +70,7 @@ class CAIF_DeviceMoEFrozenExpert:public CAIF_DeviceMoEExpertBase<ComputeT,Storag
       std::unique_ptr<CAIF_DeviceFrozenLinearBase> down; // hidden_dim -> input_dim
     };
 
-    CAIF_DeviceMoEFrozenExpert(const Config_t &config,
+    CAIF_DeviceMoEFrozenExpert(const CAIF_DeviceMoEFrozenExpertConfig &config,
                                FrozenSubLayers_t sub_layers,
                                CAIF_CudaStream &stream);
     ~CAIF_DeviceMoEFrozenExpert()override=default;
@@ -104,39 +99,39 @@ class CAIF_DeviceMoEFrozenExpert:public CAIF_DeviceMoEExpertBase<ComputeT,Storag
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const Config_t &Config()const{return _config;}
-    uint32_t InputDim()const override{return _config.input_dim;}
-    uint32_t HiddenDim()const override{return _config.hidden_dim;}
-    bool UseGated()const{return _config.use_gated;}
+    const CAIF_DeviceMoEFrozenExpertConfig &Config()const{return _config;}
+    uint32_t InputDim()const override{return Config().InputDim();}
+    uint32_t HiddenDim()const override{return Config().HiddenDim();}
+    bool UseGated()const{return Config().UseGated();}
 
     // FrozenLinear-base accessors for the offload walker. Gate is
     // optional — present iff UseGated()==true. Up and Down are always
     // present. References are non-const so a caller's offload-policy
     // walker can call SetOffloadPolicy / register with a block scheduler.
-    bool HasGate()const{return _sub_layers.gate!=nullptr;}
+    bool HasGate()const{return SubLayers().gate!=nullptr;}
     CAIF_DeviceFrozenLinearBase &Gate()
     {
-      if(_sub_layers.gate==nullptr)
+      if(SubLayersMut().gate==nullptr)
       {
         THROW_CAIFE("MoEFrozenExpert::Gate(): use_gated=false on this expert");
       }
-      return *_sub_layers.gate;
+      return *SubLayersMut().gate;
     }
     CAIF_DeviceFrozenLinearBase &Up()
     {
-      if(_sub_layers.up==nullptr)
+      if(SubLayersMut().up==nullptr)
       {
         THROW_CAIFE("MoEFrozenExpert::Up(): up sub-layer is null");
       }
-      return *_sub_layers.up;
+      return *SubLayersMut().up;
     }
     CAIF_DeviceFrozenLinearBase &Down()
     {
-      if(_sub_layers.down==nullptr)
+      if(SubLayersMut().down==nullptr)
       {
         THROW_CAIFE("MoEFrozenExpert::Down(): down sub-layer is null");
       }
-      return *_sub_layers.down;
+      return *SubLayersMut().down;
     }
 
   public:
@@ -150,18 +145,24 @@ class CAIF_DeviceMoEFrozenExpert:public CAIF_DeviceMoEExpertBase<ComputeT,Storag
     // CODING_GUIDELINES.md §Member Access. *Mut() forms hand out a
     // non-const reference for in-place mutation; Set*() forms do
     // rebind via rvalue-only setter.
+    void SetConfig(const CAIF_DeviceMoEFrozenExpertConfig &c){_config=c;}
     const FrozenSubLayers_t &SubLayers()const{return _sub_layers;}
     FrozenSubLayers_t &SubLayersMut(){return _sub_layers;}
+    void SetSubLayers(FrozenSubLayers_t &&v){_sub_layers=std::move(v);}
     const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
     void SetCachedInput(CAIF_DeviceTensor &&v){_cached_input=std::move(v);}
     const CAIF_DeviceTensor &CachedGateOut()const{return _cached_gate_out;}
+    CAIF_DeviceTensor &CachedGateOut(){return _cached_gate_out;}
     void SetCachedGateOut(CAIF_DeviceTensor &&v){_cached_gate_out=std::move(v);}
     const CAIF_DeviceTensor &CachedUpOut()const{return _cached_up_out;}
+    CAIF_DeviceTensor &CachedUpOut(){return _cached_up_out;}
     void SetCachedUpOut(CAIF_DeviceTensor &&v){_cached_up_out=std::move(v);}
     const CAIF_DeviceTensor &CachedHidden()const{return _cached_hidden;}
+    CAIF_DeviceTensor &CachedHidden(){return _cached_hidden;}
     void SetCachedHidden(CAIF_DeviceTensor &&v){_cached_hidden=std::move(v);}
 
-    Config_t _config;
+    CAIF_DeviceMoEFrozenExpertConfig _config;
     FrozenSubLayers_t _sub_layers;
 
     // Forward intermediates cached for backward. Populated only when

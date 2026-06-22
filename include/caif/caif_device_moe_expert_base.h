@@ -14,7 +14,7 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Abstract base class for MoE experts (TYPE_DISPATCH_FULL_PLAN Phase 8.5.C).
+// Abstract base class for MoE experts.
 //
 // Adds the `ForwardInto(input, output, ctx)` write-into-slice entry point
 // to the layer interface so CAIF_DeviceMoELayer can hold a heterogeneous

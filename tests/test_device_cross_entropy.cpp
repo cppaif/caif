@@ -14,35 +14,85 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// Cross-entropy loss tests
+// Cross-entropy loss tests.
+//
+// Tests cover loss shape (finite positive scalar), CPU reference parity,
+// numerical stability with large logits, gradient shape, gradient values vs
+// CPU reference, finite-difference gradient check, ignore-index masking,
+// and fused loss+gradient vs separate computation.
 //------------------------------------------------------------------------------
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <string>
 #include "caif_device_cross_entropy_loss.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_host_tensor.h"
-
 #include "caif_test_harness.h"
 #include "caif_cpu_reference/caif_cpu_cross_entropy.h"
-using namespace instance;
+#include "ise_lib/ise_out.h"
 
-static void ReportTest(const std::string &name,bool passed)
+#include <vector>
+#include <cmath>
+#include <string>
+
+namespace instance
 {
-  CAIF_TestHarness::Report(name.c_str(),passed);
-}
+
+#ifdef USE_CAIF_CUDA
+
+constexpr int g_caif_ce_test_n_loss_shape=4;
+constexpr int g_caif_ce_test_vocab_loss_shape=10;
+constexpr int g_caif_ce_test_n_values=8;
+constexpr int g_caif_ce_test_vocab_values=16;
+constexpr int g_caif_ce_test_n_stability=4;
+constexpr int g_caif_ce_test_vocab_stability=8;
+constexpr int g_caif_ce_test_n_grad_shape=4;
+constexpr int g_caif_ce_test_vocab_grad_shape=10;
+constexpr int g_caif_ce_test_n_grad_vals=4;
+constexpr int g_caif_ce_test_vocab_grad_vals=8;
+constexpr int g_caif_ce_test_n_fd=2;
+constexpr int g_caif_ce_test_vocab_fd=4;
+constexpr int g_caif_ce_test_n_ignore=4;
+constexpr int g_caif_ce_test_vocab_ignore=8;
+constexpr int g_caif_ce_test_n_fused=4;
+constexpr int g_caif_ce_test_vocab_fused=8;
+constexpr int g_caif_ce_test_ignore_index=-100;
+constexpr float g_caif_ce_test_values_tol=1e-4f;
+constexpr float g_caif_ce_test_grad_tol=1e-4f;
+constexpr float g_caif_ce_test_fd_tol=5e-2f;
+constexpr float g_caif_ce_test_fused_tol=1e-5f;
+constexpr float g_caif_ce_test_stability_base=100.0f;
+constexpr float g_caif_ce_test_stability_scale=10.0f;
+constexpr int g_caif_ce_test_fd_num_checks=4;
+
+//------------------------------------------------------------------------------
+// Cross-entropy loss tests.
+//------------------------------------------------------------------------------
+class CAIF_CrossEntropyTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void TestLossShape();
+    static void TestLossValues();
+    static void TestLossNumericalStability();
+    static void TestGradientShape();
+    static void TestGradientValues();
+    static void TestGradientFiniteDiff();
+    static void TestIgnoreIndex();
+    static void TestFusedMatchesSeparate();
+};
 
 //------------------------------------------------------------------------------
 // Test 1: Loss output is scalar
 //------------------------------------------------------------------------------
-static void TestLossShape()
+void CAIF_CrossEntropyTests::TestLossShape()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=10;
+  const int n=g_caif_ce_test_n_loss_shape;
+  const int vocab_size=g_caif_ce_test_vocab_loss_shape;
 
   std::vector<float> logits_data(n*vocab_size);
   for(int i=0;i<n*vocab_size;++i)
@@ -52,30 +102,31 @@ static void TestLossShape()
 
   std::vector<float> targets_data={0.0f,1.0f,2.0f,3.0f};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_data.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_data.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
-  float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
+  const float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
   // Loss should be a finite positive number
-  bool passed=(std::isfinite(loss)==true&&loss>=0.0f);
-  ReportTest("TestLossShape",passed);
+  bool passed=(std::isfinite(loss)==true && loss>=0.0f);
+  CAIF_TestHarness::Report("CrossEntropy::LossShape",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 2: Loss values match CPU reference
 //------------------------------------------------------------------------------
-static void TestLossValues()
+void CAIF_CrossEntropyTests::TestLossValues()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=8;
-  constexpr int vocab_size=16;
+  const int n=g_caif_ce_test_n_values;
+  const int vocab_size=g_caif_ce_test_vocab_values;
 
   std::vector<float> logits_data(n*vocab_size);
   std::vector<int> targets_int(n);
@@ -95,58 +146,69 @@ static void TestLossValues()
   }
 
   // CPU reference
-  constexpr int ignore_index=-100;
-  const float cpu_loss=CAIF_CpuCrossEntropy::Loss(logits_data,targets_int,n,vocab_size,ignore_index);
+  const float cpu_loss=CAIF_CpuCrossEntropy::Loss(logits_data,
+                                                   targets_int,
+                                                   n,
+                                                   vocab_size,
+                                                   g_caif_ce_test_ignore_index);
 
   // GPU
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_float.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_float.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   const float gpu_loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
   const float diff=std::abs(gpu_loss-cpu_loss);
-  constexpr float tol=1e-4f;
-  const bool passed=(diff<tol);
+  const bool passed=(diff<g_caif_ce_test_values_tol);
 
   if(passed==false)
   {
-    std::cout<<"    CPU loss: "<<cpu_loss<<", GPU loss: "<<gpu_loss<<", diff: "<<diff<<"\n";
+    ISE_Out::Out()<<"    CPU loss: "
+                 <<cpu_loss
+                 <<", GPU loss: "
+                 <<gpu_loss
+                 <<", diff: "
+                 <<diff
+                 <<"\n";
   }
 
-  ReportTest("TestLossValues",passed);
+  CAIF_TestHarness::Report("CrossEntropy::LossValues",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 3: Numerical stability with large logits
 //------------------------------------------------------------------------------
-static void TestLossNumericalStability()
+void CAIF_CrossEntropyTests::TestLossNumericalStability()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=8;
+  const int n=g_caif_ce_test_n_stability;
+  const int vocab_size=g_caif_ce_test_vocab_stability;
 
   // Large logits that would overflow naive exp
   std::vector<float> logits_data(n*vocab_size);
   for(int i=0;i<n*vocab_size;++i)
   {
-    logits_data[i]=100.0f+static_cast<float>(i%vocab_size)*10.0f;
+    logits_data[i]=g_caif_ce_test_stability_base+
+                   static_cast<float>(i%vocab_size)*g_caif_ce_test_stability_scale;
   }
 
   std::vector<float> targets_data={0.0f,1.0f,2.0f,3.0f};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_data.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_data.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   const float loss=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
 
@@ -155,52 +217,55 @@ static void TestLossNumericalStability()
 
   if(passed==false)
   {
-    std::cout<<"    Loss with large logits: "<<loss<<"\n";
+    ISE_Out::Out()<<"    Loss with large logits: "
+                 <<loss
+                 <<"\n";
   }
 
-  ReportTest("TestLossNumericalStability",passed);
+  CAIF_TestHarness::Report("CrossEntropy::LossNumericalStability",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 4: Gradient shape matches logits
 //------------------------------------------------------------------------------
-static void TestGradientShape()
+void CAIF_CrossEntropyTests::TestGradientShape()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=10;
+  const int n=g_caif_ce_test_n_grad_shape;
+  const int vocab_size=g_caif_ce_test_vocab_grad_shape;
 
   std::vector<float> logits_data(n*vocab_size,0.5f);
   std::vector<float> targets_data={0.0f,1.0f,2.0f,3.0f};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_data.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_data.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
 
   const auto &grad_shape=grad.Shape();
-  const bool passed=(grad_shape.size()==2&&
-                     grad_shape[0]==static_cast<uint32_t>(n)&&
+  const bool passed=(grad_shape.size()==2 &&
+                     grad_shape[0]==static_cast<uint32_t>(n) &&
                      grad_shape[1]==static_cast<uint32_t>(vocab_size));
 
-  ReportTest("TestGradientShape",passed);
+  CAIF_TestHarness::Report("CrossEntropy::GradientShape",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 5: Gradient values match CPU reference
 //------------------------------------------------------------------------------
-static void TestGradientValues()
+void CAIF_CrossEntropyTests::TestGradientValues()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=8;
+  const int n=g_caif_ce_test_n_grad_vals;
+  const int vocab_size=g_caif_ce_test_vocab_grad_vals;
 
   std::vector<float> logits_data(n*vocab_size);
   std::vector<int> targets_int(n);
@@ -218,18 +283,18 @@ static void TestGradientValues()
   }
 
   // CPU reference
-  constexpr int ignore_index=-100;
   std::vector<float> cpu_grad;
-  CAIF_CpuCrossEntropy::Gradient(logits_data,targets_int,cpu_grad,n,vocab_size,ignore_index);
+  CAIF_CpuCrossEntropy::Gradient(logits_data,targets_int,cpu_grad,n,vocab_size,g_caif_ce_test_ignore_index);
 
   // GPU
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_float.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_float.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   CAIF_DeviceTensor gpu_grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
   CAIF_HostTensor host_grad=gpu_grad.ToHost();
@@ -245,28 +310,28 @@ static void TestGradientValues()
     }
   }
 
-  constexpr float tol=1e-4f;
-  const bool passed=(max_diff<tol);
+  const bool passed=(max_diff<g_caif_ce_test_grad_tol);
 
   if(passed==false)
   {
-    std::cout<<"    Max gradient diff: "<<max_diff<<"\n";
+    ISE_Out::Out()<<"    Max gradient diff: "
+                 <<max_diff
+                 <<"\n";
   }
 
-  ReportTest("TestGradientValues",passed);
+  CAIF_TestHarness::Report("CrossEntropy::GradientValues",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 6: Finite difference gradient check
 //------------------------------------------------------------------------------
-static void TestGradientFiniteDiff()
+void CAIF_CrossEntropyTests::TestGradientFiniteDiff()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=2;
-  constexpr int vocab_size=4;
+  const int n=g_caif_ce_test_n_fd;
+  const int vocab_size=g_caif_ce_test_vocab_fd;
   constexpr float h=1e-3f;
-  constexpr float tol=5e-2f;
 
   std::vector<float> logits_data(n*vocab_size);
   for(int i=0;i<n*vocab_size;++i)
@@ -276,13 +341,14 @@ static void TestGradientFiniteDiff()
 
   std::vector<float> targets_data={1.0f,2.0f};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_data.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_data.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   // Compute analytical gradient
   CAIF_DeviceTensor grad=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeGradient(logits,targets,stream);
@@ -290,55 +356,60 @@ static void TestGradientFiniteDiff()
 
   // Check a few elements with finite difference
   bool all_passed=true;
-  constexpr int num_checks=4;
 
-  for(int check=0;check<num_checks;++check)
+  for(int check=0;check<g_caif_ce_test_fd_num_checks;++check)
   {
-    const int idx=check*(n*vocab_size)/num_checks;
+    const int idx=check*(n*vocab_size)/g_caif_ce_test_fd_num_checks;
 
     // f(x+h)
     std::vector<float> logits_plus=logits_data;
     logits_plus[idx]+=h;
-    CAIF_DeviceTensor logits_p=CAIF_DeviceTensor::FromHostData(logits_plus.data(),
-                                                              {static_cast<uint32_t>(n),
-                                                               static_cast<uint32_t>(vocab_size)},
-                                                              stream);
+    CAIF_DeviceTensor logits_p=CAIF_DeviceTensor::FromHostData(
+      logits_plus.data(),
+      {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+      stream);
     const float loss_plus=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits_p,targets,stream);
 
     // f(x-h)
     std::vector<float> logits_minus=logits_data;
     logits_minus[idx]-=h;
-    CAIF_DeviceTensor logits_m=CAIF_DeviceTensor::FromHostData(logits_minus.data(),
-                                                              {static_cast<uint32_t>(n),
-                                                               static_cast<uint32_t>(vocab_size)},
-                                                              stream);
+    CAIF_DeviceTensor logits_m=CAIF_DeviceTensor::FromHostData(
+      logits_minus.data(),
+      {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+      stream);
     const float loss_minus=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits_m,targets,stream);
 
     const float numerical_grad=(loss_plus-loss_minus)/(2.0f*h);
     const float analytical_grad=host_grad.Data()[idx];
     const float diff=std::abs(numerical_grad-analytical_grad);
 
-    if(diff>tol)
+    if(diff>g_caif_ce_test_fd_tol)
     {
-      std::cout<<"    idx "<<idx<<": numerical="<<numerical_grad
-               <<", analytical="<<analytical_grad<<", diff="<<diff<<"\n";
+      ISE_Out::Out()<<"    idx "
+                   <<idx
+                   <<": numerical="
+                   <<numerical_grad
+                   <<", analytical="
+                   <<analytical_grad
+                   <<", diff="
+                   <<diff
+                   <<"\n";
       all_passed=false;
     }
   }
 
-  ReportTest("TestGradientFiniteDiff",all_passed);
+  CAIF_TestHarness::Report("CrossEntropy::GradientFiniteDiff",all_passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 7: Ignore index excludes positions
 //------------------------------------------------------------------------------
-static void TestIgnoreIndex()
+void CAIF_CrossEntropyTests::TestIgnoreIndex()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=8;
-  constexpr int ignore_index=-100;
+  const int n=g_caif_ce_test_n_ignore;
+  const int vocab_size=g_caif_ce_test_vocab_ignore;
 
   std::vector<float> logits_data(n*vocab_size);
   for(int i=0;i<n*vocab_size;++i)
@@ -347,20 +418,23 @@ static void TestIgnoreIndex()
   }
 
   // Two positions are ignored
-  std::vector<float> targets_with_ignore={0.0f,static_cast<float>(ignore_index),
-                                           2.0f,static_cast<float>(ignore_index)};
+  std::vector<float> targets_with_ignore={0.0f,
+                                          static_cast<float>(g_caif_ce_test_ignore_index),
+                                          2.0f,
+                                          static_cast<float>(g_caif_ce_test_ignore_index)};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_with_ignore.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_with_ignore.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   // Loss should only consider positions 0 and 2
   const float loss_with_ignore=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(
-      logits,targets,stream,ignore_index);
+    logits,targets,stream,g_caif_ce_test_ignore_index);
 
   // Reference: compute loss for just positions 0 and 2
   std::vector<float> logits_subset(2*vocab_size);
@@ -370,29 +444,36 @@ static void TestIgnoreIndex()
     logits_subset[1*vocab_size+v]=logits_data[2*vocab_size+v];
   }
   std::vector<int> targets_subset={0,2};
-  const float loss_subset=CAIF_CpuCrossEntropy::Loss(logits_subset,targets_subset,2,vocab_size,-100);
+  const float loss_subset=CAIF_CpuCrossEntropy::Loss(logits_subset,
+                                                      targets_subset,
+                                                      2,
+                                                      vocab_size,
+                                                      -100);
 
   const float diff=std::abs(loss_with_ignore-loss_subset);
-  constexpr float tol=1e-4f;
-  const bool passed=(diff<tol);
+  const bool passed=(diff<g_caif_ce_test_values_tol);
 
   if(passed==false)
   {
-    std::cout<<"    Loss with ignore: "<<loss_with_ignore<<", subset loss: "<<loss_subset<<"\n";
+    ISE_Out::Out()<<"    Loss with ignore: "
+                 <<loss_with_ignore
+                 <<", subset loss: "
+                 <<loss_subset
+                 <<"\n";
   }
 
-  ReportTest("TestIgnoreIndex",passed);
+  CAIF_TestHarness::Report("CrossEntropy::IgnoreIndex",passed);
 }
 
 //------------------------------------------------------------------------------
 // Test 8: Fused matches separate loss + gradient
 //------------------------------------------------------------------------------
-static void TestFusedMatchesSeparate()
+void CAIF_CrossEntropyTests::TestFusedMatchesSeparate()
 {
   CAIF_CudaStream stream;
 
-  constexpr int n=4;
-  constexpr int vocab_size=8;
+  const int n=g_caif_ce_test_n_fused;
+  const int vocab_size=g_caif_ce_test_vocab_fused;
 
   std::vector<float> logits_data(n*vocab_size);
   for(int i=0;i<n*vocab_size;++i)
@@ -402,13 +483,14 @@ static void TestFusedMatchesSeparate()
 
   std::vector<float> targets_data={0.0f,3.0f,5.0f,7.0f};
 
-  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(logits_data.data(),
-                                                          {static_cast<uint32_t>(n),
-                                                           static_cast<uint32_t>(vocab_size)},
-                                                          stream);
-  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(targets_data.data(),
-                                                           {static_cast<uint32_t>(n)},
-                                                           stream);
+  CAIF_DeviceTensor logits=CAIF_DeviceTensor::FromHostData(
+    logits_data.data(),
+    {static_cast<uint32_t>(n),static_cast<uint32_t>(vocab_size)},
+    stream);
+  CAIF_DeviceTensor targets=CAIF_DeviceTensor::FromHostData(
+    targets_data.data(),
+    {static_cast<uint32_t>(n)},
+    stream);
 
   // Separate computation
   const float loss_separate=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLoss(logits,targets,stream);
@@ -417,7 +499,7 @@ static void TestFusedMatchesSeparate()
   // Fused computation
   CAIF_DeviceTensor grad_fused;
   const float loss_fused=CAIF_DeviceCrossEntropyLoss<float,float>::ComputeLossAndGradient(
-      logits,targets,grad_fused,stream);
+    logits,targets,grad_fused,stream);
 
   // Compare loss
   const float loss_diff=std::abs(loss_fused-loss_separate);
@@ -436,24 +518,24 @@ static void TestFusedMatchesSeparate()
     }
   }
 
-  constexpr float tol=1e-5f;
-  const bool passed=(loss_diff<tol&&max_grad_diff<tol);
+  const bool passed=(loss_diff<g_caif_ce_test_fused_tol && max_grad_diff<g_caif_ce_test_fused_tol);
 
   if(passed==false)
   {
-    std::cout<<"    Loss diff: "<<loss_diff<<", max grad diff: "<<max_grad_diff<<"\n";
+    ISE_Out::Out()<<"    Loss diff: "
+                 <<loss_diff
+                 <<", max grad diff: "
+                 <<max_grad_diff
+                 <<"\n";
   }
 
-  ReportTest("TestFusedMatchesSeparate",passed);
+  CAIF_TestHarness::Report("CrossEntropy::FusedMatchesSeparate",passed);
 }
 
-//------------------------------------------------------------------------------
-// Main
-//------------------------------------------------------------------------------
-int main()
+void CAIF_CrossEntropyTests::RunAll()
 {
-  std::cout<<"=== Cross-Entropy Loss Tests ===\n";
-
+  ISE_Out::Out()<<"=== Cross-Entropy Loss Tests ==="
+               <<"\n";
   TestLossShape();
   TestLossValues();
   TestLossNumericalStability();
@@ -462,15 +544,20 @@ int main()
   TestGradientFiniteDiff();
   TestIgnoreIndex();
   TestFusedMatchesSeparate();
+}
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
-  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
+#endif// USE_CAIF_CUDA
 
-  if(CAIF_TestHarness::FailedCount()==0)
-  {
-    std::cout<<"All tests passed!\n";
-    return 0;
-  }
-  return 1;
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_CrossEntropyTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"[SKIP] CUDA tests (USE_CAIF_CUDA not defined)"
+               <<"\n";
+  return 0;
+#endif
 }

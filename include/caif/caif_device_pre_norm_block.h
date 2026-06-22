@@ -153,6 +153,15 @@ class CAIF_DevicePreNormBlock:public CAIF_DeviceContainer
     CAIF_DeviceTensor BackwardLoop(const CAIF_DeviceTensor &grad_output,
                                    CAIF_RunContext &ctx);
 
+    // Internal accessors — keep method bodies free of direct _member access.
+    const std::vector<std::string> &NormPrefixes()const{return _norm_prefixes;}
+    std::vector<std::string> &NormPrefixes(){return _norm_prefixes;}
+    void SetNormPrefixes(std::vector<std::string> &&v){_norm_prefixes=std::move(v);}
+    const std::vector<std::string> &LayerPrefixes()const{return _layer_prefixes;}
+    std::vector<std::string> &LayerPrefixes(){return _layer_prefixes;}
+    void SetLayerPrefixes(std::vector<std::string> &&v){_layer_prefixes=std::move(v);}
+    CAIF_DeviceTensor &SavedInput(){return _saved_input;}
+
     std::vector<std::string> _norm_prefixes;
     std::vector<std::string> _layer_prefixes;
     bool _norms_trainable;

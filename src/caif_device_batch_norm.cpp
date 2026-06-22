@@ -29,14 +29,17 @@
 #include "caif_device_batch_norm.h"
 #include "caif_device_batch_norm_factory.h"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_cudnn_util.h"
 #include "caif_device_context.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
 
 #ifdef USE_CAIF_CUDA
+#include "caif_batch_norm_cudnn_helpers.h"
 #include <cudnn.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -44,89 +47,6 @@
 
 namespace instance
 {
-
-
-constexpr size_t g_caif_batch_norm_min_features=1;
-
-#ifdef USE_CAIF_CUDA
-
-// Sync a host fp32 tensor into a fresh device fp32 tensor of matching shape.
-void SyncFp32HostToDevice(const CAIF_DeviceTensor &host,
-                          CAIF_CudaStream &stream,
-                          CAIF_DeviceTensor &device_out)
-{
-  device_out=CAIF_DeviceTensor::Uninitialized(host.Shape(),
-                                              stream,
-                                              CAIF_DataType::CAIF_DataType_e::Float32);
-  // fp32 by helper contract
-  device_out.CopyFromHost(static_cast<const float*>(host.DeviceDataRaw()),
-                          host.TotalElements());
-}
-
-// Sync a device fp32 tensor back to a host fp32 tensor (overwrite).
-void SyncFp32DeviceToHostOverwrite(const CAIF_DeviceTensor &device,
-                                   CAIF_CudaStream &stream,
-                                   CAIF_DeviceTensor &host_out)
-{
-  std::vector<float> staging(device.TotalElements());
-  device.CopyToHost(staging.data());
-  stream.Synchronize();
-  std::memcpy(host_out.DeviceDataRaw(),
-              staging.data(),
-              staging.size()*sizeof(float));
-}
-
-// Accumulate a device fp32 grad into a host fp32 grad accumulator.
-void AccumulateFp32DeviceToHost(const CAIF_DeviceTensor &device_grad,
-                                CAIF_CudaStream &stream,
-                                CAIF_DeviceTensor &host_grad_inout)
-{
-  std::vector<float> staging(device_grad.TotalElements());
-  device_grad.CopyToHost(staging.data());
-  stream.Synchronize();
-  // fp32 by helper contract
-  float *acc=static_cast<float*>(host_grad_inout.DeviceDataRaw());
-  for(size_t i=0;i<staging.size();++i)
-  {
-    acc[i]+=staging[i];
-  }
-}
-
-// Set up the bn-scale/bias/mean/var descriptor for [features] params with
-// CUDNN_BATCHNORM_SPATIAL — cuDNN expects shape [1, C, 1, 1] for the params
-// in spatial mode.
-void SetupBnParamDescriptor(cudnnTensorDescriptor_t desc,uint32_t features)
-{
-  CAIF_CudnnUtil::CheckCudnn(cudnnSetTensor4dDescriptor(desc,
-                                                        CUDNN_TENSOR_NCHW,
-                                                        CUDNN_DATA_FLOAT,
-                                                        1,
-                                                        static_cast<int>(features),
-                                                        1,
-                                                        1),
-                             "set bn_param_desc");
-}
-
-// Set up the input/output descriptor for [row_count, features, 1, 1] NCHW
-// with the storage dtype. (cuDNN's batch norm wants the per-channel axis
-// at C; reshaping our [row_count, features] flat layout to NCHW with H=W=1
-// makes it directly consumable.)
-void SetupBnDataDescriptor(cudnnTensorDescriptor_t desc,
-                           uint32_t row_count,
-                           uint32_t features,
-                           cudnnDataType_t cudnn_dt)
-{
-  CAIF_CudnnUtil::CheckCudnn(cudnnSetTensor4dDescriptor(desc,
-                                                        CUDNN_TENSOR_NCHW,
-                                                        cudnn_dt,
-                                                        static_cast<int>(row_count),
-                                                        static_cast<int>(features),
-                                                        1,
-                                                        1),
-                             "set bn_data_desc");
-}
-
-#endif // USE_CAIF_CUDA
 
 
 template<typename ComputeT,typename StorageT>
@@ -151,7 +71,7 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::CAIF_DeviceBatchNorm(uint32_t num_featu
 {
   try
   {
-    if(num_features<g_caif_batch_norm_min_features)
+    if(num_features<1)
     {
       THROW_CAIFE("CAIF_DeviceBatchNorm: num_features must be >= 1");
     }
@@ -176,22 +96,22 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::CAIF_DeviceBatchNorm(uint32_t num_featu
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceBatchNorm<ComputeT,StorageT>::CAIF_DeviceBatchNorm(CAIF_DeviceBatchNorm &&other):
                               CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
-                              _num_features(other._num_features),
-                              _epsilon(other._epsilon),
-                              _momentum(other._momentum),
-                              _gamma(std::move(other._gamma)),
-                              _beta(std::move(other._beta)),
-                              _gamma_grad(std::move(other._gamma_grad)),
-                              _beta_grad(std::move(other._beta_grad)),
-                              _running_mean(std::move(other._running_mean)),
-                              _running_var(std::move(other._running_var)),
-                              _cached_input_shape(std::move(other._cached_input_shape)),
-                              _cached_mean(std::move(other._cached_mean)),
-                              _cached_inv_std(std::move(other._cached_inv_std)),
-                              _cached_normalized(std::move(other._cached_normalized)),
-                              _cached_input_device(std::move(other._cached_input_device)),
-                              _cached_save_mean_device(std::move(other._cached_save_mean_device)),
-                              _cached_save_inv_var_device(std::move(other._cached_save_inv_var_device))
+                              _num_features(other.NumFeatures()),
+                              _epsilon(other.Epsilon()),
+                              _momentum(other.Momentum()),
+                              _gamma(std::move(other.Gamma())),
+                              _beta(std::move(other.Beta())),
+                              _gamma_grad(std::move(other.GammaGrad())),
+                              _beta_grad(std::move(other.BetaGrad())),
+                              _running_mean(std::move(other.RunningMeanMutable())),
+                              _running_var(std::move(other.RunningVarMutable())),
+                              _cached_input_shape(std::move(other.CachedInputShapeMutable())),
+                              _cached_mean(std::move(other.CachedMean())),
+                              _cached_inv_std(std::move(other.CachedInvStd())),
+                              _cached_normalized(std::move(other.CachedNormalized())),
+                              _cached_input_device(std::move(other.CachedInputDevice())),
+                              _cached_save_mean_device(std::move(other.CachedSaveMeanDevice())),
+                              _cached_save_inv_var_device(std::move(other.CachedSaveInvVarDevice()))
 {
 }
 
@@ -204,22 +124,22 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::operator=(CAIF_DeviceBatchNorm &&other)
     if(this!=&other)
     {
       CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-      _num_features=other._num_features;
-      _epsilon=other._epsilon;
-      _momentum=other._momentum;
-      _gamma=std::move(other._gamma);
-      _beta=std::move(other._beta);
-      _gamma_grad=std::move(other._gamma_grad);
-      _beta_grad=std::move(other._beta_grad);
-      _running_mean=std::move(other._running_mean);
-      _running_var=std::move(other._running_var);
-      _cached_input_shape=std::move(other._cached_input_shape);
-      _cached_mean=std::move(other._cached_mean);
-      _cached_inv_std=std::move(other._cached_inv_std);
-      _cached_normalized=std::move(other._cached_normalized);
-      _cached_input_device=std::move(other._cached_input_device);
-      _cached_save_mean_device=std::move(other._cached_save_mean_device);
-      _cached_save_inv_var_device=std::move(other._cached_save_inv_var_device);
+      SetNumFeatures(other.NumFeatures());
+      SetEpsilon(other.Epsilon());
+      SetMomentum(other.Momentum());
+      SetGamma(std::move(other.Gamma()));
+      SetBeta(std::move(other.Beta()));
+      SetGammaGrad(std::move(other.GammaGrad()));
+      SetBetaGrad(std::move(other.BetaGrad()));
+      SetRunningMean(std::move(other.RunningMeanMutable()));
+      SetRunningVar(std::move(other.RunningVarMutable()));
+      SetCachedInputShape(std::move(other.CachedInputShapeMutable()));
+      SetCachedMean(std::move(other.CachedMean()));
+      SetCachedInvStd(std::move(other.CachedInvStd()));
+      SetCachedNormalized(std::move(other.CachedNormalized()));
+      SetCachedInputDevice(std::move(other.CachedInputDevice()));
+      SetCachedSaveMeanDevice(std::move(other.CachedSaveMeanDevice()));
+      SetCachedSaveInvVarDevice(std::move(other.CachedSaveInvVarDevice()));
     }
     return *this;
   }
@@ -241,7 +161,7 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &in
       THROW_CAIFE("CAIF_DeviceBatchNorm: input shape must be non-empty");
     }
     const uint32_t feature_axis=in_shape.back();
-    if(feature_axis!=_num_features)
+    if(feature_axis!=NumFeatures())
     {
       THROW_CAIFE("CAIF_DeviceBatchNorm: input feature dim mismatch");
     }
@@ -362,10 +282,10 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::ForwardDevice(const CAIF_DeviceTensor &
     CAIF_DeviceTensor beta_dev;
     CAIF_DeviceTensor running_mean_dev;
     CAIF_DeviceTensor running_var_dev;
-    SyncFp32HostToDevice(Gamma(),Stream(),gamma_dev);
-    SyncFp32HostToDevice(Beta(),Stream(),beta_dev);
-    SyncFp32HostToDevice(RunningMeanMutable(),Stream(),running_mean_dev);
-    SyncFp32HostToDevice(RunningVarMutable(),Stream(),running_var_dev);
+    CAIF_BatchNormCudnnHelpers::SyncFp32HostToDevice(Gamma(),Stream(),gamma_dev);
+    CAIF_BatchNormCudnnHelpers::SyncFp32HostToDevice(Beta(),Stream(),beta_dev);
+    CAIF_BatchNormCudnnHelpers::SyncFp32HostToDevice(RunningMeanMutable(),Stream(),running_mean_dev);
+    CAIF_BatchNormCudnnHelpers::SyncFp32HostToDevice(RunningVarMutable(),Stream(),running_var_dev);
 
     // Allocate output and per-call save buffers (shape [features] fp32).
     CAIF_DeviceTensor output=CAIF_DeviceTensor::Uninitialized(in_shape,
@@ -386,8 +306,8 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::ForwardDevice(const CAIF_DeviceTensor &
     cudnnTensorDescriptor_t param_desc=nullptr;
     CAIF_CudnnUtil::CheckCudnn(cudnnCreateTensorDescriptor(&data_desc),"create data_desc");
     CAIF_CudnnUtil::CheckCudnn(cudnnCreateTensorDescriptor(&param_desc),"create param_desc");
-    SetupBnDataDescriptor(data_desc,row_count,feature_axis,cudnn_dt);
-    SetupBnParamDescriptor(param_desc,feature_axis);
+    CAIF_BatchNormCudnnHelpers::SetupBnDataDescriptor(data_desc,row_count,feature_axis,cudnn_dt);
+    CAIF_BatchNormCudnnHelpers::SetupBnParamDescriptor(param_desc,feature_axis);
 
     const float alpha=1.0f;
     const float beta=0.0f;
@@ -414,8 +334,8 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::ForwardDevice(const CAIF_DeviceTensor &
                                                                         save_inv_var.DeviceDataRaw()),
                                  "BNForwardTraining");
       // cuDNN updated running stats — copy back to host.
-      SyncFp32DeviceToHostOverwrite(running_mean_dev,Stream(),RunningMeanMutable());
-      SyncFp32DeviceToHostOverwrite(running_var_dev,Stream(),RunningVarMutable());
+      CAIF_BatchNormCudnnHelpers::SyncFp32DeviceToHostOverwrite(running_mean_dev,Stream(),RunningMeanMutable());
+      CAIF_BatchNormCudnnHelpers::SyncFp32DeviceToHostOverwrite(running_var_dev,Stream(),RunningVarMutable());
       SetCachedInputShape(in_shape);
       SetCachedInputDevice(input.Clone());
       SetCachedSaveMeanDevice(std::move(save_mean));
@@ -553,7 +473,7 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::BackwardDevice(const CAIF_DeviceTensor 
 
     // Sync host gamma into device fp32 mirror; allocate device grads too.
     CAIF_DeviceTensor gamma_dev;
-    SyncFp32HostToDevice(Gamma(),Stream(),gamma_dev);
+    CAIF_BatchNormCudnnHelpers::SyncFp32HostToDevice(Gamma(),Stream(),gamma_dev);
     const std::vector<uint32_t> param_shape={feature_axis};
     const CAIF_DataType::CAIF_DataType_e fp32=CAIF_DataType::CAIF_DataType_e::Float32;
     CAIF_DeviceTensor gamma_grad_dev=CAIF_DeviceTensor::Uninitialized(param_shape,
@@ -575,8 +495,8 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::BackwardDevice(const CAIF_DeviceTensor 
     cudnnTensorDescriptor_t param_desc=nullptr;
     CAIF_CudnnUtil::CheckCudnn(cudnnCreateTensorDescriptor(&data_desc),"create data_desc");
     CAIF_CudnnUtil::CheckCudnn(cudnnCreateTensorDescriptor(&param_desc),"create param_desc");
-    SetupBnDataDescriptor(data_desc,row_count,feature_axis,cudnn_dt);
-    SetupBnParamDescriptor(param_desc,feature_axis);
+    CAIF_BatchNormCudnnHelpers::SetupBnDataDescriptor(data_desc,row_count,feature_axis,cudnn_dt);
+    CAIF_BatchNormCudnnHelpers::SetupBnParamDescriptor(param_desc,feature_axis);
 
     const float alpha_data=1.0f;
     const float beta_data=0.0f;
@@ -608,8 +528,8 @@ CAIF_DeviceBatchNorm<ComputeT,StorageT>::BackwardDevice(const CAIF_DeviceTensor 
     cudnnDestroyTensorDescriptor(data_desc);
 
     // Accumulate device fp32 grads back into host fp32 grad accumulators.
-    AccumulateFp32DeviceToHost(gamma_grad_dev,Stream(),GammaGrad());
-    AccumulateFp32DeviceToHost(beta_grad_dev,Stream(),BetaGrad());
+    CAIF_BatchNormCudnnHelpers::AccumulateFp32DeviceToHost(gamma_grad_dev,Stream(),GammaGrad());
+    CAIF_BatchNormCudnnHelpers::AccumulateFp32DeviceToHost(beta_grad_dev,Stream(),BetaGrad());
     return grad_input;
   }
   CAIF_CATCH_BLOCK();
@@ -723,16 +643,17 @@ size_t CAIF_DeviceBatchNorm<ComputeT,StorageT>::TotalParameterCount()const
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceBatchNorm<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_batch_norm;
+  return g_serial_tag_batch_norm;
 }
 
 template<typename ComputeT,typename StorageT>
 std::vector<std::string>
 CAIF_DeviceBatchNorm<ComputeT,StorageT>::ParameterNames(const std::string &prefix)const
 {
+  const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
   std::vector<std::string> names;
-  names.push_back(prefix+"gamma");
-  names.push_back(prefix+"beta");
+  names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::BNGamma_e));
+  names.push_back(prefix+reg.Name(CAIF_ParamRole::Role_e::BNBeta_e));
   return names;
 }
 

@@ -35,17 +35,17 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include <cstdint>
 #include <cstring>
 
 namespace instance
 {
 
-class CAIF_HostDtypeConvert
+class CAIF_HostDtypeConvert:public CAIF_Base
 {
   public:
     CAIF_HostDtypeConvert()=delete;
-    ~CAIF_HostDtypeConvert()=delete;
 
     // fp32 -> bf16 with round-to-nearest-even. bf16 stores the upper 16 bits
     // of fp32 (same exponent layout, 7-bit mantissa). The

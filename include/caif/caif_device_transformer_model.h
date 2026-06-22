@@ -43,6 +43,7 @@
 #include "caif_device_transformer_block.h"
 #include "caif_device_rmsnorm.h"
 #include "caif_device_linear_head.h"
+#include "caif_device_transformer_model_config.h"
 #include "caif_storage_dtype.h"
 #include "caif_storage_dtype_float.h"
 #ifdef USE_CAIF_CUDA
@@ -63,34 +64,7 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceContainer
   public:
     typedef CAIF_DeviceLayerTyped<ComputeT,StorageT> Typed_t;
 
-    /**
-     * @brief Configuration for TransformerModel
-     */
-    struct Config_t
-    {
-      // Embedding
-      uint32_t vocab_size;      // Vocabulary size for token embedding
-      uint32_t max_seq_len;     // Maximum sequence length
-
-      // Architecture
-      uint32_t dim;             // Model dimension
-      uint32_t num_heads;       // Number of attention heads
-      uint32_t num_kv_heads;    // Number of KV heads (GQA), 0 = num_heads
-      uint32_t num_layers;      // Number of transformer blocks
-      uint32_t ffn_dim;         // FFN hidden dimension (0 = auto-compute)
-
-      // Features
-      bool causal;              // Causal attention mask
-      bool use_rope;            // Use rotary position embeddings
-      int rope_style=0;         // CAIF_ROPE_INTERLEAVED(0) or CAIF_ROPE_HALF_SPLIT(1)
-      PositionalEncodingMode_e pe_mode;  // Learned, Sinusoidal (ignored if use_rope)
-
-      // Output
-      uint32_t output_dim;      // Output head dimension (0 = vocab_size for LM)
-      bool tie_weights;         // Tie output head to embedding table
-    };
-
-    CAIF_DeviceTransformerModel(const Config_t &config,CAIF_CudaStream &stream);
+    CAIF_DeviceTransformerModel(const CAIF_DeviceTransformerModelConfig &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceTransformerModel()override=default;
 
     // Move
@@ -106,8 +80,11 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceContainer
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
     // Accessors
-    const Config_t &Config()const{return _config;}
-    uint32_t NumLayers()const{return _config.num_layers;}
+    const CAIF_DeviceTransformerModelConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceTransformerModelConfig &c){_config=c;}
+    uint32_t NumLayers()const{return Config().NumLayers();}
+    bool PosEncPresent()const{return _pos_enc_present;}
+    void SetPosEncPresent(const bool b){_pos_enc_present=b;}
 
     static constexpr CAIF_DataType::CAIF_DataType_e ComputeDtype()
     {
@@ -124,7 +101,7 @@ class CAIF_DeviceTransformerModel:public CAIF_DeviceContainer
     // Slot indices within _sublayers for name-prefix resolution.
     // _pos_enc_present toggles whether a PositionalEncoding sublayer
     // sits between the embedding and the first block.
-    Config_t _config;
+    CAIF_DeviceTransformerModelConfig _config;
     bool _pos_enc_present;
 };
 

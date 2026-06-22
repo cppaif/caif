@@ -20,6 +20,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_tabular_embedding_config.h"
 #include "caif_run_context.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
@@ -34,13 +35,7 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t num_features;
-      uint32_t dim;
-    };
-
-    CAIF_DeviceTabularEmbedding(const Config_t &config,
+    CAIF_DeviceTabularEmbedding(const CAIF_DeviceTabularEmbeddingConfig &config,
                                 CAIF_CudaStream &stream);
     ~CAIF_DeviceTabularEmbedding()override=default;
 
@@ -63,8 +58,36 @@ class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    uint32_t NumFeatures()const{return _config.num_features;}
-    uint32_t Dim()const{return _config.dim;}
+    uint32_t NumFeatures()const{return Config().NumFeatures();}
+    uint32_t Dim()const{return Config().Dim();}
+    const CAIF_DeviceTabularEmbeddingConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceTabularEmbeddingConfig &config){_config=config;}
+
+    CAIF_DeviceTensor &WProj(){return _w_proj;}
+    const CAIF_DeviceTensor &WProj()const{return _w_proj;}
+    void SetWProj(CAIF_DeviceTensor &&t){_w_proj=std::move(t);}
+
+    CAIF_DeviceTensor &BProj(){return _b_proj;}
+    const CAIF_DeviceTensor &BProj()const{return _b_proj;}
+    void SetBProj(CAIF_DeviceTensor &&t){_b_proj=std::move(t);}
+
+    CAIF_DeviceTensor &GradWProj(){return _grad_w_proj;}
+    const CAIF_DeviceTensor &GradWProj()const{return _grad_w_proj;}
+    void SetGradWProj(CAIF_DeviceTensor &&t){_grad_w_proj=std::move(t);}
+
+    CAIF_DeviceTensor &GradBProj(){return _grad_b_proj;}
+    const CAIF_DeviceTensor &GradBProj()const{return _grad_b_proj;}
+    void SetGradBProj(CAIF_DeviceTensor &&t){_grad_b_proj=std::move(t);}
+
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    uint32_t CachedBatch()const{return _cached_batch;}
+    void SetCachedBatch(uint32_t b){_cached_batch=b;}
+
+    uint32_t CachedSeqLen()const{return _cached_seq_len;}
+    void SetCachedSeqLen(uint32_t s){_cached_seq_len=s;}
 
     void InitializeWeights(uint32_t seed=0)override;
 
@@ -82,7 +105,7 @@ class CAIF_DeviceTabularEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT
   private:
     CAIF_DeviceTensor &WProjMut(){return _w_proj;}
 
-    Config_t _config;
+    CAIF_DeviceTabularEmbeddingConfig _config;
 
     CAIF_DeviceTensor _w_proj;
     CAIF_DeviceTensor _b_proj;

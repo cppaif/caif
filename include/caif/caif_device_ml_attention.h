@@ -19,6 +19,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_ml_attention_config.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
@@ -36,20 +37,6 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct MLAConfig_t
-    {
-      uint32_t dim;
-      uint32_t num_heads;
-      uint32_t q_lora_rank;
-      uint32_t kv_lora_rank;
-      uint32_t qk_rope_head_dim;
-      uint32_t qk_nope_head_dim;
-      uint32_t v_head_dim;
-      bool causal;
-      float rope_base;
-      int rope_style=0;
-      float rms_norm_eps;
-    };
 
     struct MLAProjections_t
     {
@@ -60,8 +47,8 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
       std::unique_ptr<CAIF_DeviceLayer> o_proj;
     };
 
-    CAIF_DeviceMLAttention(const MLAConfig_t &config,CAIF_CudaStream &stream);
-    CAIF_DeviceMLAttention(const MLAConfig_t &config,
+    CAIF_DeviceMLAttention(const CAIF_DeviceMLAttentionConfig &config,CAIF_CudaStream &stream);
+    CAIF_DeviceMLAttention(const CAIF_DeviceMLAttentionConfig &config,
                            MLAProjections_t projections,
                            CAIF_CudaStream &stream);
     ~CAIF_DeviceMLAttention()override=default;
@@ -85,7 +72,7 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    const MLAConfig_t &Config()const{return _config;}
+    const CAIF_DeviceMLAttentionConfig &Config()const{return _config;}
     const MLAProjections_t &Projections()const{return _projections;}
     bool UsesProjections()const{return _use_projections;}
     bool UsesQLoRA()const{return _use_q_lora;}
@@ -134,6 +121,24 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     uint32_t KVCacheLength()const{return _kv_cache_len;}
     uint32_t KVCacheMaxLen()const{return _kv_cache_max_len;}
     uint32_t KVCacheBatch()const{return _kv_cache_batch;}
+
+    const CAIF_DeviceTensor &WQAbsorbed()const{return _w_q_absorbed;}
+    const CAIF_DeviceTensor &WVO()const{return _w_vo;}
+    const CAIF_DeviceTensor &WQRope()const{return _w_q_rope;}
+    bool AbsorbReady()const{return _absorb_ready;}
+
+    // Storage dtype of the folded decode weights. The absorbed decode is
+    // M=1, so its cost is the weight read; fp32 models store the folds in
+    // bf16 to halve that read (the GEMVs still accumulate in fp32). Other
+    // storage dtypes keep their own width.
+    CAIF_DataType::CAIF_DataType_e AbsorbedDtype()const
+    {
+      if(StorageDtype()==CAIF_DataType::CAIF_DataType_e::Float32)
+      {
+        return CAIF_DataType::CAIF_DataType_e::BFloat16;
+      }
+      return StorageDtype();
+    }
 
     // Mutable accessors — used inside Forward/Backward for in-place ops
     // (FillZero, CopyFromHost, CAIF_Ops::Add accumulator updates). A
@@ -193,7 +198,7 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     CAIF_DeviceTensor TakeKVCacheKPE(){return std::move(_kv_cache_k_pe);}
 
     // Setters (move-in for tensors, value for primitives).
-    void SetConfig(const MLAConfig_t &c){_config=c;}
+    void SetConfig(const CAIF_DeviceMLAttentionConfig &c){_config=c;}
     void SetProjections(MLAProjections_t p){_projections=std::move(p);}
     void SetUseProjections(bool v){_use_projections=v;}
     void SetUseQLoRA(bool v){_use_q_lora=v;}
@@ -240,6 +245,10 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     void SetKVCacheMaxLen(uint32_t v){_kv_cache_max_len=v;}
     void SetKVCacheBatch(uint32_t v){_kv_cache_batch=v;}
     void SetKVCacheEnabled(bool v){_kv_cache_enabled=v;}
+    void SetWQAbsorbed(CAIF_DeviceTensor &&t){_w_q_absorbed=std::move(t);}
+    void SetWVO(CAIF_DeviceTensor &&t){_w_vo=std::move(t);}
+    void SetWQRope(CAIF_DeviceTensor &&t){_w_q_rope=std::move(t);}
+    void SetAbsorbReady(bool v){_absorb_ready=v;}
 
     void InitializeWeights(uint32_t seed=0)override;
 
@@ -263,6 +272,11 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 
     CAIF_DeviceTensor ForwardCached(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx);
 
+    // Build the matrix-absorption decode weights (_w_q_absorbed, _w_vo) from
+    // W_q / W_kv_decompress / W_o. Idempotent; called lazily on the first
+    // cached decode step. Non-projection (raw-weight) MLA only.
+    void PrecomputeAbsorbedWeights();
+
   public:
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::ComputeDtype;
@@ -283,7 +297,7 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     void MoveAssignFrom(CAIF_DeviceMLAttention &&other);
 
   private:
-    MLAConfig_t _config;
+    CAIF_DeviceMLAttentionConfig _config;
     MLAProjections_t _projections;
     bool _use_projections;
     bool _use_q_lora;
@@ -328,12 +342,34 @@ class CAIF_DeviceMLAttention:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     uint32_t _cached_batch;
     uint32_t _cached_seq_len;
 
+    // _kv_cache_compressed stores the RMSNorm'd KV latent (not the raw
+    // compressed output): the matrix-absorption decode attends directly in this
+    // normed-latent space, so the norm is applied once at append time instead
+    // of re-normed over the whole cache every step.
     CAIF_DeviceTensor _kv_cache_compressed;
     CAIF_DeviceTensor _kv_cache_k_pe;
     uint32_t _kv_cache_len;
     uint32_t _kv_cache_max_len;
     uint32_t _kv_cache_batch;
     bool _kv_cache_enabled;
+
+    // Matrix-absorption incremental-decode weights (added 2026-06-08).
+    // Precomputed once from W_q / W_kv_decompress / W_o so incremental decode
+    // never decompresses the KV cache (keeps it O(n) and MLA-memory-small):
+    //   _w_q_absorbed [q_src_dim, num_heads*kv_lora_rank] folds W_k_nope^T into
+    //     the Q (nope) projection -> query lands in the normed-latent space.
+    //   _w_vo [num_heads*kv_lora_rank, dim] folds W_v then W_o -> value/output
+    //     applied straight from the attention-weighted latent.
+    //   _w_q_rope [q_src_dim, num_heads*qk_rope_head_dim] gathers just the
+    //     rope column blocks of the Q projection so decode never pays the
+    //     full W_q read for the rope slice (added 2026-06-12).
+    // q_src_dim = q_lora_rank when UsesQLoRA(), else dim. All three are
+    // stored in AbsorbedDtype() (bf16 for fp32 models — the decode GEMVs
+    // are M=1 weight reads, so width is the cost).
+    CAIF_DeviceTensor _w_q_absorbed;
+    CAIF_DeviceTensor _w_vo;
+    CAIF_DeviceTensor _w_q_rope;
+    bool _absorb_ready;
 };
 
 #ifdef USE_CAIF_CUDA

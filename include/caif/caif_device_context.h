@@ -154,6 +154,26 @@ class CAIF_DeviceContext:public CAIF_Base
      */
     CAIF_DeviceContext();
 
+    // Private setters — keep Initialize() / Cleanup() bodies free of
+    // direct _member writes. Reads through public accessors above.
+    // Address-taking for C-API populate-by-pointer (e.g.
+    // cublasCreate(&_cublas_handle)) is treated as construction and
+    // left as direct member access.
+    void SetDeviceId(const int v){_device_id=v;}
+    int DeviceId()const{return _device_id;}
+#ifdef USE_CAIF_CUDA
+    cudaStream_t LastCublasStream()const{return _last_cublas_stream;}
+#endif
+    void SetInitialized(const bool v){_initialized=v;}
+    void SetCublasLtWorkspaceSize(const size_t v){_cublaslt_workspace_size=v;}
+    void SetCublasLtWorkspace(void *v){_cublaslt_workspace=v;}
+#ifdef USE_CAIF_CUDA
+    void SetCublasHandle(cublasHandle_t v){_cublas_handle=v;}
+    void SetCublasLtHandle(cublasLtHandle_t v){_cublaslt_handle=v;}
+    void SetCudnnHandle(cudnnHandle_t v){_cudnn_handle=v;}
+    void SetLastCublasStream(cudaStream_t v){_last_cublas_stream=v;}
+#endif
+
     /**
      * @brief Clean up CUDA resources
      */
@@ -175,6 +195,20 @@ class CAIF_DeviceContext:public CAIF_Base
                                         const size_t free_vram_bytes,
                                         bool &out_is_override)const;
 
+    // RE-ENTRANCY HAZARD — read before "fixing" accessor discipline here.
+    // The public accessors CublasHandle() / CublasLtHandle() /
+    // CudnnHandle() / CublasLtWorkspace() are LAZY: each one calls
+    // Initialize() when !IsInitialized(). Therefore Initialize() and
+    // Cleanup() MUST touch these four members directly — `_cublas_handle`
+    // etc. — never through their accessors. Routing Initialize()'s own
+    // body through CublasHandle() makes it call Initialize() recursively
+    // (IsInitialized() is still false mid-init), which re-enters,
+    // re-creates handles, and exhausts cuBLAS until cublasCreate throws
+    // "Failed to create cuBLAS handle" — cascading into a near-total
+    // benchmark failure. Construction/teardown of these members is the
+    // accessor-discipline carve-out; direct access is mandatory, not a
+    // shortcut. (`_cublaslt_workspace_size` / `_initialized` / `_device_id`
+    // have non-lazy accessors and are safe either way.)
 #ifdef USE_CAIF_CUDA
     cublasHandle_t _cublas_handle;
     cublasLtHandle_t _cublaslt_handle;

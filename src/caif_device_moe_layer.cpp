@@ -20,6 +20,7 @@
 #include "caif_ops.h"
 #include "caif_constants.h"
 #include "caif_exception.h"
+#include "caif_role_registry.h"
 #include "ise_lib/ise_out.h"
 #include <algorithm>
 #include <cmath>
@@ -35,46 +36,40 @@ namespace instance
 {
 
 
-// Build internal Router/Expert primitives from scalar args. Used by the
-// primary constructor. Experts are always sized to _hidden_dim; if the
-// caller wants a distinct shared-expert width they pass shared_hidden_dim.
 template<typename ComputeT,typename StorageT>
-void BuildPrimitives(uint32_t input_dim,
-                     uint32_t hidden_dim,
-                     uint32_t num_experts,
-                     uint32_t top_k,
-                     bool expert_use_gated,
-                     bool expert_use_bias,
-                     uint32_t num_shared_experts,
-                     uint32_t shared_hidden_dim,
-                     bool router_use_bias,
-                     float router_noise_std,
-                     CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
-                     bool norm_topk_prob,
-                     float routed_scaling_factor,
-                     CAIF_CudaStream &stream,
-                     std::unique_ptr<CAIF_DeviceMoERouter<ComputeT,StorageT>> &out_router,
-                     std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &out_experts,
-                     std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> &out_shared)
+void CAIF_DeviceMoELayer<ComputeT,StorageT>::BuildPrimitives(
+                              uint32_t input_dim,
+                              uint32_t hidden_dim,
+                              uint32_t num_experts,
+                              uint32_t top_k,
+                              bool expert_use_gated,
+                              bool expert_use_bias,
+                              uint32_t num_shared_experts,
+                              uint32_t shared_hidden_dim,
+                              bool router_use_bias,
+                              float router_noise_std,
+                              CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+                              bool norm_topk_prob,
+                              float routed_scaling_factor,
+                              CAIF_CudaStream &stream,
+                              std::unique_ptr<CAIF_DeviceMoERouter<ComputeT,StorageT>> &out_router,
+                              ExpertVec_t &out_experts,
+                              ExpertVec_t &out_shared)
 {
-  typename CAIF_DeviceMoERouter<ComputeT,StorageT>::Config_t router_cfg;
-  router_cfg.input_dim=input_dim;
-  router_cfg.num_experts=num_experts;
-  router_cfg.top_k=top_k;
-  router_cfg.routing_type=CAIF_DeviceMoERouter<ComputeT,StorageT>::RoutingType_e::TopK;
-  router_cfg.use_bias=router_use_bias;
-  router_cfg.noise_std=router_noise_std;
-  router_cfg.gating_kind=gating_kind;
-  router_cfg.norm_topk_prob=norm_topk_prob;
-  router_cfg.routed_scaling_factor=routed_scaling_factor;
+  CAIF_DeviceMoERouterConfig router_cfg(input_dim,
+                                        num_experts,
+                                        top_k,
+                                        CAIF_DeviceMoERouter<ComputeT,
+                                        StorageT>::RoutingType_e::TopK,
+                                        router_use_bias,
+                                        router_noise_std);
+  router_cfg.SetGatingKind(gating_kind);
+  router_cfg.SetNormTopkProb(norm_topk_prob);
+  router_cfg.SetRoutedScalingFactor(routed_scaling_factor);
 
   out_router=std::make_unique<CAIF_DeviceMoERouter<ComputeT,StorageT>>(router_cfg,stream);
 
-  typename CAIF_DeviceMoEExpert<ComputeT,StorageT>::Config_t expert_cfg;
-  expert_cfg.input_dim=input_dim;
-  expert_cfg.hidden_dim=hidden_dim;
-  expert_cfg.use_gated=expert_use_gated;
-  expert_cfg.use_bias=expert_use_bias;
+  CAIF_DeviceMoEExpertConfig expert_cfg(input_dim,hidden_dim,expert_use_gated,expert_use_bias);
 
   out_experts.clear();
   out_experts.reserve(num_experts);
@@ -86,10 +81,10 @@ void BuildPrimitives(uint32_t input_dim,
   out_shared.clear();
   if(num_shared_experts>0)
   {
-    typename CAIF_DeviceMoEExpert<ComputeT,StorageT>::Config_t shared_cfg=expert_cfg;
+    CAIF_DeviceMoEExpertConfig shared_cfg=expert_cfg;
     if(shared_hidden_dim>0)
     {
-      shared_cfg.hidden_dim=shared_hidden_dim;
+      shared_cfg.SetHiddenDim(shared_hidden_dim);
     }
     out_shared.reserve(num_shared_experts);
     for(uint32_t i=0;i<num_shared_experts;++i)
@@ -99,10 +94,11 @@ void BuildPrimitives(uint32_t input_dim,
   }
 }
 
-void ValidateCore(uint32_t input_dim,
-                  uint32_t hidden_dim,
-                  uint32_t num_experts,
-                  uint32_t top_k)
+template<typename ComputeT,typename StorageT>
+void CAIF_DeviceMoELayer<ComputeT,StorageT>::ValidateCore(uint32_t input_dim,
+                                                          uint32_t hidden_dim,
+                                                          uint32_t num_experts,
+                                                          uint32_t top_k)
 {
   if(input_dim==0)
   {
@@ -157,7 +153,7 @@ CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
   {
     ValidateCore(input_dim,hidden_dim,num_experts,top_k);
 
-    BuildPrimitives<ComputeT,StorageT>(input_dim,
+    BuildPrimitives(input_dim,
                     hidden_dim,
                     num_experts,
                     top_k,
@@ -181,21 +177,22 @@ CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
 }
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
-                                         uint32_t hidden_dim,
-                                         uint32_t top_k,
-                                         bool router_use_bias,
-                                         float router_noise_std,
-                                         float capacity_factor,
-                                         OverflowStrategy_e overflow_strategy,
-                                         float balance_loss_weight,
-                                         float z_loss_weight,
-                                         std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> routed_experts,
-                                         std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> shared_experts,
-                                         CAIF_CudaStream &stream,
-                                         CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
-                                         bool norm_topk_prob,
-                                         float routed_scaling_factor):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
+CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(
+              uint32_t input_dim,
+              uint32_t hidden_dim,
+              uint32_t top_k,
+              bool router_use_bias,
+              float router_noise_std,
+              float capacity_factor,
+              OverflowStrategy_e overflow_strategy,
+              float balance_loss_weight,
+              float z_loss_weight,
+              std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> routed_experts,
+              std::vector<std::unique_ptr<CAIF_DeviceMoEExpertBase<ComputeT,StorageT>>> shared_experts,
+              CAIF_CudaStream &stream,
+              CAIF_DeviceMoELayerFactory::GatingKind_e gating_kind,
+              bool norm_topk_prob,
+              float routed_scaling_factor):CAIF_DeviceLayerTyped<ComputeT,StorageT>(stream),
                                                                   _input_dim(input_dim),
                                                                   _hidden_dim(hidden_dim),
                                                                   _top_k(top_k),
@@ -210,19 +207,19 @@ CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
 {
   try
   {
-    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
+    const uint32_t num_experts=static_cast<uint32_t>(Experts().size());
     ValidateCore(input_dim,hidden_dim,num_experts,top_k);
 
-    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::Config_t router_cfg;
-    router_cfg.input_dim=input_dim;
-    router_cfg.num_experts=num_experts;
-    router_cfg.top_k=top_k;
-    router_cfg.routing_type=CAIF_DeviceMoERouter<ComputeT,StorageT>::RoutingType_e::TopK;
-    router_cfg.use_bias=router_use_bias;
-    router_cfg.noise_std=router_noise_std;
-    router_cfg.gating_kind=gating_kind;
-    router_cfg.norm_topk_prob=norm_topk_prob;
-    router_cfg.routed_scaling_factor=routed_scaling_factor;
+    CAIF_DeviceMoERouterConfig router_cfg(input_dim,
+                                          num_experts,
+                                          top_k,
+                                          CAIF_DeviceMoERouter<ComputeT,
+                                          StorageT>::RoutingType_e::TopK,
+                                          router_use_bias,
+                                          router_noise_std);
+    router_cfg.SetGatingKind(gating_kind);
+    router_cfg.SetNormTopkProb(norm_topk_prob);
+    router_cfg.SetRoutedScalingFactor(routed_scaling_factor);
 
     _router=std::make_unique<CAIF_DeviceMoERouter<ComputeT,StorageT>>(router_cfg,stream);
 
@@ -232,66 +229,71 @@ CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(uint32_t input_dim,
 }
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(CAIF_DeviceMoELayer<ComputeT,StorageT> &&other):CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
-                                                                     _input_dim(other._input_dim),
-                                                                     _hidden_dim(other._hidden_dim),
-                                                                     _top_k(other._top_k),
-                                                                     _capacity_factor(other._capacity_factor),
-                                                                     _overflow_strategy(other._overflow_strategy),
-                                                                     _balance_loss_weight(other._balance_loss_weight),
-                                                                     _z_loss_weight(other._z_loss_weight),
-                                                                     _router(std::move(other._router)),
-                                                                     _experts(std::move(other._experts)),
-                                                                     _shared_experts(std::move(other._shared_experts)),
-                                                                     _cached_routing(std::move(other._cached_routing)),
-                                                                     _cached_token_counts(std::move(other._cached_token_counts)),
-                                                                     _cached_logsumexp(std::move(other._cached_logsumexp)),
-                                                                     _last_balance_loss(other._last_balance_loss),
-                                                                     _last_z_loss(other._last_z_loss),
-                                                                     _overflow_tokens(std::move(other._overflow_tokens)),
-                                                                     _ws_dispatch_map(std::move(other._ws_dispatch_map)),
-                                                                     _ws_expert_offsets(std::move(other._ws_expert_offsets)),
-                                                                     _ws_expert_input_buffer(std::move(other._ws_expert_input_buffer)),
-                                                                     _ws_expert_output_buffer(std::move(other._ws_expert_output_buffer)),
-                                                                     _ws_grad_expert_output_buffer(std::move(other._ws_grad_expert_output_buffer)),
-                                                                     _ws_grad_expert_input_buffer(std::move(other._ws_grad_expert_input_buffer))
+CAIF_DeviceMoELayer<ComputeT,StorageT>::CAIF_DeviceMoELayer(
+                              CAIF_DeviceMoELayer<ComputeT,StorageT> &&other):
+                CAIF_DeviceLayerTyped<ComputeT,StorageT>(std::move(other)),
+                _input_dim(other._input_dim),
+                _hidden_dim(other._hidden_dim),
+                _top_k(other._top_k),
+                _capacity_factor(other._capacity_factor),
+                _overflow_strategy(other._overflow_strategy),
+                _balance_loss_weight(other._balance_loss_weight),
+                _z_loss_weight(other._z_loss_weight),
+                _router(std::move(other._router)),
+                _experts(std::move(other._experts)),
+                _shared_experts(std::move(other._shared_experts)),
+                _cached_routing(std::move(other._cached_routing)),
+                _cached_token_counts(std::move(other._cached_token_counts)),
+                _cached_logsumexp(std::move(other._cached_logsumexp)),
+                _last_balance_loss(other._last_balance_loss),
+                _last_z_loss(other._last_z_loss),
+                _overflow_tokens(std::move(other._overflow_tokens)),
+                _ws_dispatch_map(std::move(other._ws_dispatch_map)),
+                _ws_expert_offsets(std::move(other._ws_expert_offsets)),
+                _ws_expert_input_buffer(std::move(other._ws_expert_input_buffer)),
+                _ws_expert_output_buffer(std::move(other._ws_expert_output_buffer)),
+                _ws_grad_expert_output_buffer(std::move(other._ws_grad_expert_output_buffer)),
+                _ws_grad_expert_input_buffer(std::move(other._ws_grad_expert_input_buffer))
 {
 }
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceMoELayer<ComputeT,StorageT> &CAIF_DeviceMoELayer<ComputeT,StorageT>::operator=(CAIF_DeviceMoELayer<ComputeT,StorageT> &&other)
+CAIF_DeviceMoELayer<ComputeT,StorageT> &
+CAIF_DeviceMoELayer<ComputeT,StorageT>::operator=(CAIF_DeviceMoELayer<ComputeT,StorageT> &&other)
 {
   if(this!=&other)
   {
     CAIF_DeviceLayerTyped<ComputeT,StorageT>::operator=(std::move(other));
-    _input_dim=other._input_dim;
-    _hidden_dim=other._hidden_dim;
-    _top_k=other._top_k;
-    _capacity_factor=other._capacity_factor;
-    _overflow_strategy=other._overflow_strategy;
-    _balance_loss_weight=other._balance_loss_weight;
-    _z_loss_weight=other._z_loss_weight;
+    SetInputDim(other.InputDim());
+    SetHiddenDim(other.HiddenDim());
+    SetTopK(other.TopK());
+    SetCapacityFactor(other.CapacityFactor());
+    SetOverflowStrategy(other.OverflowStrategy());
+    SetBalanceLossWeight(other.BalanceLossWeight());
+    SetZLossWeight(other.ZLossWeight());
     _router=std::move(other._router);
-    _experts=std::move(other._experts);
-    _shared_experts=std::move(other._shared_experts);
-    _cached_routing=std::move(other._cached_routing);
-    _cached_token_counts=std::move(other._cached_token_counts);
-    _cached_logsumexp=std::move(other._cached_logsumexp);
-    _last_balance_loss=other._last_balance_loss;
-    _last_z_loss=other._last_z_loss;
-    _overflow_tokens=std::move(other._overflow_tokens);
-    _ws_dispatch_map=std::move(other._ws_dispatch_map);
-    _ws_expert_offsets=std::move(other._ws_expert_offsets);
-    _ws_expert_input_buffer=std::move(other._ws_expert_input_buffer);
-    _ws_expert_output_buffer=std::move(other._ws_expert_output_buffer);
-    _ws_grad_expert_output_buffer=std::move(other._ws_grad_expert_output_buffer);
-    _ws_grad_expert_input_buffer=std::move(other._ws_grad_expert_input_buffer);
+    Experts()=std::move(other.Experts());
+    SharedExpertsVec()=std::move(other.SharedExpertsVec());
+    SetCachedRouting(std::move(other.CachedRouting()));
+    CachedTokenCounts()=std::move(other.CachedTokenCounts());
+    SetCachedLogsumexp(std::move(other.CachedLogsumexp()));
+    SetLastBalanceLoss(other.LastBalanceLoss());
+    SetLastZLoss(other.LastZLoss());
+    OverflowTokens()=std::move(other.OverflowTokens());
+    SetWsDispatchMap(std::move(other.WsDispatchMap()));
+    SetWsExpertOffsets(std::move(other.WsExpertOffsets()));
+    SetWsExpertInputBuffer(std::move(other.WsExpertInputBuffer()));
+    SetWsExpertOutputBuffer(std::move(other.WsExpertOutputBuffer()));
+    SetWsGradExpertOutputBuffer(std::move(other.WsGradExpertOutputBuffer()));
+    SetWsGradExpertInputBuffer(std::move(other.WsGradExpertInputBuffer()));
   }
   return *this;
 }
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,CAIF_RunContext &ctx)
+CAIF_DeviceTensor
+CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor &input,
+                                                    CAIF_RunContext &ctx)
 {
   try
   {
@@ -318,7 +320,7 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
       THROW_CAIFE("MoELayer::Forward: expected input shape [N, dim] or [batch, seq, dim]");
     }
 
-    if(flat_dim!=_input_dim)
+    if(flat_dim!=InputDim())
     {
       THROW_CAIFE("MoELayer::Forward: input dimension mismatch");
     }
@@ -353,7 +355,7 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     // ---- Route once. Always route once per forward; cache for backward
     //      only in training mode. Dispatch, combine, and aux-loss grads all
     //      read from this single RouterOutput_t.
-    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t routing=_router->Route(flat_input,ctx);
+    typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t routing=Router().Route(flat_input,ctx);
     const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &r=routing;
 
 #ifdef USE_CAIF_CUDA
@@ -376,45 +378,66 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     //
     //   MoEBuildDispatchMap still does one small host sync to read back the
     //   expert_indices (N*K int32 — tiny compared to the N*dim tensor data
-    //   we used to round-trip). Only Drop overflow is supported on the GPU
-    //   fast path; NoOp/Redistribute aren't benched or covered by MoE
-    //   parity so we fail loudly if requested.
-    if(_overflow_strategy!=OverflowStrategy_e::Drop)
+    //   we used to round-trip). Drop and NoDrop are the only strategies the
+    //   GPU fast path implements; NoOp/Redistribute aren't benched or covered
+    //   by MoE parity so we fail loudly if requested.
+    if(OverflowStrategy()!=OverflowStrategy_e::Drop&&
+       OverflowStrategy()!=OverflowStrategy_e::NoDrop)
     {
-      THROW_CAIFE("MoELayer::Forward: only Drop overflow supported on GPU dispatch path");
+      THROW_CAIFE("MoELayer::Forward: only Drop and NoDrop overflow strategies are "
+                  "supported on the GPU dispatch path");
     }
 
-    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
-    const uint32_t capacity=static_cast<uint32_t>(
-      std::ceil(static_cast<float>(num_tokens)/num_experts*_capacity_factor*_top_k));
+    const uint32_t num_experts=static_cast<uint32_t>(Experts().size());
 
-    if(_ws_dispatch_map.TotalElements()!=static_cast<size_t>(num_tokens)*_top_k)
+    // Per-expert capacity for the dispatch map.
+    //
+    // capacity == 0 is MoEBuildDispatchMap's "unlimited" sentinel: it performs
+    // no clamp when capacity_per_expert == 0, so every token-to-expert
+    // assignment is kept (exact HF parity, no dropping). NoDrop and a
+    // non-positive capacity_factor both select this path. Guarding on
+    // CapacityFactor() > 0 also keeps a negative factor well-defined — a bare
+    // static_cast<uint32_t> of a negative ceil result is undefined — instead of
+    // relying on ceil(0) == 0 to reach the unlimited path.
+    //
+    // Otherwise capacity = ceil(num_tokens / num_experts * capacity_factor *
+    // top_k): the GShard/Switch finite-capacity formula. At capacity_factor == 1
+    // this equals the mean per-expert load, so any above-mean expert drops its
+    // overflow (see OverflowStrategy_e::Drop).
+    uint32_t capacity=0u;
+    if(OverflowStrategy()==OverflowStrategy_e::Drop&&CapacityFactor()>0.0f)
     {
-      _ws_dispatch_map=CAIF_DeviceTensor::Uninitialized({num_tokens,_top_k},
-                                                        Stream(),
-                                                        CAIF_DataType::CAIF_DataType_e::Int32);
+      capacity=static_cast<uint32_t>(
+        std::ceil(static_cast<float>(num_tokens)/num_experts*CapacityFactor()*TopK()));
     }
-    if(_ws_expert_offsets.TotalElements()!=num_experts+1)
+
+    if(WsDispatchMap().TotalElements()!=static_cast<size_t>(num_tokens)*TopK())
     {
-      _ws_expert_offsets=CAIF_DeviceTensor::Uninitialized({num_experts+1},
-                                                          Stream(),
-                                                          CAIF_DataType::CAIF_DataType_e::Int32);
+      SetWsDispatchMap(CAIF_DeviceTensor::Uninitialized({num_tokens,TopK()},
+                                                         Stream(),
+                                                         CAIF_DataType::CAIF_DataType_e::Int32));
+    }
+    if(WsExpertOffsets().TotalElements()!=num_experts+1)
+    {
+      SetWsExpertOffsets(CAIF_DeviceTensor::Uninitialized({num_experts+1},
+                                                           Stream(),
+                                                           CAIF_DataType::CAIF_DataType_e::Int32));
     }
 
     const uint32_t total_assigned=CAIF_Ops::MoEBuildDispatchMap(r.expert_indices,
                                                                       num_experts,
-                                                                      _top_k,
+                                                                      TopK(),
                                                                       capacity,
-                                                                      _ws_dispatch_map,
-                                                                      _ws_expert_offsets);
+                                                                      WsDispatchMap(),
+                                                                      WsExpertOffsets());
 
     std::vector<int32_t> offsets_host(num_experts+1);
-    _ws_expert_offsets.CopyToHostRaw(offsets_host.data());
+    WsExpertOffsets().CopyToHostRaw(offsets_host.data());
 
-    _cached_token_counts.assign(num_experts,0u);
+    CachedTokenCounts().assign(num_experts,0u);
     for(uint32_t e=0;e<num_experts;++e)
     {
-      _cached_token_counts[e]=static_cast<uint32_t>(offsets_host[e+1]-offsets_host[e]);
+      CachedTokenCounts()[e]=static_cast<uint32_t>(offsets_host[e+1]-offsets_host[e]);
     }
 
 #ifdef USE_CAIF_CUDA
@@ -428,25 +451,25 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     const size_t elem_bytes=CAIF_DataType(sd).ElementSizeBytes();
 
     const uint32_t buf_rows=std::max<uint32_t>(total_assigned,1u);
-    if(_ws_expert_input_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
-       ||_ws_expert_input_buffer.Dtype()!=sd)
+    if(WsExpertInputBuffer().TotalElements()!=static_cast<size_t>(buf_rows)*InputDim()
+       ||WsExpertInputBuffer().Dtype()!=sd)
     {
-      _ws_expert_input_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+      SetWsExpertInputBuffer(CAIF_DeviceTensor::Uninitialized({buf_rows,InputDim()},Stream(),sd));
     }
-    if(_ws_expert_output_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
-       ||_ws_expert_output_buffer.Dtype()!=sd)
+    if(WsExpertOutputBuffer().TotalElements()!=static_cast<size_t>(buf_rows)*InputDim()
+       ||WsExpertOutputBuffer().Dtype()!=sd)
     {
-      _ws_expert_output_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+      SetWsExpertOutputBuffer(CAIF_DeviceTensor::Uninitialized({buf_rows,InputDim()},Stream(),sd));
     }
 
     if(total_assigned>0)
     {
       CAIF_Ops::MoEDispatchGPU(flat_input,
                                      r.expert_indices,
-                                     _ws_dispatch_map,
-                                     _ws_expert_offsets,
-                                     _top_k,
-                                     _ws_expert_input_buffer);
+                                     WsDispatchMap(),
+                                     WsExpertOffsets(),
+                                     TopK(),
+                                     WsExpertInputBuffer());
     }
 
 #ifdef USE_CAIF_CUDA
@@ -457,11 +480,11 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
 #endif
 
     // Per-expert forward: write each expert's output directly into its
-    // pre-assigned slice of the packed `_ws_expert_output_buffer`,
-    // mirroring the same offset layout as `_ws_expert_input_buffer`.
+    // pre-assigned slice of the packed `WsExpertOutputBuffer()`,
+    // mirroring the same offset layout as `WsExpertInputBuffer()`.
     //
     // Why the in-place write matters:
-    //   The pre-ForwardInto code did `out=_experts[i]->Forward(in_view)`
+    //   The pre-ForwardInto code did `out=Experts()[i]->Forward(in_view)`
     //   (allocating a per-expert owning tensor) and then a separate
     //   `cudaMemcpyAsync(out_ptr_bytes, out.DeviceDataRaw(), ...)` to
     //   copy that tensor into the workspace slice. Per-expert that's
@@ -482,13 +505,13 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     //
     // Why the views are safe:
     //   - `in_view` and `out_view` reference distinct byte ranges in
-    //     two different workspace tensors (_ws_expert_input_buffer vs
-    //     _ws_expert_output_buffer), so the expert's forward never
+    //     two different workspace tensors (WsExpertInputBuffer() vs
+    //     WsExpertOutputBuffer()), so the expert's forward never
     //     reads and writes the same bytes through different aliases.
     //   - The workspaces are member tensors of the layer; they live
     //     until the layer is destroyed, so the views are valid for the
     //     entire forward + backward window. Backward (BackwardImpl)
-    //     reads `_ws_expert_output_buffer` directly via offsets, so the
+    //     reads `WsExpertOutputBuffer()` directly via offsets, so the
     //     `expert_outputs` vector below is purely a forward-local
     //     bookkeeping list, not a backward dependency.
     //   - `Stream()` is the layer's stream, which is also the stream
@@ -510,26 +533,26 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
 
     for(uint32_t i=0;i<num_experts;++i)
     {
-      const uint32_t cnt=_cached_token_counts[i];
+      const uint32_t cnt=CachedTokenCounts()[i];
       if(cnt==0)
       {
         expert_outputs.push_back(CAIF_DeviceTensor());
         continue;
       }
       const uint32_t off=static_cast<uint32_t>(offsets_host[i]);
-      uint8_t *in_ptr_bytes=static_cast<uint8_t*>(_ws_expert_input_buffer.DeviceDataRaw())
-                            +static_cast<size_t>(off)*_input_dim*elem_bytes;
-      uint8_t *out_ptr_bytes=static_cast<uint8_t*>(_ws_expert_output_buffer.DeviceDataRaw())
-                             +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      uint8_t *in_ptr_bytes=static_cast<uint8_t*>(WsExpertInputBuffer().DeviceDataRaw())
+                            +static_cast<size_t>(off)*InputDim()*elem_bytes;
+      uint8_t *out_ptr_bytes=static_cast<uint8_t*>(WsExpertOutputBuffer().DeviceDataRaw())
+                             +static_cast<size_t>(off)*InputDim()*elem_bytes;
       CAIF_DeviceTensor in_view=CAIF_DeviceTensor::WrapView(in_ptr_bytes,
-                                                            {cnt,_input_dim},
+                                                            {cnt,InputDim()},
                                                             Stream(),
-                                                            _ws_expert_input_buffer.Dtype());
+                                                            WsExpertInputBuffer().Dtype());
       CAIF_DeviceTensor out_view=CAIF_DeviceTensor::WrapView(out_ptr_bytes,
-                                                             {cnt,_input_dim},
+                                                             {cnt,InputDim()},
                                                              Stream(),
-                                                             _ws_expert_output_buffer.Dtype());
-      _experts[i]->ForwardInto(in_view,out_view,ctx);
+                                                             WsExpertOutputBuffer().Dtype());
+      Experts()[i]->ForwardInto(in_view,out_view,ctx);
       expert_outputs.push_back(std::move(out_view));
     }
 
@@ -540,15 +563,15 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     }
 #endif
 
-    CAIF_DeviceTensor combined=CAIF_DeviceTensor::Zeros({num_tokens,_input_dim},Stream(),sd);
+    CAIF_DeviceTensor combined=CAIF_DeviceTensor::Zeros({num_tokens,InputDim()},Stream(),sd);
     if(total_assigned>0)
     {
-      CAIF_Ops::MoECombineGPU(_ws_expert_output_buffer,
+      CAIF_Ops::MoECombineGPU(WsExpertOutputBuffer(),
                                     r.expert_indices,
                                     r.expert_weights,
-                                    _ws_dispatch_map,
-                                    _ws_expert_offsets,
-                                    _top_k,
+                                    WsDispatchMap(),
+                                    WsExpertOffsets(),
+                                    TopK(),
                                     combined);
     }
 
@@ -589,37 +612,37 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
 
     // ---- Shared experts: run on full flat_input, add to combined
     std::vector<CAIF_DeviceTensor> shared_outputs;
-    if(_shared_experts.size()>0)
+    if(SharedExpertsVec().size()>0)
     {
-      shared_outputs.reserve(_shared_experts.size());
-      for(size_t i=0;i<_shared_experts.size();++i)
+      shared_outputs.reserve(SharedExpertsVec().size());
+      for(size_t i=0;i<SharedExpertsVec().size();++i)
       {
-        CAIF_DeviceTensor s=_shared_experts[i]->Forward(flat_input,ctx);
+        CAIF_DeviceTensor s=SharedExpertsVec()[i]->Forward(flat_input,ctx);
         CAIF_Ops::Add(combined,s,combined);
         shared_outputs.push_back(std::move(s));
       }
     }
 
     // ---- Aux losses (training only)
-    _last_balance_loss=0.0f;
-    _last_z_loss=0.0f;
-    _cached_logsumexp=CAIF_DeviceTensor();
+    SetLastBalanceLoss(0.0f);
+    SetLastZLoss(0.0f);
+    SetCachedLogsumexp(CAIF_DeviceTensor());
 
     if(ctx.Training()==true)
     {
-      if(_balance_loss_weight>0.0f)
+      if(BalanceLossWeight()>0.0f)
       {
-        _last_balance_loss=ComputeBalanceLoss(r.router_probs);
+        SetLastBalanceLoss(ComputeBalanceLoss(r.router_probs));
       }
-      if(_z_loss_weight>0.0f)
+      if(ZLossWeight()>0.0f)
       {
-        _last_z_loss=ComputeZLoss(r.router_logits);
+        SetLastZLoss(ComputeZLoss(r.router_logits));
       }
     }
 
     // ---- Commit caches for backward
-    // BackwardImpl reads `_ws_expert_output_buffer` directly (the packed
-    // workspace ForwardInto wrote into above) plus `_cached_routing`
+    // BackwardImpl reads `WsExpertOutputBuffer()` directly (the packed
+    // workspace ForwardInto wrote into above) plus `CachedRouting()`
     // and `_cached_token_counts`. The `expert_outputs` vector is a
     // forward-local list of non-owning views and is intentionally NOT
     // cached — caching the views would just duplicate pointers into the
@@ -628,13 +651,13 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
     // fields, which is correct now that forward is done with them).
     if(ctx.Training()==true)
     {
-      _cached_routing=std::move(routing);
+      SetCachedRouting(std::move(routing));
     }
     (void)expert_outputs;
 
     if(in_shape.size()==3)
     {
-      combined.Reshape({batch_size,seq_len,_input_dim});
+      combined.Reshape({batch_size,seq_len,InputDim()});
     }
     return combined;
   }
@@ -642,7 +665,9 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::ForwardImpl(const CAIF
 }
 
 template<typename ComputeT,typename StorageT>
-CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,CAIF_RunContext &ctx)
+CAIF_DeviceTensor
+CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor &grad_output,
+                                                     CAIF_RunContext &ctx)
 {
   try
   {
@@ -671,13 +696,13 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAI
       Stream(),
       grad_output.Dtype());
 
-    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
-    const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &r=_cached_routing;
+    const uint32_t num_experts=static_cast<uint32_t>(Experts().size());
+    const typename CAIF_DeviceMoERouter<ComputeT,StorageT>::RouterOutput_t &r=CachedRouting();
 
     // ---- GPU combine/dispatch backward using workspace buffers
     //
-    //   Forward left _ws_expert_output_buffer populated with per-expert outputs
-    //   concatenated by expert_offsets, and _ws_dispatch_map / _ws_expert_offsets
+    //   Forward left WsExpertOutputBuffer() populated with per-expert outputs
+    //   concatenated by expert_offsets, and WsDispatchMap() / WsExpertOffsets()
     //   describing the token-to-slot mapping. MoECombineBackwardGPU scatters
     //   grad_output into the grad_expert_output buffer and computes grad_weights
     //   in one kernel pair, fully on device. After per-expert Backward fills the
@@ -687,34 +712,34 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAI
     uint32_t total_assigned=0;
     for(uint32_t e=0;e<num_experts;++e)
     {
-      total_assigned+=_cached_token_counts[e];
+      total_assigned+=CachedTokenCounts()[e];
     }
     const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
     const size_t elem_bytes=CAIF_DataType(sd).ElementSizeBytes();
     const uint32_t buf_rows=std::max<uint32_t>(total_assigned,1u);
-    if(_ws_grad_expert_output_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
-       ||_ws_grad_expert_output_buffer.Dtype()!=sd)
+    if(WsGradExpertOutputBuffer().TotalElements()!=static_cast<size_t>(buf_rows)*InputDim()
+       ||WsGradExpertOutputBuffer().Dtype()!=sd)
     {
-      _ws_grad_expert_output_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+      SetWsGradExpertOutputBuffer(CAIF_DeviceTensor::Uninitialized({buf_rows,InputDim()},Stream(),sd));
     }
-    if(_ws_grad_expert_input_buffer.TotalElements()!=static_cast<size_t>(buf_rows)*_input_dim
-       ||_ws_grad_expert_input_buffer.Dtype()!=sd)
+    if(WsGradExpertInputBuffer().TotalElements()!=static_cast<size_t>(buf_rows)*InputDim()
+       ||WsGradExpertInputBuffer().Dtype()!=sd)
     {
-      _ws_grad_expert_input_buffer=CAIF_DeviceTensor::Uninitialized({buf_rows,_input_dim},Stream(),sd);
+      SetWsGradExpertInputBuffer(CAIF_DeviceTensor::Uninitialized({buf_rows,InputDim()},Stream(),sd));
     }
 
-    CAIF_DeviceTensor grad_weights=CAIF_DeviceTensor::Zeros({num_tokens,_top_k},Stream(),sd);
+    CAIF_DeviceTensor grad_weights=CAIF_DeviceTensor::Zeros({num_tokens,TopK()},Stream(),sd);
 
     if(total_assigned>0)
     {
       CAIF_Ops::MoECombineBackwardGPU(flat_grad,
-                                            _ws_expert_output_buffer,
+                                            WsExpertOutputBuffer(),
                                             r.expert_indices,
                                             r.expert_weights,
-                                            _ws_dispatch_map,
-                                            _ws_expert_offsets,
-                                            _top_k,
-                                            _ws_grad_expert_output_buffer,
+                                            WsDispatchMap(),
+                                            WsExpertOffsets(),
+                                            TopK(),
+                                            WsGradExpertOutputBuffer(),
                                             grad_weights);
     }
 
@@ -723,44 +748,44 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAI
     std::vector<int32_t> offsets_host(num_experts+1,0);
     for(uint32_t e=0;e<num_experts;++e)
     {
-      offsets_host[e+1]=offsets_host[e]+static_cast<int32_t>(_cached_token_counts[e]);
+      offsets_host[e+1]=offsets_host[e]+static_cast<int32_t>(CachedTokenCounts()[e]);
     }
 
     for(uint32_t i=0;i<num_experts;++i)
     {
-      const uint32_t cnt=_cached_token_counts[i];
+      const uint32_t cnt=CachedTokenCounts()[i];
       if(cnt==0)
       {
         continue;
       }
       const uint32_t off=static_cast<uint32_t>(offsets_host[i]);
-      uint8_t *g_out_ptr_bytes=static_cast<uint8_t*>(_ws_grad_expert_output_buffer.DeviceDataRaw())
-                               +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      uint8_t *g_out_ptr_bytes=static_cast<uint8_t*>(WsGradExpertOutputBuffer().DeviceDataRaw())
+                               +static_cast<size_t>(off)*InputDim()*elem_bytes;
       CAIF_DeviceTensor g_out_view=CAIF_DeviceTensor::WrapView(g_out_ptr_bytes,
-                                                                {cnt,_input_dim},
+                                                                {cnt,InputDim()},
                                                                 Stream(),
-                                                                _ws_grad_expert_output_buffer.Dtype());
-      CAIF_DeviceTensor g_in=_experts[i]->Backward(g_out_view,ctx);
+                                                                WsGradExpertOutputBuffer().Dtype());
+      CAIF_DeviceTensor g_in=Experts()[i]->Backward(g_out_view,ctx);
 #ifdef USE_CAIF_CUDA
-      uint8_t *g_in_ptr_bytes=static_cast<uint8_t*>(_ws_grad_expert_input_buffer.DeviceDataRaw())
-                              +static_cast<size_t>(off)*_input_dim*elem_bytes;
+      uint8_t *g_in_ptr_bytes=static_cast<uint8_t*>(WsGradExpertInputBuffer().DeviceDataRaw())
+                              +static_cast<size_t>(off)*InputDim()*elem_bytes;
       cudaMemcpyAsync(g_in_ptr_bytes,
                       g_in.DeviceDataRaw(),
-                      static_cast<size_t>(cnt)*_input_dim*elem_bytes,
+                      static_cast<size_t>(cnt)*InputDim()*elem_bytes,
                       cudaMemcpyDeviceToDevice,
                       Stream().Handle());
 #endif
     }
 
     // ---- Dispatch backward -> grad_input_from_experts
-    CAIF_DeviceTensor grad_input_from_experts=CAIF_DeviceTensor::Zeros({num_tokens,_input_dim},Stream(),sd);
+    CAIF_DeviceTensor grad_input_from_experts=CAIF_DeviceTensor::Zeros({num_tokens,InputDim()},Stream(),sd);
     if(total_assigned>0)
     {
-      CAIF_Ops::MoEDispatchBackwardGPU(_ws_grad_expert_input_buffer,
+      CAIF_Ops::MoEDispatchBackwardGPU(WsGradExpertInputBuffer(),
                                              r.expert_indices,
-                                             _ws_dispatch_map,
-                                             _ws_expert_offsets,
-                                             _top_k,
+                                             WsDispatchMap(),
+                                             WsExpertOffsets(),
+                                             TopK(),
                                              grad_input_from_experts);
     }
 
@@ -776,16 +801,16 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAI
     CAIF_DeviceTensor balance_bias;
     CAIF_DeviceTensor z_logsumexp_scaled;
 
-    if(_balance_loss_weight>0.0f)
+    if(BalanceLossWeight()>0.0f)
     {
       const float denom=static_cast<float>(num_tokens)*
                          static_cast<float>(num_tokens)*
-                         static_cast<float>(_top_k);
-      const float scale=_balance_loss_weight*static_cast<float>(num_experts)/denom;
+                         static_cast<float>(TopK());
+      const float scale=BalanceLossWeight()*static_cast<float>(num_experts)/denom;
       std::vector<float> balance_bias_host(num_experts);
       for(uint32_t e=0;e<num_experts;++e)
       {
-        balance_bias_host[e]=scale*static_cast<float>(_cached_token_counts[e]);
+        balance_bias_host[e]=scale*static_cast<float>(CachedTokenCounts()[e]);
       }
       // Allocate the destination tensor at StorageT directly and upload
       // host-side fp32 with conversion at the boundary — no device-side
@@ -794,25 +819,25 @@ CAIF_DeviceTensor CAIF_DeviceMoELayer<ComputeT,StorageT>::BackwardImpl(const CAI
       balance_bias.CopyFromHostFp32(balance_bias_host.data(),balance_bias_host.size());
     }
 
-    if(_z_loss_weight>0.0f&&_cached_logsumexp.Shape().size()>0)
+    if(ZLossWeight()>0.0f&&CachedLogsumexp().Shape().size()>0)
     {
-      const float scale=2.0f*_z_loss_weight/static_cast<float>(num_tokens);
+      const float scale=2.0f*ZLossWeight()/static_cast<float>(num_tokens);
       z_logsumexp_scaled=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
-      CAIF_Ops::Scale(_cached_logsumexp,scale,z_logsumexp_scaled);
+      CAIF_Ops::Scale(CachedLogsumexp(),scale,z_logsumexp_scaled);
     }
 
-    CAIF_DeviceTensor grad_input_from_router=_router->BackwardRoutingAuxAware(grad_weights,
+    CAIF_DeviceTensor grad_input_from_router=Router().BackwardRoutingAuxAware(grad_weights,
                                                                                balance_bias,
                                                                                z_logsumexp_scaled,
                                                                                ctx);
 
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,_input_dim},Stream(),sd);
+    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,InputDim()},Stream(),sd);
     CAIF_Ops::Add(grad_input_from_experts,grad_input_from_router,grad_input);
 
     // ---- Shared experts backward: they saw flat_grad as their grad_output.
-    for(size_t i=0;i<_shared_experts.size();++i)
+    for(size_t i=0;i<SharedExpertsVec().size();++i)
     {
-      CAIF_DeviceTensor gs=_shared_experts[i]->Backward(flat_grad,ctx);
+      CAIF_DeviceTensor gs=SharedExpertsVec()[i]->Backward(flat_grad,ctx);
       CAIF_Ops::Add(grad_input,gs,grad_input);
     }
 
@@ -831,13 +856,13 @@ float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeBalanceLoss(const CAIF_Devi
   try
   {
     const uint32_t num_tokens=router_probs.Shape()[0];
-    const uint32_t num_experts=static_cast<uint32_t>(_experts.size());
-    const float total_assignments=static_cast<float>(num_tokens)*static_cast<float>(_top_k);
+    const uint32_t num_experts=static_cast<uint32_t>(Experts().size());
+    const float total_assignments=static_cast<float>(num_tokens)*static_cast<float>(TopK());
 
     std::vector<float> fractions(num_experts,0.0f);
     for(uint32_t i=0;i<num_experts;++i)
     {
-      fractions[i]=static_cast<float>(_cached_token_counts[i])/total_assignments;
+      fractions[i]=static_cast<float>(CachedTokenCounts()[i])/total_assignments;
     }
 
     const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
@@ -861,7 +886,7 @@ float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeBalanceLoss(const CAIF_Devi
       const float mean_p=sum_probs_host[i]/static_cast<float>(num_tokens);
       loss+=fractions[i]*mean_p;
     }
-    return _balance_loss_weight*static_cast<float>(num_experts)*loss;
+    return BalanceLossWeight()*static_cast<float>(num_experts)*loss;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -874,11 +899,11 @@ float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeZLoss(const CAIF_DeviceTens
     const uint32_t num_tokens=router_logits.Shape()[0];
     const CAIF_DataType::CAIF_DataType_e sd=StorageDtype();
 
-    _cached_logsumexp=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
-    CAIF_Ops::LogSumExp(router_logits,_cached_logsumexp);
+    SetCachedLogsumexp(CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd));
+    CAIF_Ops::LogSumExp(router_logits,CachedLogsumexp());
 
     CAIF_DeviceTensor logsumexp_sq=CAIF_DeviceTensor::Uninitialized({num_tokens},Stream(),sd);
-    CAIF_Ops::Multiply(_cached_logsumexp,_cached_logsumexp,logsumexp_sq);
+    CAIF_Ops::Multiply(CachedLogsumexp(),CachedLogsumexp(),logsumexp_sq);
 
     // Sum is an atomicAdd accumulator — must start from zero, not
     // uninitialized memory. Uninitialized garbage was getting added
@@ -898,7 +923,7 @@ float CAIF_DeviceMoELayer<ComputeT,StorageT>::ComputeZLoss(const CAIF_DeviceTens
       total_fp32.CopyToHost(&total_host);
     }
 
-    return _z_loss_weight*total_host/static_cast<float>(num_tokens);
+    return ZLossWeight()*total_host/static_cast<float>(num_tokens);
   }
   CAIF_CATCH_BLOCK()
 }
@@ -908,12 +933,12 @@ void CAIF_DeviceMoELayer<ComputeT,StorageT>::ZeroGradients()
 {
   try
   {
-    _router->ZeroGradients();
-    for(auto &e:_experts)
+    Router().ZeroGradients();
+    for(auto &e:Experts())
     {
       e->ZeroGradients();
     }
-    for(auto &s:_shared_experts)
+    for(auto &s:SharedExpertsVec())
     {
       s->ZeroGradients();
     }
@@ -924,12 +949,12 @@ void CAIF_DeviceMoELayer<ComputeT,StorageT>::ZeroGradients()
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensorCount()const
 {
-  size_t count=_router->ParameterTensorCount();
-  for(const auto &e:_experts)
+  size_t count=Router().ParameterTensorCount();
+  for(const auto &e:Experts())
   {
     count+=e->ParameterTensorCount();
   }
-  for(const auto &s:_shared_experts)
+  for(const auto &s:SharedExpertsVec())
   {
     count+=s->ParameterTensorCount();
   }
@@ -939,14 +964,14 @@ size_t CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensorCount()const
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensor(size_t index)
 {
-  size_t router_count=_router->ParameterTensorCount();
+  size_t router_count=Router().ParameterTensorCount();
   if(index<router_count)
   {
-    return _router->ParameterTensor(index);
+    return Router().ParameterTensor(index);
   }
   index-=router_count;
 
-  for(auto &e:_experts)
+  for(auto &e:Experts())
   {
     size_t n=e->ParameterTensorCount();
     if(index<n)
@@ -955,7 +980,7 @@ CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensor(size_
     }
     index-=n;
   }
-  for(auto &s:_shared_experts)
+  for(auto &s:SharedExpertsVec())
   {
     size_t n=s->ParameterTensorCount();
     if(index<n)
@@ -976,14 +1001,14 @@ const CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterTensor
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::GradientTensor(size_t index)
 {
-  size_t router_count=_router->ParameterTensorCount();
+  size_t router_count=Router().ParameterTensorCount();
   if(index<router_count)
   {
-    return _router->GradientTensor(index);
+    return Router().GradientTensor(index);
   }
   index-=router_count;
 
-  for(auto &e:_experts)
+  for(auto &e:Experts())
   {
     size_t n=e->ParameterTensorCount();
     if(index<n)
@@ -992,7 +1017,7 @@ CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::GradientTensor(size_t
     }
     index-=n;
   }
-  for(auto &s:_shared_experts)
+  for(auto &s:SharedExpertsVec())
   {
     size_t n=s->ParameterTensorCount();
     if(index<n)
@@ -1013,12 +1038,12 @@ const CAIF_DeviceTensor &CAIF_DeviceMoELayer<ComputeT,StorageT>::GradientTensor(
 template<typename ComputeT,typename StorageT>
 size_t CAIF_DeviceMoELayer<ComputeT,StorageT>::TotalParameterCount()const
 {
-  size_t count=_router->TotalParameterCount();
-  for(const auto &e:_experts)
+  size_t count=Router().TotalParameterCount();
+  for(const auto &e:Experts())
   {
     count+=e->TotalParameterCount();
   }
-  for(const auto &s:_shared_experts)
+  for(const auto &s:SharedExpertsVec())
   {
     count+=s->TotalParameterCount();
   }
@@ -1029,14 +1054,14 @@ template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceMoELayer<ComputeT,StorageT>::Description()const
 {
   std::string desc="MoELayer[";
-  desc+=std::to_string(_input_dim)+"->"+std::to_string(_hidden_dim);
-  desc+=",experts="+std::to_string(_experts.size());
-  if(_shared_experts.size()>0)
+  desc+=std::to_string(InputDim())+"->"+std::to_string(HiddenDim());
+  desc+=",experts="+std::to_string(Experts().size());
+  if(SharedExpertsVec().size()>0)
   {
-    desc+=",shared="+std::to_string(_shared_experts.size());
+    desc+=",shared="+std::to_string(SharedExpertsVec().size());
   }
-  desc+=",top_k="+std::to_string(_top_k);
-  desc+=",cap="+std::to_string(_capacity_factor);
+  desc+=",top_k="+std::to_string(TopK());
+  desc+=",cap="+std::to_string(CapacityFactor());
   desc+="]";
   return desc;
 }
@@ -1046,20 +1071,24 @@ std::vector<std::string> CAIF_DeviceMoELayer<ComputeT,StorageT>::ParameterNames(
 {
   std::vector<std::string> names;
 
-  std::vector<std::string> router_names=_router->ParameterNames(prefix+"router.");
+  const CAIF_RoleRegistry &reg=CAIF_RoleRegistry::Instance();
+  std::vector<std::string> router_names=Router().ParameterNames(
+                          prefix+reg.Name(CAIF_ParamRole::Role_e::PathMoERouter_e));
   names.insert(names.end(),router_names.begin(),router_names.end());
 
-  for(size_t i=0;i<_experts.size();++i)
+  for(size_t i=0;i<Experts().size();++i)
   {
-    std::string expert_prefix=prefix+"expert_"+std::to_string(i)+".";
-    std::vector<std::string> en=_experts[i]->ParameterNames(expert_prefix);
+    std::string expert_prefix=prefix+reg.Name(CAIF_ParamRole::Role_e::PathMoEExpert_e)+std::to_string(i)+".";
+    std::vector<std::string> en=Experts()[i]->ParameterNames(expert_prefix);
     names.insert(names.end(),en.begin(),en.end());
   }
 
-  for(size_t i=0;i<_shared_experts.size();++i)
+  for(size_t i=0;i<SharedExpertsVec().size();++i)
   {
-    std::string shared_prefix=prefix+"shared_expert_"+std::to_string(i)+".";
-    std::vector<std::string> sn=_shared_experts[i]->ParameterNames(shared_prefix);
+    std::string shared_prefix=prefix+
+                              reg.Name(CAIF_ParamRole::Role_e::PathMoESharedExpert_e)+
+                              std::to_string(i)+".";
+    std::vector<std::string> sn=SharedExpertsVec()[i]->ParameterNames(shared_prefix);
     names.insert(names.end(),sn.begin(),sn.end());
   }
   return names;

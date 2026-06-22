@@ -17,8 +17,10 @@
 // SafeTensors format implementation
 //------------------------------------------------------------------------------
 #include "caif_safetensors_format.h"
+#include "caif_safetensors_json_parser.h"
 #include "caif_constants.h"
 #include "caif_exception.h"
+#include "caif_serialization_constants.h"
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -27,6 +29,62 @@
 
 namespace instance
 {
+
+//------------------------------------------------------------------------------
+// Static const dtype ↔ SafeTensors-name map. Initialised at file scope so it
+// is available before any caller runs. Strings come from g_serial_dtype_*
+// (caif_serialization_constants.h) — the single source of truth for the
+// SafeTensors dtype vocabulary.
+//------------------------------------------------------------------------------
+
+const std::map<CAIF_DataType::CAIF_DataType_e,std::string>
+CAIF_SafeTensorsFormat::_dtype_to_safetensors_name=
+{
+  {CAIF_DataType::CAIF_DataType_e::Float32,g_serial_dtype_f32},
+  {CAIF_DataType::CAIF_DataType_e::Float64,g_serial_dtype_f64},
+  {CAIF_DataType::CAIF_DataType_e::Float16,g_serial_dtype_f16},
+  {CAIF_DataType::CAIF_DataType_e::BFloat16,g_serial_dtype_bf16},
+  {CAIF_DataType::CAIF_DataType_e::Int4,g_serial_dtype_i4},
+  {CAIF_DataType::CAIF_DataType_e::Int8,g_serial_dtype_i8},
+  {CAIF_DataType::CAIF_DataType_e::Int16,g_serial_dtype_i16},
+  {CAIF_DataType::CAIF_DataType_e::Int32,g_serial_dtype_i32},
+  {CAIF_DataType::CAIF_DataType_e::Int64,g_serial_dtype_i64},
+  {CAIF_DataType::CAIF_DataType_e::UInt8,g_serial_dtype_u8},
+  {CAIF_DataType::CAIF_DataType_e::UInt16,g_serial_dtype_u16},
+  {CAIF_DataType::CAIF_DataType_e::UInt32,g_serial_dtype_u32},
+  {CAIF_DataType::CAIF_DataType_e::UInt64,g_serial_dtype_u64},
+  {CAIF_DataType::CAIF_DataType_e::Bool,g_serial_dtype_bool}
+};
+
+const std::string &CAIF_SafeTensorsFormat::DtypeToSafeTensorsName(const CAIF_DataType::CAIF_DataType_e dt)
+{
+  try
+  {
+    const auto it=DtypeToSafeTensorsNameMap().find(dt);
+    if(it==DtypeToSafeTensorsNameMap().end())
+    {
+      THROW_CAIFE("CAIF_SafeTensorsFormat::DtypeToSafeTensorsName: unsupported dtype");
+    }
+    return it->second;
+  }
+  CAIF_CATCH_BLOCK();
+}
+
+CAIF_DataType::CAIF_DataType_e CAIF_SafeTensorsFormat::DtypeFromSafeTensorsName(const std::string &name)
+{
+  try
+  {
+    for(const auto &kv:DtypeToSafeTensorsNameMap())
+    {
+      if(kv.second==name)
+      {
+        return kv.first;
+      }
+    }
+    THROW_CAIFE("CAIF_SafeTensorsFormat::DtypeFromSafeTensorsName: unrecognised name");
+  }
+  CAIF_CATCH_BLOCK();
+}
 
 //------------------------------------------------------------------------------
 // Utility functions
@@ -100,8 +158,9 @@ std::string CAIF_SafeTensorsFormat::BuildJsonHeader(
       continue;
     }
 
-    // Align offset to 8 bytes
-    current_offset=AlignTo8(current_offset);
+    // safetensors spec requires tensors packed contiguously - the
+    // reference Rust validator rejects any file where tensor[i].start
+    // != tensor[i-1].end with "invalid offset for tensor ...".
     uint64_t start_offset=current_offset;
     uint64_t tensor_bytes=static_cast<uint64_t>(tensor->SizeBytes());
     uint64_t end_offset=start_offset+tensor_bytes;
@@ -116,9 +175,17 @@ std::string CAIF_SafeTensorsFormat::BuildJsonHeader(
     first_entry=false;
 
     // Write tensor entry with native dtype
-    json<<"\""<<EscapeJsonString(name)<<"\":{";
-    json<<"\"dtype\":\""<<tensor->DtypeInfo().SafeTensorsName()<<"\",";
-    json<<"\"shape\":[";
+    json<<"\""
+        <<EscapeJsonString(name)
+        <<"\":{";
+    json<<"\""
+        <<g_serial_key_dtype
+        <<"\":\""
+        <<DtypeToSafeTensorsName(tensor->DtypeInfo().Value())
+        <<"\",";
+    json<<"\""
+        <<g_serial_key_shape
+        <<"\":[";
 
     const auto &shape=tensor->Shape();
     for(size_t i=0;i<shape.size();++i)
@@ -130,7 +197,13 @@ std::string CAIF_SafeTensorsFormat::BuildJsonHeader(
       json<<shape[i];
     }
     json<<"],";
-    json<<"\"data_offsets\":["<<start_offset<<","<<end_offset<<"]}";
+    json<<"\""
+        <<g_serial_key_data_offsets
+        <<"\":["
+        <<start_offset
+        <<","
+        <<end_offset
+        <<"]}";
 
     current_offset=end_offset;
   }
@@ -142,7 +215,9 @@ std::string CAIF_SafeTensorsFormat::BuildJsonHeader(
     {
       json<<",";
     }
-    json<<"\"__metadata__\":{";
+    json<<"\""
+        <<g_serial_key_metadata_outer
+        <<"\":{";
 
     bool first_meta=true;
     for(const auto &kv:metadata)
@@ -165,443 +240,6 @@ std::string CAIF_SafeTensorsFormat::BuildJsonHeader(
 //------------------------------------------------------------------------------
 // JSON Parsing
 //------------------------------------------------------------------------------
-
-// Simple JSON parser for SafeTensors header
-class SafeTensorsJsonParser
-{
-  public:
-    explicit SafeTensorsJsonParser(const std::string &json):_json(json),_pos(0){}
-
-    std::map<std::string,CAIF_SafeTensorsFormat::SafeTensorInfo_t> ParseTensors()
-    {
-      std::map<std::string,CAIF_SafeTensorsFormat::SafeTensorInfo_t> result;
-      SkipWhitespace();
-      Expect('{');
-
-      while(Peek()!='}')
-      {
-        SkipWhitespace();
-        std::string key=ParseString();
-        SkipWhitespace();
-        Expect(':');
-        SkipWhitespace();
-
-        if(key=="__metadata__")
-        {
-          // Skip metadata object for tensor parsing
-          SkipObject();
-        }
-        else
-        {
-          CAIF_SafeTensorsFormat::SafeTensorInfo_t info=ParseTensorInfo();
-          result[key]=info;
-        }
-
-        SkipWhitespace();
-        if(Peek()==',')
-        {
-          Advance();
-        }
-      }
-
-      Expect('}');
-      return result;
-    }
-
-    std::map<std::string,std::string> ParseMetadata()
-    {
-      std::map<std::string,std::string> result;
-      SkipWhitespace();
-      Expect('{');
-
-      while(Peek()!='}')
-      {
-        SkipWhitespace();
-        std::string key=ParseString();
-        SkipWhitespace();
-        Expect(':');
-        SkipWhitespace();
-
-        if(key=="__metadata__")
-        {
-          // Parse metadata object
-          Expect('{');
-          while(Peek()!='}')
-          {
-            SkipWhitespace();
-            std::string meta_key=ParseString();
-            SkipWhitespace();
-            Expect(':');
-            SkipWhitespace();
-            std::string meta_value=ParseString();
-            result[meta_key]=meta_value;
-            SkipWhitespace();
-            if(Peek()==',')
-            {
-              Advance();
-            }
-          }
-          Expect('}');
-        }
-        else
-        {
-          // Skip tensor info
-          SkipObject();
-        }
-
-        SkipWhitespace();
-        if(Peek()==',')
-        {
-          Advance();
-        }
-      }
-
-      Expect('}');
-      return result;
-    }
-
-    /**
-     * @brief Parse a shard index file's weight_map.
-     * Format: {"metadata":{...},"weight_map":{"tensor_name":"shard_file",...}}
-     */
-    std::map<std::string,std::string> ParseWeightMap()
-    {
-      std::map<std::string,std::string> result;
-      SkipWhitespace();
-      Expect('{');
-
-      while(Peek()!='}')
-      {
-        SkipWhitespace();
-        std::string key=ParseString();
-        SkipWhitespace();
-        Expect(':');
-        SkipWhitespace();
-
-        if(key=="weight_map")
-        {
-          Expect('{');
-          while(Peek()!='}')
-          {
-            SkipWhitespace();
-            std::string tensor_name=ParseString();
-            SkipWhitespace();
-            Expect(':');
-            SkipWhitespace();
-            std::string shard_file=ParseString();
-            result[tensor_name]=shard_file;
-            SkipWhitespace();
-            if(Peek()==',')
-            {
-              Advance();
-            }
-          }
-          Expect('}');
-        }
-        else
-        {
-          SkipValue();
-        }
-
-        SkipWhitespace();
-        if(Peek()==',')
-        {
-          Advance();
-        }
-      }
-
-      Expect('}');
-      return result;
-    }
-
-  private:
-    const std::string &_json;
-    size_t _pos;
-
-    char Peek()const
-    {
-      if(_pos>=_json.size())
-      {
-        return '\0';
-      }
-      return _json[_pos];
-    }
-
-    void Advance()
-    {
-      if(_pos<_json.size())
-      {
-        ++_pos;
-      }
-    }
-
-    void Expect(char c)
-    {
-      SkipWhitespace();
-      if(Peek()!=c)
-      {
-        std::string msg="SafeTensors JSON parse error: expected '";
-        msg+=c;
-        msg+="' at position ";
-        msg+=std::to_string(_pos);
-        THROW_CAIFE(msg.c_str());
-      }
-      Advance();
-    }
-
-    void SkipWhitespace()
-    {
-      while(_pos<_json.size())
-      {
-        char c=_json[_pos];
-        if(c==' '||c=='\n'||c=='\r'||c=='\t')
-        {
-          ++_pos;
-        }
-        else
-        {
-          break;
-        }
-      }
-    }
-
-    std::string ParseString()
-    {
-      Expect('"');
-      std::string result;
-      while(Peek()!='"'&&Peek()!='\0')
-      {
-        if(Peek()=='\\')
-        {
-          Advance();
-          char escaped=Peek();
-          if(escaped=='n')
-          {
-            result+='\n';
-          }
-          else if(escaped=='r')
-          {
-            result+='\r';
-          }
-          else if(escaped=='t')
-          {
-            result+='\t';
-          }
-          else if(escaped=='u')
-          {
-            // Skip unicode escape
-            Advance();
-            Advance();
-            Advance();
-            Advance();
-          }
-          else
-          {
-            result+=escaped;
-          }
-          Advance();
-        }
-        else
-        {
-          result+=Peek();
-          Advance();
-        }
-      }
-      Expect('"');
-      return result;
-    }
-
-    int64_t ParseNumber()
-    {
-      SkipWhitespace();
-      bool negative=false;
-      if(Peek()=='-')
-      {
-        negative=true;
-        Advance();
-      }
-      int64_t value=0;
-      while(std::isdigit(Peek()))
-      {
-        value=value*10+(Peek()-'0');
-        Advance();
-      }
-      if(negative==true)
-      {
-        value=-value;
-      }
-      return value;
-    }
-
-    std::vector<uint32_t> ParseShapeArray()
-    {
-      std::vector<uint32_t> result;
-      Expect('[');
-      SkipWhitespace();
-      while(Peek()!=']')
-      {
-        int64_t val=ParseNumber();
-        result.push_back(static_cast<uint32_t>(val));
-        SkipWhitespace();
-        if(Peek()==',')
-        {
-          Advance();
-        }
-        SkipWhitespace();
-      }
-      Expect(']');
-      return result;
-    }
-
-    std::pair<uint64_t,uint64_t> ParseDataOffsets()
-    {
-      Expect('[');
-      SkipWhitespace();
-      uint64_t start=static_cast<uint64_t>(ParseNumber());
-      SkipWhitespace();
-      Expect(',');
-      SkipWhitespace();
-      uint64_t end=static_cast<uint64_t>(ParseNumber());
-      SkipWhitespace();
-      Expect(']');
-      return {start,end};
-    }
-
-    CAIF_SafeTensorsFormat::SafeTensorInfo_t ParseTensorInfo()
-    {
-      CAIF_SafeTensorsFormat::SafeTensorInfo_t info;
-      Expect('{');
-
-      while(Peek()!='}')
-      {
-        SkipWhitespace();
-        std::string key=ParseString();
-        SkipWhitespace();
-        Expect(':');
-        SkipWhitespace();
-
-        if(key=="dtype")
-        {
-          info.dtype=ParseString();
-        }
-        else if(key=="shape")
-        {
-          info.shape=ParseShapeArray();
-        }
-        else if(key=="data_offsets")
-        {
-          auto offsets=ParseDataOffsets();
-          info.data_offset_start=offsets.first;
-          info.data_offset_end=offsets.second;
-        }
-        else
-        {
-          // Skip unknown field
-          SkipValue();
-        }
-
-        SkipWhitespace();
-        if(Peek()==',')
-        {
-          Advance();
-        }
-      }
-
-      Expect('}');
-      return info;
-    }
-
-    void SkipObject()
-    {
-      Expect('{');
-      int depth=1;
-      while(depth>0&&_pos<_json.size())
-      {
-        if(Peek()=='{')
-        {
-          ++depth;
-        }
-        else if(Peek()=='}')
-        {
-          --depth;
-        }
-        else if(Peek()=='"')
-        {
-          // Skip string
-          Advance();
-          while(Peek()!='"'&&Peek()!='\0')
-          {
-            if(Peek()=='\\')
-            {
-              Advance();
-            }
-            Advance();
-          }
-        }
-        Advance();
-      }
-    }
-
-    void SkipValue()
-    {
-      char c=Peek();
-      if(c=='"')
-      {
-        ParseString();
-      }
-      else if(c=='[')
-      {
-        SkipArray();
-      }
-      else if(c=='{')
-      {
-        SkipObject();
-      }
-      else
-      {
-        // Number or literal
-        while(_pos<_json.size())
-        {
-          char ch=Peek();
-          if(ch==','||ch=='}'||ch==']')
-          {
-            break;
-          }
-          Advance();
-        }
-      }
-    }
-
-    void SkipArray()
-    {
-      Expect('[');
-      int depth=1;
-      while(depth>0&&_pos<_json.size())
-      {
-        if(Peek()=='[')
-        {
-          ++depth;
-        }
-        else if(Peek()==']')
-        {
-          --depth;
-        }
-        else if(Peek()=='"')
-        {
-          Advance();
-          while(Peek()!='"'&&Peek()!='\0')
-          {
-            if(Peek()=='\\')
-            {
-              Advance();
-            }
-            Advance();
-          }
-        }
-        Advance();
-      }
-    }
-};
 
 std::map<std::string,CAIF_SafeTensorsFormat::SafeTensorInfo_t>
 CAIF_SafeTensorsFormat::ParseTensorInfos(const std::string &json)
@@ -670,7 +308,7 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadSingleTensor(const std::string &pa
                                                          CAIF_CudaStream &stream)
 {
   // Determine dtype
-  CAIF_DataType::CAIF_DataType_e dtype=CAIF_DataType::FromSafeTensorsName(info.dtype);
+  CAIF_DataType::CAIF_DataType_e dtype=DtypeFromSafeTensorsName(info.dtype);
   CAIF_DataType dtype_obj(dtype);
 
   // Calculate expected byte count
@@ -681,6 +319,10 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadSingleTensor(const std::string &pa
   }
 
   size_t expected_bytes=dtype_obj.StorageSizeBytes(num_elements);
+  if(info.data_offset_start>info.data_offset_end)
+  {
+    THROW_CAIFE("SafeTensors: data_offset_start exceeds data_offset_end");
+  }
   uint64_t actual_bytes=info.data_offset_end-info.data_offset_start;
 
   if(actual_bytes!=static_cast<uint64_t>(expected_bytes))
@@ -695,10 +337,26 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadSingleTensor(const std::string &pa
     THROW_CAIFE(("SafeTensors: cannot open file: "+path).c_str());
   }
 
+  in.seekg(0,std::ios::end);
+  const std::streamoff file_end=in.tellg();
+  if(file_end<0)
+  {
+    THROW_CAIFE("SafeTensors: cannot determine file size");
+  }
+  const uint64_t file_size=static_cast<uint64_t>(file_end);
+  if(data_start>file_size || info.data_offset_end>file_size-data_start)
+  {
+    THROW_CAIFE("SafeTensors: tensor data extends past end of file");
+  }
+
   in.seekg(static_cast<std::streamoff>(data_start+info.data_offset_start));
 
   std::vector<char> host_data(expected_bytes);
   in.read(host_data.data(),static_cast<std::streamsize>(expected_bytes));
+  if(in.gcount()!=static_cast<std::streamsize>(expected_bytes))
+  {
+    THROW_CAIFE("SafeTensors: short read loading tensor data");
+  }
   in.close();
 
   // Create device tensor with native dtype and upload raw bytes
@@ -775,10 +433,8 @@ void CAIF_SafeTensorsFormat::Save(const std::string &path,
     // Write JSON header
     out.write(json_header.data(),static_cast<std::streamsize>(json_header.size()));
 
-    // Write tensor data
-    size_t offset_idx=0;
-    std::vector<char> padding_buffer(8,0);
-
+    // Write tensor data contiguously - BuildJsonHeader assigns
+    // offsets back-to-back per the safetensors spec.
     for(const auto &pair:tensors)
     {
       const CAIF_DeviceTensor *tensor=pair.second;
@@ -787,23 +443,11 @@ void CAIF_SafeTensorsFormat::Save(const std::string &path,
         continue;
       }
 
-      // Align to 8 bytes if needed
-      uint64_t current_pos=static_cast<uint64_t>(out.tellp())-8-header_size;
-      uint64_t expected_pos=data_offsets[offset_idx*2];
-      if(current_pos<expected_pos)
-      {
-        uint64_t padding_needed=expected_pos-current_pos;
-        out.write(padding_buffer.data(),static_cast<std::streamsize>(padding_needed));
-      }
-
-      // Copy tensor raw bytes to host and write (dtype-aware)
       size_t byte_count=tensor->SizeBytes();
       std::vector<char> host_data(byte_count);
       tensor->CopyToHostRaw(host_data.data());
 
       out.write(host_data.data(),static_cast<std::streamsize>(byte_count));
-
-      ++offset_idx;
     }
 
     out.close();
@@ -892,7 +536,7 @@ CAIF_SafeTensorsFormat::LoadSharded(const std::string &directory,CAIF_CudaStream
     std::map<std::string,CAIF_DeviceTensor> result;
 
     // Parse the index file to get tensor->shard mapping
-    std::string index_path=directory+"/model.safetensors.index.json";
+    std::string index_path=directory+g_serial_index_relative;
     std::map<std::string,std::string> weight_map=ParseShardIndex(index_path);
 
     if(weight_map.empty()==true)
@@ -913,7 +557,7 @@ CAIF_SafeTensorsFormat::LoadSharded(const std::string &directory,CAIF_CudaStream
       const std::string &shard_name=shard_kv.first;
       const std::vector<std::string> &tensor_names=shard_kv.second;
 
-      std::string shard_path=directory+"/"+shard_name;
+      std::string shard_path=directory+g_serial_dir_separator+shard_name;
 
       // Read shard header once
       uint64_t data_start=0;
@@ -959,7 +603,7 @@ CAIF_SafeTensorsFormat::OpenShardedHandle(const std::string &directory)const
     ShardedHandle_t handle;
     handle.SetDirectory(directory);
 
-    const std::string index_path=directory+"/model.safetensors.index.json";
+    const std::string index_path=directory+g_serial_index_relative;
     ShardedHandle_t::WeightMap_t wm;
     {
       std::ifstream index_test(index_path);
@@ -980,7 +624,7 @@ CAIF_SafeTensorsFormat::OpenShardedHandle(const std::string &directory)const
         // header, synthesize a weight map mapping every tensor name to
         // the single shard. Matches the fallback already implemented
         // for the eager LoadTensorByName path.
-        const std::string single_path=directory+"/model.safetensors";
+        const std::string single_path=directory+g_serial_single_shard_relative;
         std::ifstream single_test(single_path);
         if(single_test.is_open()==false)
         {
@@ -992,7 +636,7 @@ CAIF_SafeTensorsFormat::OpenShardedHandle(const std::string &directory)const
         const auto infos=ParseTensorInfos(hdr_json);
         for(const auto &kv:infos)
         {
-          wm.emplace(kv.first,"model.safetensors");
+          wm.emplace(kv.first,g_serial_single_shard_name);
         }
         if(wm.empty()==true)
         {
@@ -1012,7 +656,7 @@ CAIF_SafeTensorsFormat::OpenShardedHandle(const std::string &directory)const
     {
       const std::string &shard_name=shard_kv.first;
       ShardedHandle_t::PerShard_t per;
-      per.SetPath(directory+"/"+shard_name);
+      per.SetPath(directory+g_serial_dir_separator+shard_name);
       uint64_t data_start=0;
       const std::string json_header=ReadHeader(per.Path(),data_start);
       per.SetDataStart(data_start);
@@ -1073,7 +717,7 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadTensorByName(const std::string &di
   try
   {
     // Try sharded model first (model.safetensors.index.json)
-    std::string index_path=directory+"/model.safetensors.index.json";
+    std::string index_path=directory+g_serial_index_relative;
     std::string shard_path;
 
     std::ifstream index_test(index_path);
@@ -1096,7 +740,7 @@ CAIF_DeviceTensor CAIF_SafeTensorsFormat::LoadTensorByName(const std::string &di
     else
     {
       // Fall back to single-file model
-      shard_path=directory+"/model.safetensors";
+      shard_path=directory+g_serial_single_shard_relative;
       std::ifstream single_test(shard_path);
       if(single_test.is_open()==false)
       {

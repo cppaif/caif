@@ -13,17 +13,19 @@
 // limitations under the License.
 
 #include "caif_device_frozen_linear.h"
+#include "caif_serialization_constants.h"
 #include "caif_ops.h"
 #include "caif_device_context.h"
 #include "caif_exception.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_quant.cuh"
+#include "caif_role_registry.h"
 #ifdef USE_CAIF_CUDA
 #include "cublas_v2.h"
 #include "cuda_runtime_api.h"
 #include "library_types.h"
 #endif
 
-// Per-site dispatch convention (TYPE_DISPATCH_FULL_PLAN Phase 8.5.A):
+// Per-site dispatch convention:
 //   - `_weight.DeviceDataRaw()` and `_scales.DeviceDataRaw()` reads are
 //     legitimate non-fp32 reinterprets — `_weight` is INT4-packed bytes
 //     (UInt8 storage) or INT8 (Int8 storage) and `_scales` carries fp16
@@ -79,18 +81,18 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::CAIF_DeviceFrozenLinear(
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceFrozenLinear<ComputeT,StorageT>::CAIF_DeviceFrozenLinear(
   CAIF_DeviceFrozenLinear &&other):Base_t(std::move(other)),
-                                   _input_dim(other._input_dim),
-                                   _output_dim(other._output_dim),
-                                   _int8_scheme(other._int8_scheme),
-                                   _group_size(other._group_size),
-                                   _weight(std::move(other._weight)),
-                                   _scales(std::move(other._scales)),
-                                   _cache_fp32(other._cache_fp32),
-                                   _cached_compute_weight(std::move(other._cached_compute_weight)),
-                                   _cached_input(std::move(other._cached_input)),
-                                   _offload_policy(other._offload_policy),
-                                   _host_weight(std::move(other._host_weight)),
-                                   _is_prefetched(other._is_prefetched)
+                                   _input_dim(other.InputDim()),
+                                   _output_dim(other.OutputDim()),
+                                   _int8_scheme(other.Int8Scheme()),
+                                   _group_size(other.GroupSize()),
+                                   _weight(std::move(other.WeightMutable())),
+                                   _scales(std::move(other.ScalesMutable())),
+                                   _cache_fp32(other.CacheFP32()),
+                                   _cached_compute_weight(std::move(other.CachedComputeWeightMutable())),
+                                   _cached_input(std::move(other.CachedInputMutable())),
+                                   _offload_policy(other.OffloadPolicy()),
+                                   _host_weight(other.ReleaseHostWeight()),
+                                   _is_prefetched(other.IsPrefetched())
 {
 }
 
@@ -103,18 +105,18 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::operator=(CAIF_DeviceFrozenLinear &&
     if(this!=&other)
     {
       Base_t::operator=(std::move(other));
-      _input_dim=other._input_dim;
-      _output_dim=other._output_dim;
-      _int8_scheme=other._int8_scheme;
-      _group_size=other._group_size;
-      _weight=std::move(other._weight);
-      _scales=std::move(other._scales);
-      _cache_fp32=other._cache_fp32;
-      _cached_compute_weight=std::move(other._cached_compute_weight);
-      _cached_input=std::move(other._cached_input);
-      _offload_policy=other._offload_policy;
-      _host_weight=std::move(other._host_weight);
-      _is_prefetched=other._is_prefetched;
+      SetInputDim(other.InputDim());
+      SetOutputDim(other.OutputDim());
+      SetInt8Scheme(other.Int8Scheme());
+      SetGroupSize(other.GroupSize());
+      SetWeight(std::move(other.WeightMutable()));
+      SetScales(std::move(other.ScalesMutable()));
+      SetCacheFP32(other.CacheFP32());
+      SetCachedComputeWeight(std::move(other.CachedComputeWeightMutable()));
+      SetCachedInput(std::move(other.CachedInputMutable()));
+      SetOffloadPolicyMember(other.OffloadPolicy());
+      SetHostWeight(other.ReleaseHostWeight());
+      SetPrefetched(other.IsPrefetched());
     }
     return *this;
   }
@@ -151,7 +153,7 @@ void CAIF_DeviceFrozenLinear<ComputeT,StorageT>::SetOffloadPolicy(
     }
     if(p==CAIF_OffloadPolicy::CAIF_OffloadPolicy_e::HostPinned_e)
     {
-      _offload_policy=p;
+      SetOffloadPolicyMember(p);
       if(HasWeight()==true)
       {
         MigrateWeightToHost();
@@ -165,9 +167,9 @@ void CAIF_DeviceFrozenLinear<ComputeT,StorageT>::SetOffloadPolicy(
         SetWeight(HostWeight().PrefetchToDevice(Stream()));
         Stream().Synchronize();
       }
-      _host_weight.reset();
+      ClearHostWeight();
       SetPrefetched(true);
-      _offload_policy=p;
+      SetOffloadPolicyMember(p);
       return;
     }
     THROW_CAIFE("FrozenLinear::SetOffloadPolicy: unsupported policy");
@@ -185,7 +187,7 @@ void CAIF_DeviceFrozenLinear<ComputeT,StorageT>::MigrateWeightToHost()
       SetPrefetched(false);
       return;
     }
-    _host_weight.reset(new CAIF_HostPinnedTensor(Weight().Shape(),Weight().Dtype()));
+    SetHostWeight(std::make_unique<CAIF_HostPinnedTensor>(Weight().Shape(),Weight().Dtype()));
     HostWeight().CopyFromDevice(Weight());
     ClearWeight();
     ClearFP32Cache();
@@ -238,30 +240,30 @@ void CAIF_DeviceFrozenLinear<ComputeT,StorageT>::LoadScalesFromHost(const void *
     constexpr CAIF_DataType::CAIF_DataType_e sd=Base_t::StorageDtype();
     if(sd==CAIF_DataType::CAIF_DataType_e::Int4)
     {
-      const size_t total_elements=static_cast<size_t>(_input_dim)*_output_dim;
+      const size_t total_elements=static_cast<size_t>(InputDim())*OutputDim();
       const uint32_t num_groups=
-        static_cast<uint32_t>((total_elements+_group_size-1)/_group_size);
-      _scales=CAIF_DeviceTensor::Zeros({num_groups},
+        static_cast<uint32_t>((total_elements+GroupSize()-1)/GroupSize());
+      SetScales(CAIF_DeviceTensor::Zeros({num_groups},
                                        Stream(),
-                                       CAIF_DataType::CAIF_DataType_e::Float16);
-      _scales.CopyFromHostRaw(data,num_bytes);
+                                       CAIF_DataType::CAIF_DataType_e::Float16));
+      ScalesMutable().CopyFromHostRaw(data,num_bytes);
       return;
     }
     if(sd==CAIF_DataType::CAIF_DataType_e::Int8)
     {
-      if(_int8_scheme==CAIF_Ops::QuantScheme_e::PerTensor_e)
+      if(Int8Scheme()==CAIF_Ops::QuantScheme_e::PerTensor_e)
       {
-        _scales=CAIF_DeviceTensor::Zeros({1u},
+        SetScales(CAIF_DeviceTensor::Zeros({1u},
                                          Stream(),
-                                         CAIF_DataType::CAIF_DataType_e::Float32);
+                                         CAIF_DataType::CAIF_DataType_e::Float32));
       }
       else
       {
-        _scales=CAIF_DeviceTensor::Zeros({_output_dim},
+        SetScales(CAIF_DeviceTensor::Zeros({OutputDim()},
                                          Stream(),
-                                         CAIF_DataType::CAIF_DataType_e::Float32);
+                                         CAIF_DataType::CAIF_DataType_e::Float32));
       }
-      _scales.CopyFromHostRaw(data,num_bytes);
+      ScalesMutable().CopyFromHostRaw(data,num_bytes);
       return;
     }
     THROW_CAIFE("FrozenLinear::LoadScalesFromHost: storage dtype does not use scales");
@@ -288,7 +290,7 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ConvertToComputeDt
 {
   try
   {
-    if(_weight.IsEmpty()==true)
+    if(Weight().IsEmpty()==true)
     {
       THROW_CAIFE("FrozenLinear: weight not loaded");
     }
@@ -299,31 +301,31 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ConvertToComputeDt
     if(sd==target)
     {
       // Same-dtype path: no conversion needed and no copy. Return a
-      // non-owning view of `_weight` reshaped to [output_dim, input_dim]
+      // non-owning view of `Weight()` reshaped to [output_dim, input_dim]
       // (the shape `MatMulTransposeB` expects). Cloning here was a real
       // ~17 MB-per-expert GPU allocation per Forward call; for a
       // 27-layer DSv2-Lite with 64 frozen experts × 3 sublayers per
       // MoE block that's ~3 GB of redundant GPU per layer per step,
       // and the offload-prefetch path can't keep up with the wasted
-      // headroom. WrapView shares `_weight`'s pointer; the view stays
+      // headroom. WrapView shares `Weight()`'s pointer; the view stays
       // valid for the duration of the Forward call (the caller doesn't
-      // mutate _weight during forward).
-      CAIF_DeviceTensor view=CAIF_DeviceTensor::WrapView(const_cast<void*>(_weight.DeviceDataRaw()),
-                                                          {_output_dim,_input_dim},
+      // mutate Weight() during forward).
+      CAIF_DeviceTensor view=CAIF_DeviceTensor::WrapView(const_cast<void*>(Weight().DeviceDataRaw()),
+                                                          {OutputDim(),InputDim()},
                                                           Stream(),
-                                                          _weight.Dtype());
+                                                          Weight().Dtype());
       return view;
     }
     if(sd==CAIF_DataType::CAIF_DataType_e::Int4)
     {
 #ifdef USE_CAIF_CUDA
-      const size_t total_elements=static_cast<size_t>(_input_dim)*_output_dim;
-      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({_output_dim,_input_dim},Stream());
-      launch_dequantize_int4(_weight.DeviceDataRaw(),
-                             _scales.DeviceDataRaw(),
+      const size_t total_elements=static_cast<size_t>(InputDim())*OutputDim();
+      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({OutputDim(),InputDim()},Stream());
+      launch_dequantize_int4(Weight().DeviceDataRaw(),
+                             Scales().DeviceDataRaw(),
                              fp32.template DevicePtr<float>(),
-                             static_cast<int>(total_elements),
-                             static_cast<int>(_group_size),
+                             static_cast<int64_t>(total_elements),
+                             static_cast<int>(GroupSize()),
                              Stream().Handle());
       if(target==CAIF_DataType::CAIF_DataType_e::Float32)
       {
@@ -336,26 +338,26 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ConvertToComputeDt
     }
 
     if(sd==CAIF_DataType::CAIF_DataType_e::Int8
-       &&_scales.IsEmpty()==false)
+       &&Scales().IsEmpty()==false)
     {
 #ifdef USE_CAIF_CUDA
-      const size_t total_elements=static_cast<size_t>(_input_dim)*_output_dim;
-      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({_output_dim,_input_dim},Stream());
-      if(_int8_scheme==CAIF_Ops::QuantScheme_e::PerTensor_e)
+      const size_t total_elements=static_cast<size_t>(InputDim())*OutputDim();
+      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({OutputDim(),InputDim()},Stream());
+      if(Int8Scheme()==CAIF_Ops::QuantScheme_e::PerTensor_e)
       {
-        launch_dequantize_int8_per_tensor(_weight.DeviceDataRaw(),
+        launch_dequantize_int8_per_tensor(Weight().DeviceDataRaw(),
                                           fp32.template DevicePtr<float>(),
-                                          _scales.DeviceDataRaw(),
-                                          static_cast<int>(total_elements),
+                                          Scales().DeviceDataRaw(),
+                                          static_cast<int64_t>(total_elements),
                                           Stream().Handle());
       }
       else
       {
-        launch_dequantize_int8_per_channel(_weight.DeviceDataRaw(),
+        launch_dequantize_int8_per_channel(Weight().DeviceDataRaw(),
                                            fp32.template DevicePtr<float>(),
-                                           _scales.DeviceDataRaw(),
-                                           static_cast<int>(_input_dim),
-                                           static_cast<int>(_output_dim),
+                                           Scales().DeviceDataRaw(),
+                                           static_cast<int>(InputDim()),
+                                           static_cast<int>(OutputDim()),
                                            Stream().Handle());
       }
       if(target==CAIF_DataType::CAIF_DataType_e::Float32)
@@ -368,8 +370,8 @@ CAIF_DeviceTensor CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ConvertToComputeDt
 #endif
     }
 
-    CAIF_DeviceTensor result=_weight.To(target);
-    result.Reshape({_output_dim,_input_dim});
+    CAIF_DeviceTensor result=Weight().To(target);
+    result.Reshape({OutputDim(),InputDim()});
     return result;
   }
   CAIF_CATCH_BLOCK()
@@ -392,7 +394,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
       THROW_CAIFE("FrozenLinear::ForwardImpl: HostPinned policy but layer is not prefetched."
                   " The block-level scheduler must call Prefetch(stream) before forward.");
     }
-    if(_weight.IsEmpty()==true)
+    if(Weight().IsEmpty()==true)
     {
       THROW_CAIFE("FrozenLinear: weight not loaded");
     }
@@ -402,7 +404,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
     {
       THROW_CAIFE("FrozenLinear::Forward: input must be at least 2D");
     }
-    if(shape.back()!=_input_dim)
+    if(shape.back()!=InputDim())
     {
       THROW_CAIFE("FrozenLinear::Forward: last dim must match input_dim");
     }
@@ -430,14 +432,14 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
       n*=shape[i];
     }
     CAIF_DeviceTensor input_2d=input.Clone();
-    input_2d.Reshape({n,_input_dim});
+    input_2d.Reshape({n,InputDim()});
 
     if(ctx.Training()==true)
     {
-      _cached_input=input_2d.Clone();
+      SetCachedInput(input_2d.Clone());
     }
 
-    CAIF_DeviceTensor output_2d=CAIF_DeviceTensor::Uninitialized({n,_output_dim},Stream());
+    CAIF_DeviceTensor output_2d=CAIF_DeviceTensor::Uninitialized({n,OutputDim()},Stream());
 
     constexpr CAIF_DataType::CAIF_DataType_e cd=Base_t::ComputeDtype();
     if(cd==CAIF_DataType::CAIF_DataType_e::Float32)
@@ -467,8 +469,8 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
       device_ctx.SetCublasStream(Stream().Handle());
 
       const int m=static_cast<int>(n);
-      const int nn=static_cast<int>(_output_dim);
-      const int k=static_cast<int>(_input_dim);
+      const int nn=static_cast<int>(OutputDim());
+      const int k=static_cast<int>(InputDim());
 
       cudaDataType input_cuda_type=CUDA_R_16BF;
       if(cd==CAIF_DataType::CAIF_DataType_e::Float16)
@@ -513,7 +515,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::ForwardImpl(const CAIF_DeviceTensor 
     if(shape.size()>2)
     {
       std::vector<uint32_t> out_shape(shape.begin(),shape.end()-1);
-      out_shape.push_back(_output_dim);
+      out_shape.push_back(OutputDim());
       output_2d.Reshape(out_shape);
     }
     return output_2d;
@@ -538,7 +540,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
       THROW_CAIFE("FrozenLinear::BackwardImpl: HostPinned policy but layer is not prefetched."
                   " The block-level scheduler must call Prefetch(stream) before backward.");
     }
-    if(_cached_input.IsEmpty()==true)
+    if(CachedInput().IsEmpty()==true)
     {
       THROW_CAIFE("FrozenLinear::Backward: must call Forward with training=true first");
     }
@@ -547,8 +549,8 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
     if(CacheFP32()==true)
     {
       // Lazy (re)populate. With offload, eviction during forward
-      // clears both the GPU `_weight` and the cached compute view;
-      // backward's OnEnterBackwardStage re-prefetches `_weight` but
+      // clears both the GPU `Weight()` and the cached compute view;
+      // backward's OnEnterBackwardStage re-prefetches `Weight()` but
       // doesn't re-fill the compute cache, so we rebuild it here on
       // demand. For the sd==target cell ConvertToComputeDtype returns
       // a non-owning WrapView, so the rebuild costs nothing on GPU.
@@ -573,9 +575,9 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
       n*=shape[i];
     }
     CAIF_DeviceTensor grad_2d=grad_output.Clone();
-    grad_2d.Reshape({n,_output_dim});
+    grad_2d.Reshape({n,OutputDim()});
 
-    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({n,_input_dim},Stream());
+    CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({n,InputDim()},Stream());
 
     constexpr CAIF_DataType::CAIF_DataType_e cd=Base_t::ComputeDtype();
     if(cd==CAIF_DataType::CAIF_DataType_e::Float32)
@@ -603,8 +605,8 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
       device_ctx.SetCublasStream(Stream().Handle());
 
       const int m=static_cast<int>(n);
-      const int nn=static_cast<int>(_input_dim);
-      const int k=static_cast<int>(_output_dim);
+      const int nn=static_cast<int>(InputDim());
+      const int k=static_cast<int>(OutputDim());
 
       cudaDataType input_cuda_type=CUDA_R_16BF;
       if(cd==CAIF_DataType::CAIF_DataType_e::Float16)
@@ -649,7 +651,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::BackwardImpl(const CAIF_DeviceTensor
     if(shape.size()>2)
     {
       std::vector<uint32_t> in_shape(shape.begin(),shape.end()-1);
-      in_shape.push_back(_input_dim);
+      in_shape.push_back(InputDim());
       grad_input.Reshape(in_shape);
     }
     return grad_input;
@@ -728,10 +730,10 @@ std::string CAIF_DeviceFrozenLinear<ComputeT,StorageT>::Description()const
   try
   {
     CAIF_DataType dt(Base_t::StorageDtype());
-    return std::string(g_caif_description_frozen_linear)+
-           "("+std::to_string(_input_dim)+
-           ","+std::to_string(_output_dim)+
-           ","+dt.Name()+")";
+    return std::string(g_serial_tag_frozen_linear)+
+           g_serial_open_paren+std::to_string(InputDim())+
+           g_serial_comma+std::to_string(OutputDim())+
+           g_serial_comma+dt.Name()+g_serial_close_paren;
   }
   CAIF_CATCH_BLOCK()
 }
@@ -764,7 +766,7 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::FrozenTensorFP32(size_t index)const
     {
       THROW_CAIFE("FrozenLinear: frozen tensor index out of range");
     }
-    if(_weight.IsEmpty()==true)
+    if(Weight().IsEmpty()==true)
     {
       THROW_CAIFE("FrozenLinear: weight not loaded");
     }
@@ -773,13 +775,13 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::FrozenTensorFP32(size_t index)const
     if(sd==CAIF_DataType::CAIF_DataType_e::Int4)
     {
 #ifdef USE_CAIF_CUDA
-      const size_t total_elements=static_cast<size_t>(_input_dim)*_output_dim;
-      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({_output_dim,_input_dim},Stream());
-      launch_dequantize_int4(_weight.DeviceDataRaw(),
-                             _scales.DeviceDataRaw(),
+      const size_t total_elements=static_cast<size_t>(InputDim())*OutputDim();
+      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({OutputDim(),InputDim()},Stream());
+      launch_dequantize_int4(Weight().DeviceDataRaw(),
+                             Scales().DeviceDataRaw(),
                              fp32.template DevicePtr<float>(),
-                             static_cast<int>(total_elements),
-                             static_cast<int>(_group_size),
+                             static_cast<int64_t>(total_elements),
+                             static_cast<int>(GroupSize()),
                              Stream().Handle());
       return fp32;
 #else
@@ -788,26 +790,26 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::FrozenTensorFP32(size_t index)const
     }
 
     if(sd==CAIF_DataType::CAIF_DataType_e::Int8
-       &&_scales.IsEmpty()==false)
+       &&Scales().IsEmpty()==false)
     {
 #ifdef USE_CAIF_CUDA
-      const size_t total_elements=static_cast<size_t>(_input_dim)*_output_dim;
-      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({_output_dim,_input_dim},Stream());
-      if(_int8_scheme==CAIF_Ops::QuantScheme_e::PerTensor_e)
+      const size_t total_elements=static_cast<size_t>(InputDim())*OutputDim();
+      CAIF_DeviceTensor fp32=CAIF_DeviceTensor::Uninitialized({OutputDim(),InputDim()},Stream());
+      if(Int8Scheme()==CAIF_Ops::QuantScheme_e::PerTensor_e)
       {
-        launch_dequantize_int8_per_tensor(_weight.DeviceDataRaw(),
+        launch_dequantize_int8_per_tensor(Weight().DeviceDataRaw(),
                                           fp32.template DevicePtr<float>(),
-                                          _scales.DeviceDataRaw(),
-                                          static_cast<int>(total_elements),
+                                          Scales().DeviceDataRaw(),
+                                          static_cast<int64_t>(total_elements),
                                           Stream().Handle());
       }
       else
       {
-        launch_dequantize_int8_per_channel(_weight.DeviceDataRaw(),
+        launch_dequantize_int8_per_channel(Weight().DeviceDataRaw(),
                                            fp32.template DevicePtr<float>(),
-                                           _scales.DeviceDataRaw(),
-                                           static_cast<int>(_input_dim),
-                                           static_cast<int>(_output_dim),
+                                           Scales().DeviceDataRaw(),
+                                           static_cast<int>(InputDim()),
+                                           static_cast<int>(OutputDim()),
                                            Stream().Handle());
       }
       return fp32;
@@ -816,8 +818,8 @@ CAIF_DeviceFrozenLinear<ComputeT,StorageT>::FrozenTensorFP32(size_t index)const
 #endif
     }
 
-    CAIF_DeviceTensor result=_weight.To(CAIF_DataType::CAIF_DataType_e::Float32);
-    result.Reshape({_output_dim,_input_dim});
+    CAIF_DeviceTensor result=Weight().To(CAIF_DataType::CAIF_DataType_e::Float32);
+    result.Reshape({OutputDim(),InputDim()});
     return result;
   }
   CAIF_CATCH_BLOCK()
@@ -827,7 +829,7 @@ template<typename ComputeT,typename StorageT>
 std::vector<std::string>
 CAIF_DeviceFrozenLinear<ComputeT,StorageT>::FrozenTensorNames(const std::string &prefix)const
 {
-  return {prefix+g_caif_name_weight};
+  return {prefix+CAIF_RoleRegistry::Instance().Name(CAIF_ParamRole::Role_e::GenericWeight_e)};
 }
 
 // Explicit instantiations — full 5×3 (StorageT, ComputeT) grid.

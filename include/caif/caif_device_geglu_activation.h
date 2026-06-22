@@ -20,6 +20,7 @@
 #pragma once
 
 #include "caif_device_gated_activation.h"
+#include "caif_serialization_constants.h"
 #include "caif_storage_dtype.h"
 #include "caif_storage_dtype_float.h"
 #ifdef USE_CAIF_CUDA
@@ -44,7 +45,7 @@ class CAIF_DeviceGeGLUActivation:public CAIF_DeviceGatedActivation
                   CAIF_DeviceTensor &grad_gate,
                   CAIF_DeviceTensor &grad_up)const override;
 
-    std::string Description()const override{return "GeGLU";}
+    std::string Description()const override{return g_serial_gated_geglu;}
     std::unique_ptr<CAIF_DeviceActivation> Clone()const override;
 
   protected:

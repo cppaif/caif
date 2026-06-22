@@ -44,18 +44,204 @@
 #include <random>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
 
-void ReportResult(const char *name,bool ok)
+constexpr uint32_t g_caif_hostparity_test_binary_n=64;
+constexpr uint32_t g_caif_hostparity_test_unary_n=64;
+constexpr uint32_t g_caif_hostparity_test_softmax_rows=8;
+constexpr uint32_t g_caif_hostparity_test_softmax_cols=32;
+constexpr uint32_t g_caif_hostparity_test_biasadd_rows=16;
+constexpr uint32_t g_caif_hostparity_test_biasadd_cols=24;
+constexpr uint32_t g_caif_hostparity_test_matmul_m=8;
+constexpr uint32_t g_caif_hostparity_test_matmul_k=12;
+constexpr uint32_t g_caif_hostparity_test_matmul_n=16;
+constexpr uint32_t g_caif_hostparity_test_reducesum_n=256;
+constexpr float g_caif_hostparity_test_sqrt_offset=0.1f;
+constexpr float g_caif_hostparity_test_denom_floor=1.0e-6f;
+
+//------------------------------------------------------------------------------
+// Abstract runner base classes for binary and unary ops.
+// These avoid lambdas while keeping the parity loop generic.
+//------------------------------------------------------------------------------
+class CAIF_BinaryOpRunner
 {
-  CAIF_TestHarness::Report(name,ok);
-}
+  public:
+    virtual ~CAIF_BinaryOpRunner()=default;
+    virtual void Invoke(const CAIF_DeviceTensor &a,
+                        const CAIF_DeviceTensor &b,
+                        CAIF_DeviceTensor &out)=0;
 
+  protected:
 
-std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed)
+  private:
+};
+
+class CAIF_AddOpRunner:public CAIF_BinaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &a,
+                const CAIF_DeviceTensor &b,
+                CAIF_DeviceTensor &out)override
+    {
+      CAIF_Ops::Add(a,b,out);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_MultiplyOpRunner:public CAIF_BinaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &a,
+                const CAIF_DeviceTensor &b,
+                CAIF_DeviceTensor &out)override
+    {
+      CAIF_Ops::Multiply(a,b,out);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_SubtractOpRunner:public CAIF_BinaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &a,
+                const CAIF_DeviceTensor &b,
+                CAIF_DeviceTensor &out)override
+    {
+      CAIF_Ops::Subtract(a,b,out);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_UnaryOpRunner
+{
+  public:
+    virtual ~CAIF_UnaryOpRunner()=default;
+    virtual void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)=0;
+
+  protected:
+
+  private:
+};
+
+class CAIF_ReLUOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::ReLU(input,output);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_SigmoidOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::Sigmoid(input,output);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_TanhOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::Tanh(input,output);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_GELUOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::GELU(input,output,CAIF_GELUApproximation::CAIF_GELUApproximation_e::Tanh);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_SwishOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::Swish(input,output);
+    }
+
+  protected:
+
+  private:
+};
+
+class CAIF_SqrtOpRunner:public CAIF_UnaryOpRunner
+{
+  public:
+    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
+    {
+      CAIF_Ops::Sqrt(input,output);
+    }
+
+  protected:
+
+  private:
+};
+
+//------------------------------------------------------------------------------
+// Host/Device parity tests for CAIF_Ops.
+//------------------------------------------------------------------------------
+class CAIF_OpsHostParityTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed);
+    static bool RelClose(const std::vector<float> &ref,
+                         const std::vector<float> &got,
+                         const float tol);
+    static std::vector<float> ReadDeviceTensorFp32(const CAIF_DeviceTensor &t);
+    static std::vector<float> ReadHostTensorFp32(const CAIF_DeviceTensor &t);
+    static void WriteHostTensorFp32(CAIF_DeviceTensor &t,const std::vector<float> &data);
+
+    static bool TestMatMulFp32();
+    static bool TestBinary(CAIF_BinaryOpRunner &runner,const uint32_t seed);
+    static bool TestUnary(CAIF_UnaryOpRunner &runner,
+                          const uint32_t seed,
+                          const bool positive_inputs);
+    static bool TestSoftmax();
+    static bool TestBiasAdd();
+    static bool TestReduceSum();
+};
+
+std::vector<float> CAIF_OpsHostParityTests::MakeRandomVec(const size_t n,
+                                                           const uint32_t seed)
 {
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> dist(-0.5f,0.5f);
@@ -67,9 +253,9 @@ std::vector<float> MakeRandomVec(const size_t n,const uint32_t seed)
   return v;
 }
 
-bool RelClose(const std::vector<float> &ref,
-              const std::vector<float> &got,
-              const float tol)
+bool CAIF_OpsHostParityTests::RelClose(const std::vector<float> &ref,
+                                        const std::vector<float> &got,
+                                        const float tol)
 {
   if(ref.size()!=got.size())
   {
@@ -84,7 +270,7 @@ bool RelClose(const std::vector<float> &ref,
       max_abs_ref=a;
     }
   }
-  const float denom=std::max(max_abs_ref,1.0e-6f);
+  const float denom=std::max(max_abs_ref,g_caif_hostparity_test_denom_floor);
   for(size_t i=0;i<ref.size();++i)
   {
     const float rel=std::fabs(ref[i]-got[i])/denom;
@@ -96,21 +282,22 @@ bool RelClose(const std::vector<float> &ref,
   return true;
 }
 
-std::vector<float> ReadDeviceTensorFp32(const CAIF_DeviceTensor &t)
+std::vector<float> CAIF_OpsHostParityTests::ReadDeviceTensorFp32(const CAIF_DeviceTensor &t)
 {
   std::vector<float> out(t.TotalElements());
   t.CopyToHost(out.data());
   return out;
 }
 
-std::vector<float> ReadHostTensorFp32(const CAIF_DeviceTensor &t)
+std::vector<float> CAIF_OpsHostParityTests::ReadHostTensorFp32(const CAIF_DeviceTensor &t)
 {
   std::vector<float> out(t.TotalElements());
   std::memcpy(out.data(),t.DeviceDataRaw(),out.size()*sizeof(float));
   return out;
 }
 
-void WriteHostTensorFp32(CAIF_DeviceTensor &t,const std::vector<float> &data)
+void CAIF_OpsHostParityTests::WriteHostTensorFp32(CAIF_DeviceTensor &t,
+                                                   const std::vector<float> &data)
 {
   std::memcpy(t.DeviceDataRaw(),data.data(),data.size()*sizeof(float));
 }
@@ -118,31 +305,43 @@ void WriteHostTensorFp32(CAIF_DeviceTensor &t,const std::vector<float> &data)
 //------------------------------------------------------------------------------
 // MatMul FP32 parity
 //------------------------------------------------------------------------------
-
-bool TestMatMulFp32()
+bool CAIF_OpsHostParityTests::TestMatMulFp32()
 {
   try
   {
-    const uint32_t m=8,k=12,n=16;
-    const std::vector<float> a_data=MakeRandomVec(m*k,1);
-    const std::vector<float> b_data=MakeRandomVec(k*n,2);
+    const std::vector<float> a_data=MakeRandomVec(g_caif_hostparity_test_matmul_m*
+                                                   g_caif_hostparity_test_matmul_k,1);
+    const std::vector<float> b_data=MakeRandomVec(g_caif_hostparity_test_matmul_k*
+                                                   g_caif_hostparity_test_matmul_n,2);
 
     CAIF_CudaStream stream;
     CAIF_RunContext ctx;
     ctx.SetStream(stream);
 
-    CAIF_DeviceTensor a_dev=CAIF_DeviceTensor::Zeros({m,k},stream);
-    CAIF_DeviceTensor b_dev=CAIF_DeviceTensor::Zeros({k,n},stream);
-    CAIF_DeviceTensor c_dev=CAIF_DeviceTensor::Zeros({m,n},stream);
+    CAIF_DeviceTensor a_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_matmul_m,
+                                g_caif_hostparity_test_matmul_k},stream);
+    CAIF_DeviceTensor b_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_matmul_k,
+                                g_caif_hostparity_test_matmul_n},stream);
+    CAIF_DeviceTensor c_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_matmul_m,
+                                g_caif_hostparity_test_matmul_n},stream);
     a_dev.CopyFromHost(a_data.data(),a_data.size());
     b_dev.CopyFromHost(b_data.data(),b_data.size());
     CAIF_Ops::MatMul(a_dev,b_dev,c_dev,ctx);
     stream.Synchronize();
     const std::vector<float> dev_out=ReadDeviceTensorFp32(c_dev);
 
-    CAIF_DeviceTensor a_host=CAIF_DeviceTensor::ZerosHost({m,k});
-    CAIF_DeviceTensor b_host=CAIF_DeviceTensor::ZerosHost({k,n});
-    CAIF_DeviceTensor c_host=CAIF_DeviceTensor::ZerosHost({m,n});
+    CAIF_DeviceTensor a_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_matmul_m,
+                                    g_caif_hostparity_test_matmul_k});
+    CAIF_DeviceTensor b_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_matmul_k,
+                                    g_caif_hostparity_test_matmul_n});
+    CAIF_DeviceTensor c_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_matmul_m,
+                                    g_caif_hostparity_test_matmul_n});
     WriteHostTensorFp32(a_host,a_data);
     WriteHostTensorFp32(b_host,b_data);
     CAIF_Ops::MatMul(a_host,b_host,c_host,ctx);
@@ -155,73 +354,34 @@ bool TestMatMulFp32()
 }
 
 //------------------------------------------------------------------------------
-// Generic element-wise parity helpers via functors (no lambdas).
+// Generic element-wise parity helpers.
 //------------------------------------------------------------------------------
-
-class BinaryOpRunner
-{
-  public:
-    virtual ~BinaryOpRunner()=default;
-    virtual void Invoke(const CAIF_DeviceTensor &a,
-                        const CAIF_DeviceTensor &b,
-                        CAIF_DeviceTensor &out)=0;
-};
-
-class AddOpRunner:public BinaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &a,
-                const CAIF_DeviceTensor &b,
-                CAIF_DeviceTensor &out)override
-    {
-      CAIF_Ops::Add(a,b,out);
-    }
-};
-
-class MultiplyOpRunner:public BinaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &a,
-                const CAIF_DeviceTensor &b,
-                CAIF_DeviceTensor &out)override
-    {
-      CAIF_Ops::Multiply(a,b,out);
-    }
-};
-
-class SubtractOpRunner:public BinaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &a,
-                const CAIF_DeviceTensor &b,
-                CAIF_DeviceTensor &out)override
-    {
-      CAIF_Ops::Subtract(a,b,out);
-    }
-};
-
-bool TestBinary(BinaryOpRunner &runner,const uint32_t seed)
+bool CAIF_OpsHostParityTests::TestBinary(CAIF_BinaryOpRunner &runner,const uint32_t seed)
 {
   try
   {
-    const uint32_t n=64;
-    const std::vector<float> a_data=MakeRandomVec(n,seed);
-    const std::vector<float> b_data=MakeRandomVec(n,seed+1);
+    const std::vector<float> a_data=
+      MakeRandomVec(g_caif_hostparity_test_binary_n,seed);
+    const std::vector<float> b_data=
+      MakeRandomVec(g_caif_hostparity_test_binary_n,seed+1);
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceTensor a_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    CAIF_DeviceTensor b_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    a_dev.CopyFromHost(a_data.data(),n);
-    b_dev.CopyFromHost(b_data.data(),n);
+    CAIF_DeviceTensor a_dev=CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_binary_n},stream);
+    CAIF_DeviceTensor b_dev=CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_binary_n},stream);
+    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_binary_n},stream);
+    a_dev.CopyFromHost(a_data.data(),g_caif_hostparity_test_binary_n);
+    b_dev.CopyFromHost(b_data.data(),g_caif_hostparity_test_binary_n);
     runner.Invoke(a_dev,b_dev,o_dev);
     stream.Synchronize();
     const std::vector<float> dev_out=ReadDeviceTensorFp32(o_dev);
 
-    CAIF_DeviceTensor a_host=CAIF_DeviceTensor::ZerosHost({n});
-    CAIF_DeviceTensor b_host=CAIF_DeviceTensor::ZerosHost({n});
-    CAIF_DeviceTensor o_host=CAIF_DeviceTensor::ZerosHost({n});
+    CAIF_DeviceTensor a_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_binary_n});
+    CAIF_DeviceTensor b_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_binary_n});
+    CAIF_DeviceTensor o_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_binary_n});
     WriteHostTensorFp32(a_host,a_data);
     WriteHostTensorFp32(b_host,b_data);
     runner.Invoke(a_host,b_host,o_host);
@@ -233,92 +393,34 @@ bool TestBinary(BinaryOpRunner &runner,const uint32_t seed)
   return false;
 }
 
-class UnaryOpRunner
-{
-  public:
-    virtual ~UnaryOpRunner()=default;
-    virtual void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)=0;
-};
-
-class ReLUOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::ReLU(input,output);
-    }
-};
-
-class SigmoidOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::Sigmoid(input,output);
-    }
-};
-
-class TanhOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::Tanh(input,output);
-    }
-};
-
-class GELUOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::GELU(input,output);
-    }
-};
-
-class SwishOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::Swish(input,output);
-    }
-};
-
-class SqrtOpRunner:public UnaryOpRunner
-{
-  public:
-    void Invoke(const CAIF_DeviceTensor &input,CAIF_DeviceTensor &output)override
-    {
-      CAIF_Ops::Sqrt(input,output);
-    }
-};
-
-bool TestUnary(UnaryOpRunner &runner,const uint32_t seed,const bool positive_inputs)
+bool CAIF_OpsHostParityTests::TestUnary(CAIF_UnaryOpRunner &runner,
+                                         const uint32_t seed,
+                                         const bool positive_inputs)
 {
   try
   {
-    const uint32_t n=64;
-    std::vector<float> in_data=MakeRandomVec(n,seed);
+    std::vector<float> in_data=MakeRandomVec(g_caif_hostparity_test_unary_n,seed);
     if(positive_inputs==true)
     {
       for(float &x:in_data)
       {
-        x=std::fabs(x)+0.1f;
+        x=std::fabs(x)+g_caif_hostparity_test_sqrt_offset;
       }
     }
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceTensor i_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    i_dev.CopyFromHost(in_data.data(),n);
+    CAIF_DeviceTensor i_dev=CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_unary_n},stream);
+    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_unary_n},stream);
+    i_dev.CopyFromHost(in_data.data(),g_caif_hostparity_test_unary_n);
     runner.Invoke(i_dev,o_dev);
     stream.Synchronize();
     const std::vector<float> dev_out=ReadDeviceTensorFp32(o_dev);
 
-    CAIF_DeviceTensor i_host=CAIF_DeviceTensor::ZerosHost({n});
-    CAIF_DeviceTensor o_host=CAIF_DeviceTensor::ZerosHost({n});
+    CAIF_DeviceTensor i_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_unary_n});
+    CAIF_DeviceTensor o_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_unary_n});
     WriteHostTensorFp32(i_host,in_data);
     runner.Invoke(i_host,o_host);
     const std::vector<float> host_out=ReadHostTensorFp32(o_host);
@@ -332,26 +434,32 @@ bool TestUnary(UnaryOpRunner &runner,const uint32_t seed,const bool positive_inp
 //------------------------------------------------------------------------------
 // Per-op shape-specific parity tests.
 //------------------------------------------------------------------------------
-
-bool TestSoftmax()
+bool CAIF_OpsHostParityTests::TestSoftmax()
 {
   try
   {
-    const uint32_t rows=8;
-    const uint32_t cols=32;
-    const std::vector<float> in_data=MakeRandomVec(rows*cols,7);
+    const std::vector<float> in_data=
+      MakeRandomVec(g_caif_hostparity_test_softmax_rows*g_caif_hostparity_test_softmax_cols,7);
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceTensor i_dev=CAIF_DeviceTensor::Zeros({rows,cols},stream);
-    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({rows,cols},stream);
+    CAIF_DeviceTensor i_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_softmax_rows,
+                                g_caif_hostparity_test_softmax_cols},stream);
+    CAIF_DeviceTensor o_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_softmax_rows,
+                                g_caif_hostparity_test_softmax_cols},stream);
     i_dev.CopyFromHost(in_data.data(),in_data.size());
     CAIF_Ops::Softmax(i_dev,o_dev);
     stream.Synchronize();
     const std::vector<float> dev_out=ReadDeviceTensorFp32(o_dev);
 
-    CAIF_DeviceTensor i_host=CAIF_DeviceTensor::ZerosHost({rows,cols});
-    CAIF_DeviceTensor o_host=CAIF_DeviceTensor::ZerosHost({rows,cols});
+    CAIF_DeviceTensor i_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_softmax_rows,
+                                    g_caif_hostparity_test_softmax_cols});
+    CAIF_DeviceTensor o_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_softmax_rows,
+                                    g_caif_hostparity_test_softmax_cols});
     WriteHostTensorFp32(i_host,in_data);
     CAIF_Ops::Softmax(i_host,o_host);
     const std::vector<float> host_out=ReadHostTensorFp32(o_host);
@@ -362,29 +470,39 @@ bool TestSoftmax()
   return false;
 }
 
-bool TestBiasAdd()
+bool CAIF_OpsHostParityTests::TestBiasAdd()
 {
   try
   {
-    const uint32_t rows=16;
-    const uint32_t cols=24;
-    const std::vector<float> in_data=MakeRandomVec(rows*cols,11);
-    const std::vector<float> bias_data=MakeRandomVec(cols,12);
+    const std::vector<float> in_data=
+      MakeRandomVec(g_caif_hostparity_test_biasadd_rows*g_caif_hostparity_test_biasadd_cols,11);
+    const std::vector<float> bias_data=
+      MakeRandomVec(g_caif_hostparity_test_biasadd_cols,12);
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceTensor i_dev=CAIF_DeviceTensor::Zeros({rows,cols},stream);
-    CAIF_DeviceTensor b_dev=CAIF_DeviceTensor::Zeros({cols},stream);
-    CAIF_DeviceTensor o_dev=CAIF_DeviceTensor::Zeros({rows,cols},stream);
+    CAIF_DeviceTensor i_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_biasadd_rows,
+                                g_caif_hostparity_test_biasadd_cols},stream);
+    CAIF_DeviceTensor b_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_biasadd_cols},stream);
+    CAIF_DeviceTensor o_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_biasadd_rows,
+                                g_caif_hostparity_test_biasadd_cols},stream);
     i_dev.CopyFromHost(in_data.data(),in_data.size());
     b_dev.CopyFromHost(bias_data.data(),bias_data.size());
     CAIF_Ops::BiasAdd(i_dev,b_dev,o_dev);
     stream.Synchronize();
     const std::vector<float> dev_out=ReadDeviceTensorFp32(o_dev);
 
-    CAIF_DeviceTensor i_host=CAIF_DeviceTensor::ZerosHost({rows,cols});
-    CAIF_DeviceTensor b_host=CAIF_DeviceTensor::ZerosHost({cols});
-    CAIF_DeviceTensor o_host=CAIF_DeviceTensor::ZerosHost({rows,cols});
+    CAIF_DeviceTensor i_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_biasadd_rows,
+                                    g_caif_hostparity_test_biasadd_cols});
+    CAIF_DeviceTensor b_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_biasadd_cols});
+    CAIF_DeviceTensor o_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_biasadd_rows,
+                                    g_caif_hostparity_test_biasadd_cols});
     WriteHostTensorFp32(i_host,in_data);
     WriteHostTensorFp32(b_host,bias_data);
     CAIF_Ops::BiasAdd(i_host,b_host,o_host);
@@ -396,25 +514,27 @@ bool TestBiasAdd()
   return false;
 }
 
-bool TestReduceSum()
+bool CAIF_OpsHostParityTests::TestReduceSum()
 {
   try
   {
-    const uint32_t n=256;
-    const std::vector<float> in_data=MakeRandomVec(n,13);
+    const std::vector<float> in_data=
+      MakeRandomVec(g_caif_hostparity_test_reducesum_n,13);
 
     CAIF_CudaStream stream;
 
-    CAIF_DeviceTensor i_dev=CAIF_DeviceTensor::Zeros({n},stream);
-    i_dev.CopyFromHost(in_data.data(),n);
+    CAIF_DeviceTensor i_dev=
+      CAIF_DeviceTensor::Zeros({g_caif_hostparity_test_reducesum_n},stream);
+    i_dev.CopyFromHost(in_data.data(),g_caif_hostparity_test_reducesum_n);
     const float dev_sum=CAIF_Ops::ReduceSum(i_dev);
     stream.Synchronize();
 
-    CAIF_DeviceTensor i_host=CAIF_DeviceTensor::ZerosHost({n});
+    CAIF_DeviceTensor i_host=
+      CAIF_DeviceTensor::ZerosHost({g_caif_hostparity_test_reducesum_n});
     WriteHostTensorFp32(i_host,in_data);
     const float host_sum=CAIF_Ops::ReduceSum(i_host);
 
-    const float denom=std::max(std::fabs(dev_sum),1.0e-6f);
+    const float denom=std::max(std::fabs(dev_sum),g_caif_hostparity_test_denom_floor);
     const float rel=std::fabs(dev_sum-host_sum)/denom;
     return rel<CAIF_Tolerances::Fp32Rel();
   }
@@ -422,38 +542,36 @@ bool TestReduceSum()
   return false;
 }
 
-}  // namespace
-
-int main()
+void CAIF_OpsHostParityTests::RunAll()
 {
   ISE_Out::Out()<<"Host/Device Parity Tests\n";
   ISE_Out::Out()<<"========================\n";
 
-  ReportResult("MatMul FP32 parity",TestMatMulFp32());
+  CAIF_TestHarness::Report("MatMul FP32 parity",TestMatMulFp32());
 
-  AddOpRunner add_runner;
-  ReportResult("Add parity",TestBinary(add_runner,21));
-  MultiplyOpRunner mul_runner;
-  ReportResult("Multiply parity",TestBinary(mul_runner,23));
-  SubtractOpRunner sub_runner;
-  ReportResult("Subtract parity",TestBinary(sub_runner,25));
+  CAIF_AddOpRunner add_runner;
+  CAIF_TestHarness::Report("Add parity",TestBinary(add_runner,21));
+  CAIF_MultiplyOpRunner mul_runner;
+  CAIF_TestHarness::Report("Multiply parity",TestBinary(mul_runner,23));
+  CAIF_SubtractOpRunner sub_runner;
+  CAIF_TestHarness::Report("Subtract parity",TestBinary(sub_runner,25));
 
-  ReLUOpRunner relu_runner;
-  ReportResult("ReLU parity",TestUnary(relu_runner,31,false));
-  SigmoidOpRunner sigmoid_runner;
-  ReportResult("Sigmoid parity",TestUnary(sigmoid_runner,33,false));
-  TanhOpRunner tanh_runner;
-  ReportResult("Tanh parity",TestUnary(tanh_runner,35,false));
-  GELUOpRunner gelu_runner;
-  ReportResult("GELU parity",TestUnary(gelu_runner,37,false));
-  SwishOpRunner swish_runner;
-  ReportResult("Swish parity",TestUnary(swish_runner,39,false));
-  SqrtOpRunner sqrt_runner;
-  ReportResult("Sqrt parity",TestUnary(sqrt_runner,41,true));
+  CAIF_ReLUOpRunner relu_runner;
+  CAIF_TestHarness::Report("ReLU parity",TestUnary(relu_runner,31,false));
+  CAIF_SigmoidOpRunner sigmoid_runner;
+  CAIF_TestHarness::Report("Sigmoid parity",TestUnary(sigmoid_runner,33,false));
+  CAIF_TanhOpRunner tanh_runner;
+  CAIF_TestHarness::Report("Tanh parity",TestUnary(tanh_runner,35,false));
+  CAIF_GELUOpRunner gelu_runner;
+  CAIF_TestHarness::Report("GELU parity",TestUnary(gelu_runner,37,false));
+  CAIF_SwishOpRunner swish_runner;
+  CAIF_TestHarness::Report("Swish parity",TestUnary(swish_runner,39,false));
+  CAIF_SqrtOpRunner sqrt_runner;
+  CAIF_TestHarness::Report("Sqrt parity",TestUnary(sqrt_runner,41,true));
 
-  ReportResult("Softmax parity",TestSoftmax());
-  ReportResult("BiasAdd parity",TestBiasAdd());
-  ReportResult("ReduceSum parity",TestReduceSum());
+  CAIF_TestHarness::Report("Softmax parity",TestSoftmax());
+  CAIF_TestHarness::Report("BiasAdd parity",TestBiasAdd());
+  CAIF_TestHarness::Report("ReduceSum parity",TestReduceSum());
 
   ISE_Out::Out()<<"\n";
   ISE_Out::Out()<<"Passed: "
@@ -461,5 +579,12 @@ int main()
                 <<"  Failed: "
                 <<CAIF_TestHarness::FailedCount()
                 <<"\n";
-  return CAIF_TestHarness::FinalExitCode();
+}
+
+}//end instance namespace
+
+int main()
+{
+  instance::CAIF_OpsHostParityTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 }

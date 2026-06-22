@@ -31,7 +31,7 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceT5Attention:public CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>
 {
   public:
-    typedef typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::AttentionConfig_t AttentionConfig_t;
+    typedef CAIF_DeviceMultiHeadAttentionConfig AttentionConfig_t;
     typedef typename CAIF_DeviceMultiHeadAttention<ComputeT,StorageT>::MHAProjections_t MHAProjections_t;
 
     CAIF_DeviceT5Attention(const AttentionConfig_t &config,

@@ -23,28 +23,54 @@
 #include "caif_device_vit_model.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include <iostream>
+#include "caif_exception.h"
+#include "ise_lib/ise_out.h"
 #include <fstream>
 #include <cmath>
 #include <cstdio>
 
-using namespace instance;
-
-static void ReportResult(const char *test_name,bool passed)
+namespace instance
 {
-  CAIF_TestHarness::Report(test_name,passed);
-}
 
-static bool FloatEqual(float a,float b,float tolerance=1e-4f)
+constexpr float g_caif_safetensors_test_scale=0.1f;
+constexpr float g_caif_safetensors_test_bias_scale=-0.5f;
+constexpr float g_caif_safetensors_test_img_scale_inv=255.0f;
+constexpr float g_caif_safetensors_test_vit_lr=0.01f;
+constexpr float g_caif_safetensors_test_tol=1e-4f;
+constexpr uint32_t g_caif_safetensors_test_header_max=10000;
+constexpr float g_caif_safetensors_test_py_weight_0=1.0f;
+constexpr float g_caif_safetensors_test_py_weight_1=2.0f;
+constexpr float g_caif_safetensors_test_py_weight_2=3.0f;
+constexpr float g_caif_safetensors_test_py_weight_3=4.0f;
+constexpr float g_caif_safetensors_test_py_weight_4=5.0f;
+constexpr float g_caif_safetensors_test_py_weight_5=6.0f;
+constexpr float g_caif_safetensors_test_py_bias_0=0.1f;
+constexpr float g_caif_safetensors_test_py_bias_1=0.2f;
+constexpr float g_caif_safetensors_test_py_bias_2=0.3f;
+
+//------------------------------------------------------------------------------
+// SafeTensors format correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_SafeTensorsTests
 {
-  return CAIF_TestHarness::FloatEqual(a,b,tolerance);
-}
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void TestBasicSaveLoad();
+    static void TestDenseNetworkSaveLoad();
+    static void TestViTModelSaveLoad();
+    static void TestParameterNames();
+    static void TestFileFormatValidation();
+    static void TestPythonSerializationCompatibility();
+};
 
 //------------------------------------------------------------------------------
 // Test: Basic SafeTensors Save/Load
 //------------------------------------------------------------------------------
-
-static void TestBasicSaveLoad()
+void CAIF_SafeTensorsTests::TestBasicSaveLoad()
 {
   try
   {
@@ -59,24 +85,24 @@ static void TestBasicSaveLoad()
     std::vector<float> data1(32);
     for(size_t i=0;i<data1.size();++i)
     {
-      data1[i]=static_cast<float>(i)*0.1f;
+      data1[i]=static_cast<float>(i)*g_caif_safetensors_test_scale;
     }
     tensor1.CopyFromHost(data1.data(),data1.size());
 
     std::vector<float> data2(8);
     for(size_t i=0;i<data2.size();++i)
     {
-      data2[i]=static_cast<float>(i)*-0.5f;
+      data2[i]=static_cast<float>(i)*g_caif_safetensors_test_bias_scale;
     }
     tensor2.CopyFromHost(data2.data(),data2.size());
 
     // Save
     CAIF_SafeTensorsFormat format;
-    std::vector<std::pair<std::string, const CAIF_DeviceTensor*>> tensors;
+    std::vector<std::pair<std::string,const CAIF_DeviceTensor*>> tensors;
     tensors.push_back({"weight",&tensor1});
     tensors.push_back({"bias",&tensor2});
 
-    std::map<std::string, std::string> metadata;
+    std::map<std::string,std::string> metadata;
     metadata["test_key"]="test_value";
 
     format.Save(test_path,tensors,metadata);
@@ -103,14 +129,17 @@ static void TestBasicSaveLoad()
       {
         passed=false;
       }
-      std::vector<float> loaded_data(32);
-      loaded_weight.CopyToHost(loaded_data.data());
-      for(size_t i=0;i<data1.size();++i)
+      if(passed==true)
       {
-        if(FloatEqual(loaded_data[i],data1[i])==false)
+        std::vector<float> loaded_data(32);
+        loaded_weight.CopyToHost(loaded_data.data());
+        for(size_t i=0;i<data1.size();++i)
         {
-          passed=false;
-          break;
+          if(CAIF_TestHarness::FloatEqual(loaded_data[i],data1[i],g_caif_safetensors_test_tol)==false)
+          {
+            passed=false;
+            break;
+          }
         }
       }
     }
@@ -126,14 +155,17 @@ static void TestBasicSaveLoad()
       {
         passed=false;
       }
-      std::vector<float> loaded_data(8);
-      loaded_bias.CopyToHost(loaded_data.data());
-      for(size_t i=0;i<data2.size();++i)
+      if(passed==true)
       {
-        if(FloatEqual(loaded_data[i],data2[i])==false)
+        std::vector<float> loaded_data(8);
+        loaded_bias.CopyToHost(loaded_data.data());
+        for(size_t i=0;i<data2.size();++i)
         {
-          passed=false;
-          break;
+          if(CAIF_TestHarness::FloatEqual(loaded_data[i],data2[i],g_caif_safetensors_test_tol)==false)
+          {
+            passed=false;
+            break;
+          }
         }
       }
     }
@@ -152,16 +184,15 @@ static void TestBasicSaveLoad()
     // Cleanup
     std::remove(test_path.c_str());
 
-    ReportResult("BasicSaveLoad",passed);
+    CAIF_TestHarness::Report("SafeTensors::BasicSaveLoad",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("BasicSaveLoad")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::BasicSaveLoad")
 }
 
 //------------------------------------------------------------------------------
 // Test: Dense Network Save/Load
 //------------------------------------------------------------------------------
-
-static void TestDenseNetworkSaveLoad()
+void CAIF_SafeTensorsTests::TestDenseNetworkSaveLoad()
 {
   try
   {
@@ -170,8 +201,8 @@ static void TestDenseNetworkSaveLoad()
 
     // Create network
     CAIF_DeviceNetwork net1(stream);
-    net1.AddDenseLayer(4,8,CAIF_DeviceActivation_e::ReLU,true);
-    net1.AddDenseLayer(8,2,CAIF_DeviceActivation_e::None,true);
+    net1.AddDenseLayer(4,8,CAIF_DeviceActivation::CAIF_DeviceActivation_e::ReLU,true);
+    net1.AddDenseLayer(8,2,CAIF_DeviceActivation::CAIF_DeviceActivation_e::None,true);
 
     // Create test input
     CAIF_DeviceTensor input=CAIF_DeviceTensor::Zeros({2,4},stream);
@@ -188,8 +219,8 @@ static void TestDenseNetworkSaveLoad()
 
     // Create new network with same architecture
     CAIF_DeviceNetwork net2(stream);
-    net2.AddDenseLayer(4,8,CAIF_DeviceActivation_e::ReLU,true);
-    net2.AddDenseLayer(8,2,CAIF_DeviceActivation_e::None,true);
+    net2.AddDenseLayer(4,8,CAIF_DeviceActivation::CAIF_DeviceActivation_e::ReLU,true);
+    net2.AddDenseLayer(8,2,CAIF_DeviceActivation::CAIF_DeviceActivation_e::None,true);
 
     // Load weights
     net2.LoadSafeTensors(test_path);
@@ -203,9 +234,15 @@ static void TestDenseNetworkSaveLoad()
     bool passed=true;
     for(size_t i=0;i<output1_data.size();++i)
     {
-      if(FloatEqual(output1_data[i],output2_data[i])==false)
+      if(CAIF_TestHarness::FloatEqual(output1_data[i],output2_data[i],g_caif_safetensors_test_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": "<<output1_data[i]<<" vs "<<output2_data[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": "
+                      <<output1_data[i]
+                      <<" vs "
+                      <<output2_data[i]
+                      <<"\n";
         passed=false;
       }
     }
@@ -213,16 +250,15 @@ static void TestDenseNetworkSaveLoad()
     // Cleanup
     std::remove(test_path.c_str());
 
-    ReportResult("DenseNetworkSaveLoad",passed);
+    CAIF_TestHarness::Report("SafeTensors::DenseNetworkSaveLoad",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("DenseNetworkSaveLoad")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::DenseNetworkSaveLoad")
 }
 
 //------------------------------------------------------------------------------
 // Test: ViT Model Save/Load
 //------------------------------------------------------------------------------
-
-static void TestViTModelSaveLoad()
+void CAIF_SafeTensorsTests::TestViTModelSaveLoad()
 {
   try
   {
@@ -232,21 +268,7 @@ static void TestViTModelSaveLoad()
     const std::string test_path="test_vit_model.safetensors";
 
     // Create small ViT config
-    CAIF_DeviceViTModel<float,float>::Config_t config;
-    config.image_height=16;
-    config.image_width=16;
-    config.channels=3;
-    config.patch_size=8;
-    config.dim=32;
-    config.num_heads=2;
-    config.num_layers=1;
-    config.ffn_hidden_dim=64;
-    config.dropout_rate=0.0f;
-    config.num_classes=4;
-    config.use_rope=false;
-    config.rope_base=10000.0f;
-
-    // Create model
+    CAIF_DeviceViTModelConfig config(16,16,3,8,32,1,2,64,0.0f,4,false,10000.0f);
     CAIF_DeviceViTModel<float,float> model1(config,stream);
 
     // Create test input: [batch=1, height=16, width=16, channels=3] (BHWC format)
@@ -260,7 +282,7 @@ static void TestViTModelSaveLoad()
     std::vector<float> input_data(batch*channels*height*width);
     for(size_t i=0;i<input_data.size();++i)
     {
-      input_data[i]=static_cast<float>(i%256)/255.0f;
+      input_data[i]=static_cast<float>(i%256)/g_caif_safetensors_test_img_scale_inv;
     }
     input.CopyFromHost(input_data.data(),input_data.size());
 
@@ -268,11 +290,11 @@ static void TestViTModelSaveLoad()
     ctx.SetTraining(false);
     ctx.SetPass(CAIF_RunContext::Pass_e::Forward_e);
     CAIF_DeviceTensor output1=model1.Forward(input,ctx);
-    std::vector<float> output1_data(batch*config.num_classes);
+    std::vector<float> output1_data(batch*config.NumClasses());
     output1.CopyToHost(output1_data.data());
 
     // Save
-    std::vector<std::pair<std::string, const CAIF_DeviceTensor*>> tensors;
+    std::vector<std::pair<std::string,const CAIF_DeviceTensor*>> tensors;
     std::vector<std::string> param_names=model1.ParameterNames("");
     for(size_t i=0;i<model1.ParameterTensorCount();++i)
     {
@@ -280,7 +302,7 @@ static void TestViTModelSaveLoad()
     }
 
     CAIF_SafeTensorsFormat format;
-    std::map<std::string, std::string> metadata;
+    std::map<std::string,std::string> metadata;
     metadata["model_type"]="vit";
     format.Save(test_path,tensors,metadata);
 
@@ -297,12 +319,10 @@ static void TestViTModelSaveLoad()
       auto it=loaded.find(name);
       if(it==loaded.end())
       {
-        throw std::runtime_error("Missing tensor: "+name);
+        THROW_CAIFE("Missing tensor");
       }
-
       CAIF_DeviceTensor &param=model2.ParameterTensor(i);
       const CAIF_DeviceTensor &loaded_tensor=it->second;
-
       std::vector<float> data(loaded_tensor.TotalElements());
       loaded_tensor.CopyToHost(data.data());
       param.CopyFromHost(data.data(),data.size());
@@ -310,16 +330,22 @@ static void TestViTModelSaveLoad()
 
     // Run forward pass
     CAIF_DeviceTensor output2=model2.Forward(input,ctx);
-    std::vector<float> output2_data(batch*config.num_classes);
+    std::vector<float> output2_data(batch*config.NumClasses());
     output2.CopyToHost(output2_data.data());
 
     // Verify outputs match
     bool passed=true;
     for(size_t i=0;i<output1_data.size();++i)
     {
-      if(FloatEqual(output1_data[i],output2_data[i],1e-4f)==false)
+      if(CAIF_TestHarness::FloatEqual(output1_data[i],output2_data[i],g_caif_safetensors_test_tol)==false)
       {
-        std::cout<<"  Mismatch at "<<i<<": "<<output1_data[i]<<" vs "<<output2_data[i]<<"\n";
+        ISE_Out::Out()<<"  Mismatch at "
+                      <<i
+                      <<": "
+                      <<output1_data[i]
+                      <<" vs "
+                      <<output2_data[i]
+                      <<"\n";
         passed=false;
       }
     }
@@ -327,16 +353,15 @@ static void TestViTModelSaveLoad()
     // Cleanup
     std::remove(test_path.c_str());
 
-    ReportResult("ViTModelSaveLoad",passed);
+    CAIF_TestHarness::Report("SafeTensors::ViTModelSaveLoad",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("ViTModelSaveLoad")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::ViTModelSaveLoad")
 }
 
 //------------------------------------------------------------------------------
 // Test: Parameter Names
 //------------------------------------------------------------------------------
-
-static void TestParameterNames()
+void CAIF_SafeTensorsTests::TestParameterNames()
 {
   try
   {
@@ -344,8 +369,8 @@ static void TestParameterNames()
 
     // Create network with dense layers
     CAIF_DeviceNetwork net(stream);
-    net.AddDenseLayer(4,8,CAIF_DeviceActivation_e::ReLU,true);
-    net.AddDenseLayer(8,2,CAIF_DeviceActivation_e::None,false);
+    net.AddDenseLayer(4,8,CAIF_DeviceActivation::CAIF_DeviceActivation_e::ReLU,true);
+    net.AddDenseLayer(8,2,CAIF_DeviceActivation::CAIF_DeviceActivation_e::None,false);
 
     bool passed=true;
 
@@ -355,36 +380,38 @@ static void TestParameterNames()
     {
       passed=false;
     }
-    if(names0[0]!="layers.0.weight")
+    if(passed==true&&names0[0]!="layers.0.weight")
     {
       passed=false;
     }
-    if(names0[1]!="layers.0.bias")
+    if(passed==true&&names0[1]!="layers.0.bias")
     {
       passed=false;
     }
 
     // Check layer 1 parameter names (no bias)
-    auto names1=net.DenseLayer(1).ParameterNames("layers.1.");
-    if(names1.size()!=1)
+    if(passed==true)
     {
-      passed=false;
-    }
-    if(names1[0]!="layers.1.weight")
-    {
-      passed=false;
+      auto names1=net.DenseLayer(1).ParameterNames("layers.1.");
+      if(names1.size()!=1)
+      {
+        passed=false;
+      }
+      if(passed==true&&names1[0]!="layers.1.weight")
+      {
+        passed=false;
+      }
     }
 
-    ReportResult("ParameterNames",passed);
+    CAIF_TestHarness::Report("SafeTensors::ParameterNames",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("ParameterNames")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::ParameterNames")
 }
 
 //------------------------------------------------------------------------------
 // Test: File Format Validation
 //------------------------------------------------------------------------------
-
-static void TestFileFormatValidation()
+void CAIF_SafeTensorsTests::TestFileFormatValidation()
 {
   try
   {
@@ -397,10 +424,10 @@ static void TestFileFormatValidation()
     tensor.CopyFromHost(data.data(),data.size());
 
     CAIF_SafeTensorsFormat format;
-    std::vector<std::pair<std::string, const CAIF_DeviceTensor*>> tensors;
+    std::vector<std::pair<std::string,const CAIF_DeviceTensor*>> tensors;
     tensors.push_back({"test_tensor",&tensor});
 
-    std::map<std::string, std::string> metadata;
+    std::map<std::string,std::string> metadata;
     metadata["format_version"]="1.0";
     metadata["model_name"]="test_model";
 
@@ -421,35 +448,38 @@ static void TestFileFormatValidation()
       in.read(reinterpret_cast<char*>(&header_size),sizeof(uint64_t));
 
       // Header should be reasonable size
-      if(header_size==0||header_size>10000)
+      if(header_size==0||header_size>g_caif_safetensors_test_header_max)
       {
         passed=false;
       }
 
-      // Read header JSON
-      std::string header(header_size,'\0');
-      in.read(&header[0],static_cast<std::streamsize>(header_size));
+      if(passed==true)
+      {
+        // Read header JSON
+        std::string header(header_size,'\0');
+        in.read(&header[0],static_cast<std::streamsize>(header_size));
 
-      // Verify header contains expected keys
-      if(header.find("\"test_tensor\"")==std::string::npos)
-      {
-        passed=false;
-      }
-      if(header.find("\"dtype\":\"F32\"")==std::string::npos)
-      {
-        passed=false;
-      }
-      if(header.find("\"shape\":[2,3]")==std::string::npos)
-      {
-        passed=false;
-      }
-      if(header.find("\"__metadata__\"")==std::string::npos)
-      {
-        passed=false;
-      }
-      if(header.find("\"format_version\":\"1.0\"")==std::string::npos)
-      {
-        passed=false;
+        // Verify header contains expected keys
+        if(header.find("\"test_tensor\"")==std::string::npos)
+        {
+          passed=false;
+        }
+        if(header.find("\"dtype\":\"F32\"")==std::string::npos)
+        {
+          passed=false;
+        }
+        if(header.find("\"shape\":[2,3]")==std::string::npos)
+        {
+          passed=false;
+        }
+        if(header.find("\"__metadata__\"")==std::string::npos)
+        {
+          passed=false;
+        }
+        if(header.find("\"format_version\":\"1.0\"")==std::string::npos)
+        {
+          passed=false;
+        }
       }
 
       in.close();
@@ -458,17 +488,16 @@ static void TestFileFormatValidation()
     // Cleanup
     std::remove(test_path.c_str());
 
-    ReportResult("FileFormatValidation",passed);
+    CAIF_TestHarness::Report("SafeTensors::FileFormatValidation",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("FileFormatValidation")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::FileFormatValidation")
 }
 
 //------------------------------------------------------------------------------
-// Test: Python Serialization Compatibility
-// Creates a file for Python verification - does NOT delete it
+// Test: Python Serialization Compatibility.
+// Creates a file for Python verification - does NOT delete it.
 //------------------------------------------------------------------------------
-
-static void TestPythonSerializationCompatibility()
+void CAIF_SafeTensorsTests::TestPythonSerializationCompatibility()
 {
   try
   {
@@ -479,8 +508,15 @@ static void TestPythonSerializationCompatibility()
     CAIF_DeviceTensor weight=CAIF_DeviceTensor::Zeros({2,3},stream);
     CAIF_DeviceTensor bias=CAIF_DeviceTensor::Zeros({3},stream);
 
-    std::vector<float> weight_data={1.0f,2.0f,3.0f,4.0f,5.0f,6.0f};
-    std::vector<float> bias_data={0.1f,0.2f,0.3f};
+    std::vector<float> weight_data={g_caif_safetensors_test_py_weight_0,
+                                    g_caif_safetensors_test_py_weight_1,
+                                    g_caif_safetensors_test_py_weight_2,
+                                    g_caif_safetensors_test_py_weight_3,
+                                    g_caif_safetensors_test_py_weight_4,
+                                    g_caif_safetensors_test_py_weight_5};
+    std::vector<float> bias_data={g_caif_safetensors_test_py_bias_0,
+                                  g_caif_safetensors_test_py_bias_1,
+                                  g_caif_safetensors_test_py_bias_2};
 
     weight.CopyFromHost(weight_data.data(),weight_data.size());
     bias.CopyFromHost(bias_data.data(),bias_data.size());
@@ -513,9 +549,10 @@ static void TestPythonSerializationCompatibility()
       loaded.at("model.weight").CopyToHost(loaded_weight.data());
       for(size_t i=0;i<weight_data.size();++i)
       {
-        if(FloatEqual(loaded_weight[i],weight_data[i])==false)
+        if(CAIF_TestHarness::FloatEqual(loaded_weight[i],weight_data[i],g_caif_safetensors_test_tol)==false)
         {
           passed=false;
+          break;
         }
       }
     }
@@ -531,39 +568,47 @@ static void TestPythonSerializationCompatibility()
       loaded.at("model.bias").CopyToHost(loaded_bias.data());
       for(size_t i=0;i<bias_data.size();++i)
       {
-        if(FloatEqual(loaded_bias[i],bias_data[i])==false)
+        if(CAIF_TestHarness::FloatEqual(loaded_bias[i],bias_data[i],g_caif_safetensors_test_tol)==false)
         {
           passed=false;
+          break;
         }
       }
     }
 
-    // DO NOT cleanup - leave file for Python verification
-    std::cout<<"  (File saved to "<<test_path<<" for Python verification)\n";
+    // DO NOT cleanup — leave file for Python verification
+    ISE_Out::Out()<<"  (File saved to "
+                  <<test_path
+                  <<" for Python verification)\n";
 
-    ReportResult("PythonSerializationCompatibility",passed);
+    CAIF_TestHarness::Report("SafeTensors::PythonSerializationCompatibility",passed);
   }
-  CAIF_TEST_CATCH_BLOCK("PythonSerializationCompatibility")
+  CAIF_TEST_CATCH_BLOCK("SafeTensors::PythonSerializationCompatibility")
 }
 
-//------------------------------------------------------------------------------
-// Main
-//------------------------------------------------------------------------------
-
-int main()
+void CAIF_SafeTensorsTests::RunAll()
 {
-  std::cout<<"=== SafeTensors Format Tests ===\n\n";
-
+  ISE_Out::Out()<<"=== SafeTensors Format Tests ==="
+                <<"\n\n";
   TestBasicSaveLoad();
   TestDenseNetworkSaveLoad();
   TestViTModelSaveLoad();
   TestParameterNames();
   TestFileFormatValidation();
   TestPythonSerializationCompatibility();
+  ISE_Out::Out()<<"\n=== Summary ===\n"
+                <<"Passed: "
+                <<CAIF_TestHarness::PassedCount()
+                <<"\n"
+                <<"Failed: "
+                <<CAIF_TestHarness::FailedCount()
+                <<"\n";
+}
 
-  std::cout<<"\n=== Summary ===\n";
-  std::cout<<"Passed: "<<CAIF_TestHarness::PassedCount()<<"\n";
-  std::cout<<"Failed: "<<CAIF_TestHarness::FailedCount()<<"\n";
+}//end instance namespace
 
-  return (CAIF_TestHarness::FailedCount()>0)?1:0;
+int main()
+{
+  instance::CAIF_SafeTensorsTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
 }

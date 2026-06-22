@@ -354,6 +354,7 @@ class CAIF_DeviceTensor:public CAIF_Base
      * @return Vector of dimension sizes
      */
     const std::vector<uint32_t> &Shape()const{return _shape;}
+    std::vector<uint32_t> &Shape(){return _shape;}
 
     /**
      * @brief Get total number of elements
@@ -462,6 +463,29 @@ class CAIF_DeviceTensor:public CAIF_Base
 
     void AllocateDevice();
     void FreeDevice();
+
+    // Alignment (bytes) for host-backed tensor allocations made via
+    // ::operator new[] in the UninitializedHost factory path.
+    static constexpr size_t _host_alignment=64;
+
+    // Private setters — every internal write to a member goes through one
+    // of these so method bodies stay accessor-only. Address-taking sites
+    // (`cudaMalloc(&_device_data)`) and ctor init lists are exempt.
+    void SetDeviceData(void *p){_device_data=p;}
+    void SetShape(std::vector<uint32_t> &&v){_shape=std::move(v);}
+    void SetShape(const std::vector<uint32_t> &v){_shape=v;}
+    void SetTotalElements(const size_t v){_total_elements=v;}
+    void SetSizeBytes(const size_t v){_size_bytes=v;}
+    void SetStreamPtr(CAIF_CudaStream *p){_stream=p;}
+    void SetDtypeInfo(const CAIF_DataType &v){_dtype=v;}
+    void SetOwnsData(const bool v){_owns_data=v;}
+    void SetLocation(const Location_e v){_location=v;}
+
+    // Internal reads for cases that need the raw stream pointer (not the
+    // reference yielded by Stream()).
+    CAIF_CudaStream *StreamPtr(){return _stream;}
+    const CAIF_CudaStream *StreamPtr()const{return _stream;}
+    bool OwnsData()const{return _owns_data;}
 
     void *_device_data;  // Raw device pointer (was float*, now void* for multi-dtype)
     std::vector<uint32_t> _shape;

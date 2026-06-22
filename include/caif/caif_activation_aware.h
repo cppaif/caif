@@ -20,18 +20,19 @@
 #pragma once
 
 #include "caif_constants.h"
+#include "caif_activation_type.h"
 
 namespace instance
 {
   class CAIF_ActivationAware
   {
     public:
-      static bool UsesKaiming(const CAIF_ActivationType_e activation);
+      static bool UsesKaiming(const CAIF_ActivationType::CAIF_ActivationType_e activation);
 
-      static float Gain(const CAIF_ActivationType_e activation);
+      static float Gain(const CAIF_ActivationType::CAIF_ActivationType_e activation);
 
       static float UniformBound(
-                                const CAIF_ActivationType_e activation,
+                                const CAIF_ActivationType::CAIF_ActivationType_e activation,
                                 const uint32_t fan_in,
                                 const uint32_t fan_out,
                                 const bool activation_aware_enabled

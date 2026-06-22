@@ -24,8 +24,8 @@ namespace instance
 
 // Static members
 CAIF_DeviceProperties::DevicePropertiesVec_t
-  CAIF_DeviceProperties::s_device_cache;
-std::mutex CAIF_DeviceProperties::s_cache_mutex;
+  CAIF_DeviceProperties::_device_cache;
+std::mutex CAIF_DeviceProperties::_cache_mutex;
 
 CAIF_DeviceProperties::CAIF_DeviceProperties(const int device_id):_device_id(device_id),
                                                                   _name("CPU"),
@@ -54,18 +54,18 @@ CAIF_DeviceProperties::CAIF_DeviceProperties(const int device_id):_device_id(dev
                   +std::to_string(device_id));
     }
 
-    _name=props.name;
-    _compute_major=props.major;
-    _compute_minor=props.minor;
-    _total_global_mem=props.totalGlobalMem;
-    _shared_mem_per_block=props.sharedMemPerBlock;
-    _shared_mem_per_sm=props.sharedMemPerMultiprocessor;
-    _sm_count=props.multiProcessorCount;
-    _max_threads_per_block=props.maxThreadsPerBlock;
-    _max_threads_per_sm=props.maxThreadsPerMultiProcessor;
-    _warp_size=props.warpSize;
-    _regs_per_sm=props.regsPerMultiprocessor;
-    _regs_per_block=props.regsPerBlock;
+    SetDeviceName(props.name);
+    SetComputeCapabilityMajor(props.major);
+    SetComputeCapabilityMinor(props.minor);
+    SetTotalGlobalMemory(props.totalGlobalMem);
+    SetSharedMemoryPerBlock(props.sharedMemPerBlock);
+    SetSharedMemoryPerSM(props.sharedMemPerMultiprocessor);
+    SetMultiprocessorCount(props.multiProcessorCount);
+    SetMaxThreadsPerBlock(props.maxThreadsPerBlock);
+    SetMaxThreadsPerSM(props.maxThreadsPerMultiProcessor);
+    SetWarpSize(props.warpSize);
+    SetRegistersPerSM(props.regsPerMultiprocessor);
+    SetRegistersPerBlock(props.regsPerBlock);
 
     // Max dynamic shared memory per block after opt-in
     int optin_smem=0;
@@ -74,11 +74,11 @@ CAIF_DeviceProperties::CAIF_DeviceProperties(const int device_id):_device_id(dev
                                                    device_id);
     if(attr_status==cudaSuccess)
     {
-      _shared_mem_per_block_optin=static_cast<size_t>(optin_smem);
+      SetSharedMemoryPerBlockOptin(static_cast<size_t>(optin_smem));
     }
     else
     {
-      _shared_mem_per_block_optin=_shared_mem_per_block;
+      SetSharedMemoryPerBlockOptin(SharedMemoryPerBlock());
     }
 
     // Max blocks per SM
@@ -88,7 +88,7 @@ CAIF_DeviceProperties::CAIF_DeviceProperties(const int device_id):_device_id(dev
                                        device_id);
     if(attr_status==cudaSuccess)
     {
-      _max_blocks_per_sm=max_blocks;
+      SetMaxBlocksPerSM(max_blocks);
     }
 #endif
   }
@@ -114,22 +114,22 @@ int CAIF_DeviceProperties::DeviceCount()
 
 CAIF_DeviceProperties &CAIF_DeviceProperties::ForDevice(const int device_id)
 {
-  std::lock_guard<std::mutex> lock(s_cache_mutex);
+  std::lock_guard<std::mutex> lock(CacheMutex());
 
   // Grow cache vector if needed
   const size_t idx=static_cast<size_t>(device_id);
-  if(idx>=s_device_cache.size())
+  if(idx>=DeviceCache().size())
   {
-    s_device_cache.resize(idx+1);
+    DeviceCache().resize(idx+1);
   }
 
   // Lazily create
-  if(s_device_cache[idx]==nullptr)
+  if(DeviceCache()[idx]==nullptr)
   {
-    s_device_cache[idx]=std::make_unique<CAIF_DeviceProperties>(device_id);
+    DeviceCache()[idx]=std::make_unique<CAIF_DeviceProperties>(device_id);
   }
 
-  return *s_device_cache[idx];
+  return *DeviceCache()[idx];
 }
 
 CAIF_DeviceProperties &CAIF_DeviceProperties::Current()

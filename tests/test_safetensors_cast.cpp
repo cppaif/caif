@@ -47,65 +47,177 @@
 #include <string>
 #include <vector>
 
-using namespace instance;
-
-namespace
+namespace instance
 {
-
-void ReportResult(const char *name,bool ok)
-{
-  CAIF_TestHarness::Report(name,ok);
-}
 
 #ifdef USE_CAIF_CUDA
 
-constexpr uint32_t g_rows=8;
-constexpr uint32_t g_cols=16;
+constexpr uint32_t g_caif_stcast_test_rows=8;
+constexpr uint32_t g_caif_stcast_test_cols=16;
+constexpr float g_caif_stcast_test_fp16_tol=3e-3f;
+constexpr float g_caif_stcast_test_bf16_tol=1e-2f;
+constexpr float g_caif_stcast_test_exact_tol=1e-6f;
+constexpr uint32_t g_caif_stcast_test_seed_fp32=1;
+constexpr uint32_t g_caif_stcast_test_seed_bf16=2;
+constexpr uint32_t g_caif_stcast_test_seed_fp32_to_fp16=3;
+constexpr uint32_t g_caif_stcast_test_seed_fp32_to_bf16=4;
+constexpr uint32_t g_caif_stcast_test_seed_bf16_to_fp32=5;
+constexpr uint32_t g_caif_stcast_test_seed_fp16_to_bf16=6;
+constexpr uint32_t g_caif_stcast_test_seed_mod_sign=2;
+constexpr uint32_t g_caif_stcast_test_seed_mod_scale=13;
+constexpr float g_caif_stcast_test_pattern_base=0.25f;
+constexpr float g_caif_stcast_test_pattern_step=0.01f;
 
-class TestParamLayer:public CAIF_DeviceLayer
+//------------------------------------------------------------------------------
+// RAII file-cleanup guard.
+//------------------------------------------------------------------------------
+class CAIF_SafetensorsCastTestCleanupFile
 {
   public:
-    TestParamLayer(CAIF_CudaStream &stream,
-                   CAIF_DataType::CAIF_DataType_e param_dtype):CAIF_DeviceLayer(stream)
+    explicit CAIF_SafetensorsCastTestCleanupFile(const std::string &path):_path(path){}
+    ~CAIF_SafetensorsCastTestCleanupFile()
     {
-      const std::vector<uint32_t> shape={g_rows,g_cols};
-      _param=CAIF_DeviceTensor::Zeros(shape,stream,param_dtype);
-      _grad=CAIF_DeviceTensor::Zeros(shape,stream,CAIF_DataType::CAIF_DataType_e::Float32);
+      if(Path().empty()==false)
+      {
+        std::remove(Path().c_str());
+      }
+    }
+
+    const std::string &Path()const{return _path;}
+
+  protected:
+
+  private:
+    std::string _path;
+};
+
+//------------------------------------------------------------------------------
+// Test-only layer: a single parameter tensor of user-chosen dtype, plus a
+// fp32 gradient tensor.  Forward/Backward are unused (we drive the network's
+// load plumbing directly), so they throw if called.
+//------------------------------------------------------------------------------
+class CAIF_SafetensorsCastTestParamLayer:public CAIF_DeviceLayer
+{
+  public:
+    CAIF_SafetensorsCastTestParamLayer(CAIF_CudaStream &stream,
+                                        CAIF_DataType::CAIF_DataType_e param_dtype)
+      :CAIF_DeviceLayer(stream),
+       _param(MakeZeros(stream,param_dtype)),
+       _grad(MakeZerosFp32(stream))
+    {
     }
 
     CAIF_DeviceTensor ForwardImpl(const CAIF_DeviceTensor &,CAIF_RunContext &)override
     {
-      THROW_CAIFE("TestParamLayer::ForwardImpl not used in test");
+      THROW_CAIFE("CAIF_SafetensorsCastTestParamLayer::ForwardImpl not used in test");
     }
     CAIF_DeviceTensor BackwardImpl(const CAIF_DeviceTensor &,CAIF_RunContext &)override
     {
-      THROW_CAIFE("TestParamLayer::BackwardImpl not used in test");
+      THROW_CAIFE("CAIF_SafetensorsCastTestParamLayer::BackwardImpl not used in test");
     }
     CAIF_RunContext::Subsystem_e SubsystemTag()const override
     {
       return CAIF_RunContext::Subsystem_e::Dense_e;
     }
-    void ZeroGradients()override{_grad.Fill(0.0f);}
-    size_t ParameterTensorCount()const override{return 1;}
-    CAIF_DeviceTensor &ParameterTensor(size_t)override{return _param;}
-    const CAIF_DeviceTensor &ParameterTensor(size_t)const override{return _param;}
-    CAIF_DeviceTensor &GradientTensor(size_t)override{return _grad;}
-    const CAIF_DeviceTensor &GradientTensor(size_t)const override{return _grad;}
-    size_t TotalParameterCount()const override{return _param.TotalElements();}
-    std::string Description()const override{return "TestParamLayer";}
+    void ZeroGradients()override
+    {
+      GradientTensor(0).Fill(0.0f);
+    }
+    size_t ParameterTensorCount()const override
+    {
+      return 1;
+    }
+    CAIF_DeviceTensor &ParameterTensor(size_t)override
+    {
+      return _param;
+    }
+    const CAIF_DeviceTensor &ParameterTensor(size_t)const override
+    {
+      return _param;
+    }
+    CAIF_DeviceTensor &GradientTensor(size_t)override
+    {
+      return _grad;
+    }
+    const CAIF_DeviceTensor &GradientTensor(size_t)const override
+    {
+      return _grad;
+    }
+    size_t TotalParameterCount()const override
+    {
+      return ParameterTensor(0).TotalElements();
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeStorageDtype()const override
+    {
+      return ParameterTensor(0).Dtype();
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeComputeDtype()const override
+    {
+      return ParameterTensor(0).Dtype();
+    }
+    std::string Description()const override
+    {
+      return "CAIF_SafetensorsCastTestParamLayer";
+    }
     std::vector<std::string> ParameterNames(const std::string &prefix)const override
     {
       return {prefix+"weight"};
     }
 
+  protected:
+
   private:
+    static CAIF_DeviceTensor MakeZeros(CAIF_CudaStream &stream,
+                                        CAIF_DataType::CAIF_DataType_e dtype)
+    {
+      const std::vector<uint32_t> shape={g_caif_stcast_test_rows,g_caif_stcast_test_cols};
+      return CAIF_DeviceTensor::Zeros(shape,stream,dtype);
+    }
+    static CAIF_DeviceTensor MakeZerosFp32(CAIF_CudaStream &stream)
+    {
+      const std::vector<uint32_t> shape={g_caif_stcast_test_rows,g_caif_stcast_test_cols};
+      return CAIF_DeviceTensor::Zeros(shape,stream,CAIF_DataType::CAIF_DataType_e::Float32);
+    }
+
     CAIF_DeviceTensor _param;
     CAIF_DeviceTensor _grad;
 };
 
-void CopyFp32HostToDeviceTensor(const std::vector<float> &host,
-                                CAIF_DeviceTensor &dst,
-                                CAIF_CudaStream &stream)
+//------------------------------------------------------------------------------
+// On-load dtype cast correctness tests.
+//------------------------------------------------------------------------------
+class CAIF_SafetensorsCastTests
+{
+  public:
+    static void RunAll();
+
+  protected:
+
+  private:
+    static void CopyFp32HostToDeviceTensor(const std::vector<float> &host,
+                                            CAIF_DeviceTensor &dst,
+                                            CAIF_CudaStream &stream);
+    static std::vector<float> ReadDeviceTensorAsFp32(const CAIF_DeviceTensor &src,
+                                                      CAIF_CudaStream &stream);
+    static std::vector<float> MakeSeedPattern(size_t n,uint32_t seed);
+    static float MaxAbsDiff(const std::vector<float> &a,const std::vector<float> &b);
+    static std::unique_ptr<CAIF_DeviceNetwork> BuildNet(CAIF_DataType::CAIF_DataType_e param_dtype,
+                                                         CAIF_CudaStream &stream);
+    static void FillNetParam(CAIF_DeviceNetwork &net,
+                              const std::vector<float> &data,
+                              CAIF_CudaStream &stream);
+
+    static void TestSameDtypeFp32RoundTrip();
+    static void TestSameDtypeBf16RoundTrip();
+    static void TestCastFp32ToFp16();
+    static void TestCastFp32ToBf16();
+    static void TestCastBf16ToFp32();
+    static void TestCastFp16ToBf16();
+};
+
+void CAIF_SafetensorsCastTests::CopyFp32HostToDeviceTensor(const std::vector<float> &host,
+                                                             CAIF_DeviceTensor &dst,
+                                                             CAIF_CudaStream &stream)
 {
   if(dst.Dtype()==CAIF_DataType::CAIF_DataType_e::Float32)
   {
@@ -119,8 +231,9 @@ void CopyFp32HostToDeviceTensor(const std::vector<float> &host,
   CAIF_Ops::Cast(scratch,dst,ctx);
 }
 
-std::vector<float> ReadDeviceTensorAsFp32(const CAIF_DeviceTensor &src,
-                                          CAIF_CudaStream &stream)
+std::vector<float> CAIF_SafetensorsCastTests::ReadDeviceTensorAsFp32(
+  const CAIF_DeviceTensor &src,
+  CAIF_CudaStream &stream)
 {
   const size_t n=src.TotalElements();
   std::vector<float> out(n);
@@ -139,18 +252,29 @@ std::vector<float> ReadDeviceTensorAsFp32(const CAIF_DeviceTensor &src,
   return out;
 }
 
-std::vector<float> MakeSeedPattern(const size_t n,const uint32_t seed)
+std::vector<float> CAIF_SafetensorsCastTests::MakeSeedPattern(const size_t n,
+                                                                const uint32_t seed)
 {
   std::vector<float> out(n);
   for(size_t i=0;i<n;++i)
   {
-    const float sgn=(((i+seed)%2)==0)?1.0f:-1.0f;
-    out[i]=sgn*0.25f*(1.0f+0.01f*static_cast<float>((i+seed)%13));
+    float sgn=0.0f;
+    if(((i+seed)%g_caif_stcast_test_seed_mod_sign)==0)
+    {
+      sgn=1.0f;
+    }
+    else
+    {
+      sgn=-1.0f;
+    }
+    out[i]=sgn*g_caif_stcast_test_pattern_base*(1.0f+g_caif_stcast_test_pattern_step*
+            static_cast<float>((i+seed)%g_caif_stcast_test_seed_mod_scale));
   }
   return out;
 }
 
-float MaxAbsDiff(const std::vector<float> &a,const std::vector<float> &b)
+float CAIF_SafetensorsCastTests::MaxAbsDiff(const std::vector<float> &a,
+                                              const std::vector<float> &b)
 {
   if(a.size()!=b.size())
   {
@@ -168,47 +292,32 @@ float MaxAbsDiff(const std::vector<float> &a,const std::vector<float> &b)
   return peak;
 }
 
-std::unique_ptr<CAIF_DeviceNetwork> BuildNet(CAIF_DataType::CAIF_DataType_e param_dtype,
-                                             CAIF_CudaStream &stream)
+std::unique_ptr<CAIF_DeviceNetwork> CAIF_SafetensorsCastTests::BuildNet(
+  CAIF_DataType::CAIF_DataType_e param_dtype,
+  CAIF_CudaStream &stream)
 {
   auto net=std::make_unique<CAIF_DeviceNetwork>(stream);
-  net->AddLayer(std::make_unique<TestParamLayer>(stream,param_dtype));
+  net->AddLayer(std::make_unique<CAIF_SafetensorsCastTestParamLayer>(stream,param_dtype));
   return net;
 }
 
-void FillNetParam(CAIF_DeviceNetwork &net,
-                  const std::vector<float> &data,
-                  CAIF_CudaStream &stream)
+void CAIF_SafetensorsCastTests::FillNetParam(CAIF_DeviceNetwork &net,
+                                               const std::vector<float> &data,
+                                               CAIF_CudaStream &stream)
 {
   CopyFp32HostToDeviceTensor(data,net.Layer(0).ParameterTensor(0),stream);
 }
 
-struct CleanupFile
-{
-  std::string path;
-  ~CleanupFile()
-  {
-    if(path.empty()==false)
-    {
-      std::remove(path.c_str());
-    }
-  }
-};
-
-// Round-trip tolerance: fp16 rounding is ~2e-3; bf16 is ~8e-3.
-constexpr float g_fp16_tol=3e-3f;
-constexpr float g_bf16_tol=1e-2f;
-
-void TestSameDtypeFp32RoundTrip()
+void CAIF_SafetensorsCastTests::TestSameDtypeFp32RoundTrip()
 {
   try
   {
     const std::string path="test_safetensors_cast_fp32.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,1);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_fp32);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::Float32,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -220,21 +329,22 @@ void TestSameDtypeFp32RoundTrip()
     const auto loaded=
       ReadDeviceTensorAsFp32(load_net->Layer(0).ParameterTensor(0),stream);
     const float diff=MaxAbsDiff(pattern,loaded);
-    ReportResult("OnLoadCast::SameDtypeFp32RoundTrip",diff<=1e-6f);
+    CAIF_TestHarness::Report("OnLoadCast::SameDtypeFp32RoundTrip",
+                              diff<=g_caif_stcast_test_exact_tol);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::SameDtypeFp32RoundTrip")
 }
 
-void TestSameDtypeBf16RoundTrip()
+void CAIF_SafetensorsCastTests::TestSameDtypeBf16RoundTrip()
 {
   try
   {
     const std::string path="test_safetensors_cast_bf16.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,2);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_bf16);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::BFloat16,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -254,21 +364,22 @@ void TestSameDtypeBf16RoundTrip()
     const auto dt=load_net->Layer(0).ParameterTensor(0).Dtype();
     const bool dtype_ok=(dt==CAIF_DataType::CAIF_DataType_e::BFloat16);
 
-    ReportResult("OnLoadCast::SameDtypeBf16RoundTrip",diff<=1e-6f&&dtype_ok);
+    CAIF_TestHarness::Report("OnLoadCast::SameDtypeBf16RoundTrip",
+                              diff<=g_caif_stcast_test_exact_tol&&dtype_ok);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::SameDtypeBf16RoundTrip")
 }
 
-void TestCastFp32ToFp16()
+void CAIF_SafetensorsCastTests::TestCastFp32ToFp16()
 {
   try
   {
     const std::string path="test_safetensors_cast_fp32_to_fp16.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,3);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_fp32_to_fp16);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::Float32,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -282,21 +393,22 @@ void TestCastFp32ToFp16()
     const auto dt=load_net->Layer(0).ParameterTensor(0).Dtype();
     const bool dtype_ok=(dt==CAIF_DataType::CAIF_DataType_e::Float16);
     const float diff=MaxAbsDiff(pattern,loaded);
-    ReportResult("OnLoadCast::Fp32FileToFp16Param",diff<=g_fp16_tol&&dtype_ok);
+    CAIF_TestHarness::Report("OnLoadCast::Fp32FileToFp16Param",
+                              diff<=g_caif_stcast_test_fp16_tol&&dtype_ok);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::Fp32FileToFp16Param")
 }
 
-void TestCastFp32ToBf16()
+void CAIF_SafetensorsCastTests::TestCastFp32ToBf16()
 {
   try
   {
     const std::string path="test_safetensors_cast_fp32_to_bf16.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,4);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_fp32_to_bf16);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::Float32,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -310,21 +422,22 @@ void TestCastFp32ToBf16()
     const auto dt=load_net->Layer(0).ParameterTensor(0).Dtype();
     const bool dtype_ok=(dt==CAIF_DataType::CAIF_DataType_e::BFloat16);
     const float diff=MaxAbsDiff(pattern,loaded);
-    ReportResult("OnLoadCast::Fp32FileToBf16Param",diff<=g_bf16_tol&&dtype_ok);
+    CAIF_TestHarness::Report("OnLoadCast::Fp32FileToBf16Param",
+                              diff<=g_caif_stcast_test_bf16_tol&&dtype_ok);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::Fp32FileToBf16Param")
 }
 
-void TestCastBf16ToFp32()
+void CAIF_SafetensorsCastTests::TestCastBf16ToFp32()
 {
   try
   {
     const std::string path="test_safetensors_cast_bf16_to_fp32.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,5);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_bf16_to_fp32);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::BFloat16,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -345,21 +458,22 @@ void TestCastBf16ToFp32()
     // Cast from bf16→fp32 is exact, so this should match the already-rounded
     // bf16 values to ~0.
     const float diff=MaxAbsDiff(saved_as_fp32,loaded);
-    ReportResult("OnLoadCast::Bf16FileToFp32Param",diff<=1e-6f&&dtype_ok);
+    CAIF_TestHarness::Report("OnLoadCast::Bf16FileToFp32Param",
+                              diff<=g_caif_stcast_test_exact_tol&&dtype_ok);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::Bf16FileToFp32Param")
 }
 
-void TestCastFp16ToBf16()
+void CAIF_SafetensorsCastTests::TestCastFp16ToBf16()
 {
   try
   {
     const std::string path="test_safetensors_cast_fp16_to_bf16.safetensors";
-    CleanupFile cleanup{path};
+    CAIF_SafetensorsCastTestCleanupFile cleanup(path);
 
     CAIF_CudaStream stream;
-    const size_t n=static_cast<size_t>(g_rows)*g_cols;
-    const auto pattern=MakeSeedPattern(n,6);
+    const size_t n=static_cast<size_t>(g_caif_stcast_test_rows)*g_caif_stcast_test_cols;
+    const auto pattern=MakeSeedPattern(n,g_caif_stcast_test_seed_fp16_to_bf16);
 
     auto save_net=BuildNet(CAIF_DataType::CAIF_DataType_e::Float16,stream);
     FillNetParam(*save_net,pattern,stream);
@@ -373,31 +487,38 @@ void TestCastFp16ToBf16()
     const auto dt=load_net->Layer(0).ParameterTensor(0).Dtype();
     const bool dtype_ok=(dt==CAIF_DataType::CAIF_DataType_e::BFloat16);
     // Two rounding stages (fp16 then bf16) compared against the original
-    // fp32 pattern — the looser tolerance (g_bf16_tol) covers both.
+    // fp32 pattern — the looser tolerance (g_caif_stcast_test_bf16_tol) covers both.
     const float diff=MaxAbsDiff(pattern,loaded);
-    ReportResult("OnLoadCast::Fp16FileToBf16Param",diff<=g_bf16_tol&&dtype_ok);
+    CAIF_TestHarness::Report("OnLoadCast::Fp16FileToBf16Param",
+                              diff<=g_caif_stcast_test_bf16_tol&&dtype_ok);
   }
   CAIF_TEST_CATCH_BLOCK("OnLoadCast::Fp16FileToBf16Param")
 }
 
-#endif// USE_CAIF_CUDA
-
-}// anon
-
-int main()
+void CAIF_SafetensorsCastTests::RunAll()
 {
-  ISE_Out::Out()<<"=== Safetensors On-Load Cast Tests ===\n\n";
-
-#ifdef USE_CAIF_CUDA
+  ISE_Out::Out()<<"=== Safetensors On-Load Cast Tests ==="
+                <<"\n\n";
   TestSameDtypeFp32RoundTrip();
   TestSameDtypeBf16RoundTrip();
   TestCastFp32ToFp16();
   TestCastFp32ToBf16();
   TestCastBf16ToFp32();
   TestCastFp16ToBf16();
-#else
-  ISE_Out::Out()<<"  (CUDA not enabled; tests skipped)\n";
-#endif
+}
 
-  return CAIF_TestHarness::FinalExitCode();
+#endif// USE_CAIF_CUDA
+
+}//end instance namespace
+
+int main()
+{
+#ifdef USE_CAIF_CUDA
+  instance::CAIF_SafetensorsCastTests::RunAll();
+  return instance::CAIF_TestHarness::FinalExitCode();
+#else
+  ISE_Out::Out()<<"  (CUDA not enabled; tests skipped)"
+                <<"\n";
+  return 0;
+#endif
 }

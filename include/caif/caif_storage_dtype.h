@@ -36,6 +36,13 @@
 namespace instance
 {
 
+// CAIF_Base exemption: CAIF_StorageDtype_t is a pure compile-time type
+// trait — never instantiated (its ctor and dtor are =delete), it only maps
+// a C++ storage type to a CAIF_DataType_e at compile time. CAIF_Base brings
+// a vtable plus ISE_Base logging machinery that only makes sense for live,
+// constructible objects; a never-instantiated trait has none. Exempt for
+// the same reason as CAIF_Exception. The fp32/fp16/bf16/int4/int8
+// specializations in the sibling headers share this exemption.
 template<typename T>
 class CAIF_StorageDtype_t
 {

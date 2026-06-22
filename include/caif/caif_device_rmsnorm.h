@@ -67,7 +67,25 @@ class CAIF_DeviceRMSNorm:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     // Accessors (StorageDtype()/ComputeDtype() inherited from
     // CAIF_DeviceLayerTyped — no per-layer copy needed).
     uint32_t Dim()const{return _dim;}
+    void SetDim(uint32_t dim){_dim=dim;}
     float Epsilon()const{return _epsilon;}
+    void SetEpsilon(float epsilon){_epsilon=epsilon;}
+
+    CAIF_DeviceTensor &Gamma(){return _gamma;}
+    const CAIF_DeviceTensor &Gamma()const{return _gamma;}
+    void SetGamma(CAIF_DeviceTensor &&gamma){_gamma=std::move(gamma);}
+
+    CAIF_DeviceTensor &GammaGrad(){return _gamma_grad;}
+    const CAIF_DeviceTensor &GammaGrad()const{return _gamma_grad;}
+    void SetGammaGrad(CAIF_DeviceTensor &&gamma_grad){_gamma_grad=std::move(gamma_grad);}
+
+    CAIF_DeviceTensor &LastInput(){return _last_input;}
+    const CAIF_DeviceTensor &LastInput()const{return _last_input;}
+    void SetLastInput(CAIF_DeviceTensor &&last_input){_last_input=std::move(last_input);}
+
+    CAIF_DeviceTensor &RmsCache(){return _rms_cache;}
+    const CAIF_DeviceTensor &RmsCache()const{return _rms_cache;}
+    void SetRmsCache(CAIF_DeviceTensor &&rms_cache){_rms_cache=std::move(rms_cache);}
 
     /**
      * @brief Replace the gamma weight tensor. Takes ownership by move.

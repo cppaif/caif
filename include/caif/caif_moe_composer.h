@@ -19,9 +19,12 @@
 #ifndef CAIF_MOE_COMPOSER_H
 #define CAIF_MOE_COMPOSER_H
 
+#include "caif_base.h"
 #include "caif_device_pre_norm_block.h"
 #include "caif_device_network.h"
 #include "caif_device_moe_layer.h"
+#include "caif_moe_composer_block_config.h"
+#include "caif_moe_composer_model_config.h"
 #include "caif_device_positional_encoding.h"
 #include "caif_cuda_stream.h"
 #include "caif_data_type.h"
@@ -57,80 +60,9 @@ namespace instance
  *   Final RMSNorm
  *   LinearHead (tied to embedding when tie_weights == true)
  */
-class CAIF_MoEComposer
+class CAIF_MoEComposer:public CAIF_Base
 {
   public:
-
-    struct BlockConfig_t
-    {
-      // Attention
-      uint32_t dim;
-      uint32_t num_heads;
-      uint32_t num_kv_heads;
-      float    attention_dropout;
-      bool     causal;
-      bool     use_rope;
-      float    rope_base;
-      int      rope_style;
-
-      // Norms (pre-attn and pre-moe)
-      float    norm_eps;
-
-      // MoE FFN — flattened fields forwarded to CAIF_DeviceMoELayer ctor
-      uint32_t moe_input_dim;
-      uint32_t moe_hidden_dim;
-      uint32_t moe_num_experts;
-      uint32_t moe_top_k;
-      bool     moe_expert_use_gated;
-      bool     moe_expert_use_bias;
-      uint32_t moe_num_shared_experts;
-      uint32_t moe_shared_hidden_dim;
-      bool     moe_router_use_bias;
-      float    moe_router_noise_std;
-      float    moe_capacity_factor;
-      CAIF_DeviceMoELayer<float,float>::OverflowStrategy_e moe_overflow_strategy;
-      float    moe_balance_loss_weight;
-      float    moe_z_loss_weight;
-
-      // Naming prefixes baked into the produced CAIF_DevicePreNormBlock<float,float>.
-      // Callers supply the scheme they want (e.g. an HF-style naming
-      // profile, or literal strings for tests).
-      std::string norm1_prefix;
-      std::string attn_prefix;
-      std::string norm2_prefix;
-      std::string moe_prefix;
-
-      // Precision
-      CAIF_DataType::CAIF_DataType_e storage_dtype=CAIF_DataType::CAIF_DataType_e::Float32;
-      CAIF_DataType::CAIF_DataType_e compute_dtype=CAIF_DataType::CAIF_DataType_e::Float32;
-    };
-
-    struct ModelConfig_t
-    {
-      // Embedding / head
-      uint32_t vocab_size;
-      uint32_t max_seq_len;
-      uint32_t output_dim;         // 0 = vocab_size
-      bool     tie_weights;
-
-      // Optional positional encoding (skipped when use_rope == true in block)
-      PositionalEncodingMode_e pe_mode;
-
-      // Final norm epsilon
-      float    final_norm_eps;
-
-      // Per-layer MoE block configuration — applied to every layer.
-      // BuildModel uses the naming prefixes in block_template verbatim
-      // for every layer; per-layer differentiation (e.g., "layers.0.*",
-      // "layers.1.*") is the caller's responsibility and is applied at
-      // ParameterNames(prefix) query time on each network layer.
-      uint32_t      num_layers;
-      BlockConfig_t block_template;
-
-      // Precision (propagated to block_template and head at BuildModel time)
-      CAIF_DataType::CAIF_DataType_e storage_dtype=CAIF_DataType::CAIF_DataType_e::Float32;
-      CAIF_DataType::CAIF_DataType_e compute_dtype=CAIF_DataType::CAIF_DataType_e::Float32;
-    };
 
     /**
      * @brief Build a single MoE transformer block.
@@ -139,7 +71,7 @@ class CAIF_MoEComposer
      * (RMSNorm, MHA, RMSNorm, MoELayer) wrapped in a CAIF_DevicePreNormBlock<float,float>.
      */
     static std::unique_ptr<CAIF_DevicePreNormBlock<float,float>>
-      BuildMoEBlock(const BlockConfig_t &cfg,CAIF_CudaStream &stream);
+      BuildMoEBlock(const CAIF_MoEComposerBlockConfig &cfg,CAIF_CudaStream &stream);
 
     /**
      * @brief Build a full MoE decoder-only model.
@@ -152,13 +84,25 @@ class CAIF_MoEComposer
      * bypass the composer and access the primitives directly.
      */
     static std::unique_ptr<CAIF_DeviceNetwork>
-      BuildModel(const ModelConfig_t &cfg,CAIF_CudaStream &stream);
+      BuildModel(const CAIF_MoEComposerModelConfig &cfg,CAIF_CudaStream &stream);
 
   protected:
 
   private:
 
     CAIF_MoEComposer()=delete;
+
+    // Dtype-templated builders. The public BuildModel/BuildMoEBlock dispatch on
+    // the config's compute/storage dtype to the matching instantiation so a
+    // bf16 (or fp16) model assembles end to end, not just <float,float>.
+    template<typename ComputeT,typename StorageT>
+    static std::unique_ptr<CAIF_DevicePreNormBlock<ComputeT,StorageT>> BuildMoEBlockImpl(
+                                                                           const CAIF_MoEComposerBlockConfig &cfg,
+                                                                           CAIF_CudaStream &stream);
+
+    template<typename ComputeT,typename StorageT>
+    static std::unique_ptr<CAIF_DeviceNetwork> BuildModelImpl(const CAIF_MoEComposerModelConfig &cfg,
+                                                              CAIF_CudaStream &stream);
 };
 
 }//end instance namespace

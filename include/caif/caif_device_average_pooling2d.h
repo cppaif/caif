@@ -29,7 +29,7 @@ class CAIF_DeviceAveragePooling2D:public CAIF_DevicePooling2D<ComputeT,StorageT>
 {
   public:
     typedef CAIF_DevicePooling2D<ComputeT,StorageT> Base_t;
-    typedef typename Base_t::Config_t Config_t;
+    typedef CAIF_DevicePooling2DConfig Config_t;
 
     CAIF_DeviceAveragePooling2D(const Config_t &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceAveragePooling2D()override=default;

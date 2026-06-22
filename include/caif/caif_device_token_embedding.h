@@ -23,6 +23,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_token_embedding_config.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
 #include <cstdint>
@@ -37,14 +38,7 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceTokenEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t vocab_size;
-      uint32_t dim;
-    };
-
-    CAIF_DeviceTokenEmbedding(const Config_t &config,
-                              CAIF_CudaStream &stream);
+    CAIF_DeviceTokenEmbedding(const CAIF_DeviceTokenEmbeddingConfig &config,CAIF_CudaStream &stream);
     ~CAIF_DeviceTokenEmbedding()override;
 
     // Move
@@ -78,13 +72,45 @@ class CAIF_DeviceTokenEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 
     // Accessors (StorageDtype()/ComputeDtype() inherited from
     // CAIF_DeviceLayerTyped — no per-layer copy needed).
-    uint32_t VocabSize()const{return _config.vocab_size;}
-    uint32_t Dim()const{return _config.dim;}
+    uint32_t VocabSize()const{return Config().VocabSize();}
+    uint32_t Dim()const{return Config().Dim();}
+    float OutputScale()const{return Config().OutputScale();}
+    const CAIF_DeviceTokenEmbeddingConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DeviceTokenEmbeddingConfig &config){_config=config;}
+
+    CAIF_DeviceTensor &EmbeddingTable(){return *_embedding_table;}
+    const CAIF_DeviceTensor &EmbeddingTable()const{return *_embedding_table;}
+
+    CAIF_DeviceTensor &EmbeddingTableGrad(){return *_embedding_table_grad;}
+    const CAIF_DeviceTensor &EmbeddingTableGrad()const{return *_embedding_table_grad;}
+    void SetEmbeddingTableGrad(CAIF_DeviceTensor &&t){*_embedding_table_grad=std::move(t);}
+
+    // GPU scratch buffer holding the current batch's token IDs (one
+    // uint32_t per token) for the embedding-lookup CUDA kernel, which
+    // takes a raw `const unsigned int *` argument. Hand-managed via
+    // cudaMalloc / cudaFree (see EnsureTokenIdCapacity / FreeTokenIdBuffer)
+    // because it's a kernel-API scratch buffer, not a parameter or
+    // gradient — no shape, dtype, save/load, or grad accumulation is
+    // needed. The `uint32_t *` type spells "pointer to the start of a
+    // contiguous device buffer of uint32_t"; the buffer's length is
+    // tracked separately in `_token_ids_capacity` (the standard C idiom
+    // for a runtime-sized buffer).
+    uint32_t *TokenIdsDevice(){return _token_ids_device;}
+    const uint32_t *TokenIdsDevice()const{return _token_ids_device;}
+    void SetTokenIdsDevice(uint32_t *p){_token_ids_device=p;}
+
+    size_t TokenIdsCapacity()const{return _token_ids_capacity;}
+    void SetTokenIdsCapacity(size_t cap){_token_ids_capacity=cap;}
+
+    uint32_t CachedNumTokens()const{return _cached_num_tokens;}
+    void SetCachedNumTokens(uint32_t n){_cached_num_tokens=n;}
 
     /**
      * @brief Replace the embedding table with a tensor of shape [vocab_size, dim].
+     * Virtual so CAIF_DeviceSharedTokenEmbedding can override and throw — a
+     * borrower cannot replace the donor's storage through its tied pointer.
      */
-    void LoadEmbeddingTable(CAIF_DeviceTensor &&table);
+    virtual void LoadEmbeddingTable(CAIF_DeviceTensor &&table);
 
   public:
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
@@ -97,14 +123,50 @@ class CAIF_DeviceTokenEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::CublasComputeType;
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
+    /**
+     * @brief Subclass-only constructor that borrows the table + grad from a
+     * donor instance (T5-style shared encoder/decoder embeddings). Stores
+     * the donor's pointers; allocates nothing of its own. The subclass
+     * (CAIF_DeviceSharedTokenEmbedding) is responsible for nulling these
+     * pointers before this base destructor runs, so the base destructor's
+     * `delete` becomes a `delete nullptr` no-op rather than freeing the
+     * donor's storage. Shape contract: shared_table.Shape() == [vocab_size, dim].
+     */
+    CAIF_DeviceTokenEmbedding(const CAIF_DeviceTokenEmbeddingConfig &config,
+                              CAIF_DeviceTensor &shared_table,
+                              CAIF_DeviceTensor &shared_grad,
+                              CAIF_CudaStream &stream);
+
+    // Pointer-rebinding setters + getters used by CAIF_DeviceSharedTokenEmbedding's
+    // destructor (and the base's own move ctor / op=) to inspect and null these
+    // out before storage gets freed (see the `_embedding_table` data-member
+    // comment below for the full rationale). Protected because the borrower
+    // subclass needs to call them; not public because external callers must not
+    // rebind ownership behind the layer's back.
+    CAIF_DeviceTensor *EmbeddingTablePtr()const{return _embedding_table;}
+    CAIF_DeviceTensor *EmbeddingTableGradPtr()const{return _embedding_table_grad;}
+    void SetEmbeddingTablePtr(CAIF_DeviceTensor *p){_embedding_table=p;}
+    void SetEmbeddingTableGradPtr(CAIF_DeviceTensor *p){_embedding_table_grad=p;}
+
   private:
-    CAIF_DeviceTensor &EmbeddingTableMut(){return _embedding_table;}
-    void SetEmbeddingTable(CAIF_DeviceTensor &&t){_embedding_table=std::move(t);}
+    CAIF_DeviceTensor &EmbeddingTableMut(){return *_embedding_table;}
+    void SetEmbeddingTable(CAIF_DeviceTensor &&t){*_embedding_table=std::move(t);}
 
-    Config_t _config;
+    CAIF_DeviceTokenEmbeddingConfig _config;
 
-    CAIF_DeviceTensor _embedding_table;       // [vocab_size, dim] at StorageT
-    CAIF_DeviceTensor _embedding_table_grad;  // [vocab_size, dim] at StorageT
+    // `_embedding_table` and `_embedding_table_grad` are raw pointers rather
+    // than value members so that CAIF_DeviceSharedTokenEmbedding can borrow
+    // these from a donor instance (the shared encoder/decoder embedding
+    // case) without duplicating the storage. The standard owning constructor
+    // `new`s these tensors and the destructor `delete`s them; the protected
+    // borrower constructor stores donor pointers and the borrower subclass
+    // nulls them before the base destructor runs so `delete nullptr` leaves
+    // the donor's storage intact. Every read/write of the embedding table
+    // and its gradient goes through EmbeddingTable() / EmbeddingTableGrad()
+    // accessors, which deref these pointers — no call site needs to know
+    // whether storage is owned or borrowed.
+    CAIF_DeviceTensor *_embedding_table;       // [vocab_size, dim] at StorageT
+    CAIF_DeviceTensor *_embedding_table_grad;  // [vocab_size, dim] at StorageT
 
     // Internal uint32 device buffer for token IDs
     uint32_t *_token_ids_device;

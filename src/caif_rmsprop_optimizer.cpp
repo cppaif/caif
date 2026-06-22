@@ -14,6 +14,7 @@
 
 #include "caif_rmsprop_optimizer.h"
 #include "caif_ops.h"
+#include "caif_cuda_kernels_optimizers.cuh"
 #include "caif_exception.h"
 
 namespace instance
@@ -57,6 +58,45 @@ void CAIF_RmspropOptimizer::UpdateOne(CAIF_DeviceTensor &target,
                             WeightDecay());
   }
   CAIF_CATCH_BLOCK()
+}
+
+bool CAIF_RmspropOptimizer::BatchedStep(CAIF_DeviceNetwork &network)
+{
+#ifdef USE_CAIF_CUDA
+  try
+  {
+    if(BuildSharedBatch(network)==false)
+    {
+      return false;
+    }
+    const int n=BatchNumTensors();
+    HostAvgSqPtrsMut().resize(static_cast<size_t>(n));
+    for(int idx=0;idx<n;++idx)
+    {
+      HostAvgSqPtrsMut()[idx]=AvgSqsMut()[static_cast<size_t>(idx)].DevicePtr<float>();
+    }
+    UploadScratch(DeviceAvgSqPtrsMut(),
+                  HostAvgSqPtrsMut().data(),
+                  n*sizeof(float *),
+                  Stream());
+    launch_multi_tensor_rmsprop<float>(BatchTargetsDevice(),
+                                       BatchGradsDevice(),
+                                       reinterpret_cast<float *const *>(DeviceAvgSqPtrsMut().DeviceDataRaw()),
+                                       BatchOffsetsDevice(),
+                                       n,
+                                       BatchTotalElements(),
+                                       LearningRate(),
+                                       Alpha(),
+                                       Epsilon(),
+                                       WeightDecay(),
+                                       Stream().Handle());
+    return true;
+  }
+  CAIF_CATCH_BLOCK()
+#else
+  (void)network;
+  return false;
+#endif
 }
 
 }//end instance namespace

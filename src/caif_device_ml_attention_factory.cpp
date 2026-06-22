@@ -34,10 +34,17 @@ std::unique_ptr<CAIF_DeviceLayer> MakeMLA(uint32_t dim,
                                            float rms_norm_eps,
                                            CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceMLAttention<ComputeT,StorageT>::MLAConfig_t cfg{
-      dim,num_heads,q_lora_rank,kv_lora_rank,
-      qk_rope_head_dim,qk_nope_head_dim,v_head_dim,
-      causal,rope_base,rope_style,rms_norm_eps};
+  CAIF_DeviceMLAttentionConfig cfg(dim,
+                                   num_heads,
+                                   q_lora_rank,
+                                   kv_lora_rank,
+                                   qk_rope_head_dim,
+                                   qk_nope_head_dim,
+                                   v_head_dim,
+                                   causal,
+                                   rope_base,
+                                   rms_norm_eps);
+  cfg.SetRopeStyle(rope_style);
   return std::make_unique<CAIF_DeviceMLAttention<ComputeT,StorageT>>(cfg,stream);
 }
 

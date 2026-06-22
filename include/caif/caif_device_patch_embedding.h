@@ -26,6 +26,7 @@
 #pragma once
 
 #include "caif_device_layer_typed.h"
+#include "caif_device_patch_embedding_config.h"
 #include "caif_run_context.h"
 #include "caif_constants.h"
 #include "caif_data_type.h"
@@ -41,17 +42,8 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
 {
   public:
-    struct Config_t
-    {
-      uint32_t image_height;
-      uint32_t image_width;
-      uint32_t channels;
-      uint32_t patch_size;
-      uint32_t dim;
-      bool use_cls_token;
-    };
 
-    CAIF_DevicePatchEmbedding(const Config_t &config,
+    CAIF_DevicePatchEmbedding(const CAIF_DevicePatchEmbeddingConfig &config,
                               CAIF_CudaStream &stream);
     ~CAIF_DevicePatchEmbedding()override=default;
 
@@ -76,10 +68,10 @@ class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     std::string Description()const override;
     std::vector<std::string> ParameterNames(const std::string &prefix="")const override;
 
-    uint32_t PatchSize()const{return _config.patch_size;}
-    uint32_t Dim()const{return _config.dim;}
+    uint32_t PatchSize()const{return Config().PatchSize();}
+    uint32_t Dim()const{return Config().Dim();}
     uint32_t NumPatches()const{return _num_patches;}
-    bool UseCLSToken()const{return _config.use_cls_token;}
+    bool UseCLSToken()const{return Config().UseCLSToken();}
 
   public:
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StorageDtype;
@@ -93,17 +85,52 @@ class CAIF_DevicePatchEmbedding:public CAIF_DeviceLayerTyped<ComputeT,StorageT>
     using CAIF_DeviceLayerTyped<ComputeT,StorageT>::StoragePtr;
 
   private:
-    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
-    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
-    void SetWProj(CAIF_DeviceTensor &&t){_w_proj=std::move(t);}
-    void SetCLSToken(CAIF_DeviceTensor &&t){_cls_token=std::move(t);}
-    void SetBProj(CAIF_DeviceTensor &&t){_b_proj=std::move(t);}
-    void SetGradWProj(CAIF_DeviceTensor &&t){_grad_w_proj=std::move(t);}
-    void SetGradBProj(CAIF_DeviceTensor &&t){_grad_b_proj=std::move(t);}
-    void SetGradCls(CAIF_DeviceTensor &&t){_grad_cls=std::move(t);}
+    const CAIF_DevicePatchEmbeddingConfig &Config()const{return _config;}
+    void SetConfig(const CAIF_DevicePatchEmbeddingConfig &c){_config=c;}
+    uint32_t NumPatchesH()const{return _num_patches_h;}
+    void SetNumPatchesH(const uint32_t v){_num_patches_h=v;}
+    uint32_t NumPatchesW()const{return _num_patches_w;}
+    void SetNumPatchesW(const uint32_t v){_num_patches_w=v;}
+    void SetNumPatches(const uint32_t v){_num_patches=v;}
     uint32_t PatchFlatDim()const{return _patch_flat_dim;}
+    void SetPatchFlatDim(const uint32_t v){_patch_flat_dim=v;}
 
-    Config_t _config;
+    const CAIF_DeviceTensor &WProj()const{return _w_proj;}
+    CAIF_DeviceTensor &WProjMut(){return _w_proj;}
+    void SetWProj(CAIF_DeviceTensor &&t){_w_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &BProj()const{return _b_proj;}
+    CAIF_DeviceTensor &BProj(){return _b_proj;}
+    void SetBProj(CAIF_DeviceTensor &&t){_b_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &CLSToken()const{return _cls_token;}
+    CAIF_DeviceTensor &CLSTokenMut(){return _cls_token;}
+    void SetCLSToken(CAIF_DeviceTensor &&t){_cls_token=std::move(t);}
+
+    const CAIF_DeviceTensor &GradWProj()const{return _grad_w_proj;}
+    CAIF_DeviceTensor &GradWProj(){return _grad_w_proj;}
+    void SetGradWProj(CAIF_DeviceTensor &&t){_grad_w_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &GradBProj()const{return _grad_b_proj;}
+    CAIF_DeviceTensor &GradBProj(){return _grad_b_proj;}
+    void SetGradBProj(CAIF_DeviceTensor &&t){_grad_b_proj=std::move(t);}
+
+    const CAIF_DeviceTensor &GradCls()const{return _grad_cls;}
+    CAIF_DeviceTensor &GradCls(){return _grad_cls;}
+    void SetGradCls(CAIF_DeviceTensor &&t){_grad_cls=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedInput()const{return _cached_input;}
+    CAIF_DeviceTensor &CachedInput(){return _cached_input;}
+    void SetCachedInput(CAIF_DeviceTensor &&t){_cached_input=std::move(t);}
+
+    const CAIF_DeviceTensor &CachedPatches()const{return _cached_patches;}
+    CAIF_DeviceTensor &CachedPatches(){return _cached_patches;}
+    void SetCachedPatches(CAIF_DeviceTensor &&t){_cached_patches=std::move(t);}
+
+    uint32_t CachedBatch()const{return _cached_batch;}
+    void SetCachedBatch(const uint32_t v){_cached_batch=v;}
+
+    CAIF_DevicePatchEmbeddingConfig _config;
     uint32_t _num_patches_h;
     uint32_t _num_patches_w;
     uint32_t _num_patches;

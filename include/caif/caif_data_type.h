@@ -52,7 +52,7 @@ namespace instance
 
       size_t ElementSizeBytes()const
       {
-        switch(_v)
+        switch(Value())
         {
           case CAIF_DataType_e::Float32:return 4;
           case CAIF_DataType_e::Float64:return 8;
@@ -79,7 +79,7 @@ namespace instance
        */
       size_t StorageSizeBytes(size_t num_elements)const
       {
-        if(_v==CAIF_DataType_e::Int4)
+        if(Value()==CAIF_DataType_e::Int4)
         {
           return (num_elements+1)/2;
         }
@@ -87,119 +87,10 @@ namespace instance
       }
 
       /**
-       * @brief Human-readable type name (e.g. "fp32", "bf16", "int4")
+       * @brief Human-readable type name (e.g. "fp32", "bf16", "int4").
+       * Defined out-of-line in src/caif_data_type.cpp.
        */
-      std::string Name()const
-      {
-        switch(_v)
-        {
-          case CAIF_DataType_e::Float32:return "fp32";
-          case CAIF_DataType_e::Float64:return "fp64";
-          case CAIF_DataType_e::Float16:return "fp16";
-          case CAIF_DataType_e::BFloat16:return "bf16";
-          case CAIF_DataType_e::Int4:return "int4";
-          case CAIF_DataType_e::Int8:return "int8";
-          case CAIF_DataType_e::Int16:return "int16";
-          case CAIF_DataType_e::Int32:return "int32";
-          case CAIF_DataType_e::Int64:return "int64";
-          case CAIF_DataType_e::UInt8:return "uint8";
-          case CAIF_DataType_e::UInt16:return "uint16";
-          case CAIF_DataType_e::UInt32:return "uint32";
-          case CAIF_DataType_e::UInt64:return "uint64";
-          case CAIF_DataType_e::Bool:return "bool";
-        }
-        return "unknown";
-      }
-
-      /**
-       * @brief SafeTensors dtype string (e.g. "F32", "BF16", "I8")
-       */
-      std::string SafeTensorsName()const
-      {
-        switch(_v)
-        {
-          case CAIF_DataType_e::Float32:return "F32";
-          case CAIF_DataType_e::Float64:return "F64";
-          case CAIF_DataType_e::Float16:return "F16";
-          case CAIF_DataType_e::BFloat16:return "BF16";
-          case CAIF_DataType_e::Int8:return "I8";
-          case CAIF_DataType_e::Int16:return "I16";
-          case CAIF_DataType_e::Int32:return "I32";
-          case CAIF_DataType_e::Int64:return "I64";
-          case CAIF_DataType_e::UInt8:return "U8";
-          case CAIF_DataType_e::UInt16:return "U16";
-          case CAIF_DataType_e::UInt32:return "U32";
-          case CAIF_DataType_e::UInt64:return "U64";
-          case CAIF_DataType_e::Bool:return "BOOL";
-          case CAIF_DataType_e::Int4:return "I4";
-        }
-        return "F32";
-      }
-
-      /**
-       * @brief Parse SafeTensors dtype string to CAIF_DataType_e.
-       * Returns Float32 for unrecognized strings.
-       */
-      static CAIF_DataType_e FromSafeTensorsName(const std::string &name)
-      {
-        if(name=="F32")
-        {
-          return CAIF_DataType_e::Float32;
-        }
-        if(name=="F64")
-        {
-          return CAIF_DataType_e::Float64;
-        }
-        if(name=="F16")
-        {
-          return CAIF_DataType_e::Float16;
-        }
-        if(name=="BF16")
-        {
-          return CAIF_DataType_e::BFloat16;
-        }
-        if(name=="I8")
-        {
-          return CAIF_DataType_e::Int8;
-        }
-        if(name=="I16")
-        {
-          return CAIF_DataType_e::Int16;
-        }
-        if(name=="I32")
-        {
-          return CAIF_DataType_e::Int32;
-        }
-        if(name=="I64")
-        {
-          return CAIF_DataType_e::Int64;
-        }
-        if(name=="U8")
-        {
-          return CAIF_DataType_e::UInt8;
-        }
-        if(name=="U16")
-        {
-          return CAIF_DataType_e::UInt16;
-        }
-        if(name=="U32")
-        {
-          return CAIF_DataType_e::UInt32;
-        }
-        if(name=="U64")
-        {
-          return CAIF_DataType_e::UInt64;
-        }
-        if(name=="BOOL")
-        {
-          return CAIF_DataType_e::Bool;
-        }
-        if(name=="I4")
-        {
-          return CAIF_DataType_e::Int4;
-        }
-        return CAIF_DataType_e::Float32;
-      }
+      std::string Name()const;
 
       CAIF_DataType_e Value()const{return _v;}
 

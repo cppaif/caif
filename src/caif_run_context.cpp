@@ -29,22 +29,22 @@ namespace instance
 
 CAIF_RunContext::Subsystem_e CAIF_RunContext::CurrentSubsystem()const
 {
-  if(_subsystem_stack.empty()==true)
+  if(SubsystemStack().empty()==true)
   {
     return Subsystem_e::None_e;
   }
-  return _subsystem_stack.back();
+  return SubsystemStack().back();
 }
 
 void CAIF_RunContext::PopSubsystem()
 {
   try
   {
-    if(_subsystem_stack.empty()==true)
+    if(SubsystemStack().empty()==true)
     {
       THROW_CAIFE("CAIF_RunContext::PopSubsystem: subsystem stack is empty");
     }
-    _subsystem_stack.pop_back();
+    SubsystemStack().pop_back();
   }
   CAIF_CATCH_BLOCK();
 }

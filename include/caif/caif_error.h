@@ -42,23 +42,18 @@ namespace instance
       {
       }
 
-      explicit CAIF_Error(const char *message)
-        :_exception(nullptr),_message(message==nullptr?std::string():std::string(message))
-      {
-      }
-
       explicit CAIF_Error(CAIF_Exception &ex)
         :_exception(&ex)
       {
         std::ostringstream oss;
         oss<<static_cast<const ISE_Exception&>(ex);
-        _message=oss.str();
+        SetMessage(oss.str());
       }
 
       CAIF_Error &operator=(const std::string &message)
       {
-        _message=message;
-        _exception=nullptr;
+        SetMessage(message);
+        SetException(nullptr);
         return *this;
       }
 
@@ -74,7 +69,7 @@ namespace instance
         {
           std::ostringstream oss;
           oss<<static_cast<const ISE_Exception&>(*ex);
-          _message=oss.str();
+          SetMessage(oss.str());
         }
       }
 
@@ -84,13 +79,13 @@ namespace instance
 
       [[noreturn]] void Throw()const
       {
-        if(_exception!=nullptr)
+        if(Exception()!=nullptr)
         {
-          RETHROW_CAIFES((*_exception));
+          RETHROW_CAIFES((*Exception()));
         }
         else
         {
-          THROW_CAIFE(_message.c_str());
+          THROW_CAIFE(Message());
         }
       }
 

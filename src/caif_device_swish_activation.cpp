@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #include "caif_device_swish_activation.h"
-#include "caif_cuda_kernels.h"
+#include "caif_cuda_kernels_activations.cuh"
 #include "caif_constants.h"
+#include "caif_serialization_constants.h"
 #include "caif_exception.h"
 
 namespace instance
@@ -30,7 +31,7 @@ void CAIF_DeviceSwishActivation<ComputeT,StorageT>::Forward(const CAIF_DeviceTen
     {
       THROW_CAIFE("CAIF_DeviceSwishActivation: output dtype != StorageT");
     }
-    const int n=static_cast<int>(input.TotalElements());
+    const int64_t n=static_cast<int64_t>(input.TotalElements());
     launch_swish_forward<StorageT>(input.template DevicePtr<StorageT>(),
                                     output.template DevicePtr<StorageT>(),
                                     n,
@@ -51,7 +52,7 @@ void CAIF_DeviceSwishActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTe
     {
       THROW_CAIFE("CAIF_DeviceSwishActivation: grad_output dtype != StorageT");
     }
-    const int n=static_cast<int>(grad_output.TotalElements());
+    const int64_t n=static_cast<int64_t>(grad_output.TotalElements());
     launch_swish_backward<StorageT>(grad_output.template DevicePtr<StorageT>(),
                                      pre_activation.template DevicePtr<StorageT>(),
                                      post_activation.template DevicePtr<StorageT>(),
@@ -65,7 +66,7 @@ void CAIF_DeviceSwishActivation<ComputeT,StorageT>::Backward(const CAIF_DeviceTe
 template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceSwishActivation<ComputeT,StorageT>::Description()const
 {
-  return g_caif_description_swish;
+  return g_serial_tag_swish;
 }
 
 template<typename ComputeT,typename StorageT>

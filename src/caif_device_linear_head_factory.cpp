@@ -26,7 +26,7 @@ std::unique_ptr<CAIF_DeviceLayer> MakeLinearHead(uint32_t input_dim,
                                                   bool use_bias,
                                                   CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceLinearHead<ComputeT,StorageT>::Config_t cfg{input_dim,output_dim,use_bias};
+  CAIF_DeviceLinearHeadConfig cfg{input_dim,output_dim,use_bias};
   return std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(cfg,stream);
 }
 
@@ -38,7 +38,7 @@ std::unique_ptr<CAIF_DeviceLayer> MakeLinearHeadTied(uint32_t input_dim,
                                                       CAIF_DeviceTensor &tied_weight_grad,
                                                       CAIF_CudaStream &stream)
 {
-  typename CAIF_DeviceLinearHead<ComputeT,StorageT>::Config_t cfg{input_dim,output_dim,use_bias};
+  CAIF_DeviceLinearHeadConfig cfg{input_dim,output_dim,use_bias};
   return std::make_unique<CAIF_DeviceLinearHead<ComputeT,StorageT>>(cfg,
                                                                      tied_weight,
                                                                      tied_weight_grad,

@@ -23,7 +23,7 @@ namespace instance
 {
 
 // Static singleton default stream
-std::unique_ptr<CAIF_CudaStream> CAIF_CudaStream::s_default_stream=nullptr;
+std::unique_ptr<CAIF_CudaStream> CAIF_CudaStream::_default_stream=nullptr;
 
 CAIF_CudaStream::CAIF_CudaStream():
 #ifdef USE_CAIF_CUDA
@@ -39,7 +39,7 @@ CAIF_CudaStream::CAIF_CudaStream():
   {
     THROW_CAIFE("Failed to create CUDA stream");
   }
-  _valid=true;
+  SetValid(true);
 #endif
 }
 
@@ -54,13 +54,13 @@ CAIF_CudaStream::CAIF_CudaStream(cudaStream_t stream,bool owns_stream):_stream(s
 CAIF_CudaStream::~CAIF_CudaStream()
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==true&&_owns_stream==true&&_stream!=nullptr)
+  if(IsValid()==true&&OwnsStream()==true&&Handle()!=nullptr)
   {
-    cudaStreamDestroy(_stream);
-    _stream=nullptr;
+    cudaStreamDestroy(Handle());
+    SetStream(nullptr);
   }
 #endif
-  _valid=false;
+  SetValid(false);
 }
 
 CAIF_CudaStream::CAIF_CudaStream(CAIF_CudaStream &&other)noexcept:
@@ -71,10 +71,10 @@ CAIF_CudaStream::CAIF_CudaStream(CAIF_CudaStream &&other)noexcept:
                                                               _owns_stream(other._owns_stream)
 {
 #ifdef USE_CAIF_CUDA
-  other._stream=nullptr;
+  other.SetStream(nullptr);
 #endif
-  other._valid=false;
-  other._owns_stream=false;
+  other.SetValid(false);
+  other.SetOwnsStream(false);
 }
 
 CAIF_CudaStream &CAIF_CudaStream::operator=(CAIF_CudaStream &&other)noexcept
@@ -83,17 +83,17 @@ CAIF_CudaStream &CAIF_CudaStream::operator=(CAIF_CudaStream &&other)noexcept
   {
 #ifdef USE_CAIF_CUDA
     // Destroy current stream if we own it
-    if(_valid==true&&_owns_stream==true&&_stream!=nullptr)
+    if(IsValid()==true&&OwnsStream()==true&&Handle()!=nullptr)
     {
-      cudaStreamDestroy(_stream);
+      cudaStreamDestroy(Handle());
     }
-    _stream=other._stream;
-    other._stream=nullptr;
+    SetStream(other.Handle());
+    other.SetStream(nullptr);
 #endif
-    _valid=other._valid;
-    _owns_stream=other._owns_stream;
-    other._valid=false;
-    other._owns_stream=false;
+    SetValid(other.IsValid());
+    SetOwnsStream(other.OwnsStream());
+    other.SetValid(false);
+    other.SetOwnsStream(false);
   }
   return *this;
 }
@@ -102,11 +102,11 @@ CAIF_CudaEvent CAIF_CudaStream::RecordEvent()const
 {
   CAIF_CudaEvent event;
 #ifdef USE_CAIF_CUDA
-  if(_valid==false)
+  if(IsValid()==false)
   {
     THROW_CAIFE("Cannot record event on invalid CUDA stream");
   }
-  cudaError_t status=cudaEventRecord(event.Handle(),_stream);
+  cudaError_t status=cudaEventRecord(event.Handle(),Handle());
   if(status!=cudaSuccess)
   {
     THROW_CAIFE("Failed to record CUDA event on stream");
@@ -118,7 +118,7 @@ CAIF_CudaEvent CAIF_CudaStream::RecordEvent()const
 void CAIF_CudaStream::WaitFor(const CAIF_CudaEvent &event)
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==false)
+  if(IsValid()==false)
   {
     THROW_CAIFE("Cannot wait on invalid CUDA stream");
   }
@@ -126,7 +126,7 @@ void CAIF_CudaStream::WaitFor(const CAIF_CudaEvent &event)
   {
     THROW_CAIFE("Cannot wait for invalid CUDA event");
   }
-  cudaError_t status=cudaStreamWaitEvent(_stream,event.Handle(),0);
+  cudaError_t status=cudaStreamWaitEvent(Handle(),event.Handle(),0);
   if(status!=cudaSuccess)
   {
     THROW_CAIFE("Failed to make CUDA stream wait for event");
@@ -137,11 +137,11 @@ void CAIF_CudaStream::WaitFor(const CAIF_CudaEvent &event)
 void CAIF_CudaStream::Synchronize()const
 {
 #ifdef USE_CAIF_CUDA
-  if(_valid==false)
+  if(IsValid()==false)
   {
     THROW_CAIFE("Cannot synchronize invalid CUDA stream");
   }
-  cudaError_t status=cudaStreamSynchronize(_stream);
+  cudaError_t status=cudaStreamSynchronize(Handle());
   if(status!=cudaSuccess)
   {
     THROW_CAIFE("Failed to synchronize CUDA stream");
@@ -152,19 +152,19 @@ void CAIF_CudaStream::Synchronize()const
 CAIF_CudaStream &CAIF_CudaStream::Default()
 {
 #ifdef USE_CAIF_CUDA
-  if(s_default_stream==nullptr)
+  if(_default_stream==nullptr)
   {
     // Use the CUDA default stream (0/nullptr) - we don't own it
-    s_default_stream=std::unique_ptr<CAIF_CudaStream>(new CAIF_CudaStream(nullptr,false));
+    _default_stream=std::unique_ptr<CAIF_CudaStream>(new CAIF_CudaStream(nullptr,false));
   }
-  return *s_default_stream;
+  return *_default_stream;
 #else
   // When CUDA not available, return a dummy stream
-  if(s_default_stream==nullptr)
+  if(_default_stream==nullptr)
   {
-    s_default_stream=std::make_unique<CAIF_CudaStream>();
+    _default_stream=std::make_unique<CAIF_CudaStream>();
   }
-  return *s_default_stream;
+  return *_default_stream;
 #endif
 }
 

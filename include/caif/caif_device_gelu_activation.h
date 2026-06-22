@@ -14,13 +14,16 @@
 
 //------------------------------------------------------------------------------
 // CAIF - AI Framework
-// CAIF_DeviceGELUActivation — pointwise GELU.
-// f(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-// Templated on <ComputeT, StorageT>.
+// CAIF_DeviceGELUActivation — pointwise GELU. The approximation is selectable:
+//   Tanh  (default): f(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+//   Exact          : f(x) = 0.5*x*(1 + erf(x/sqrt(2)))
+// Tanh is the historical CAIF default, so an unparameterised construction keeps
+// existing numerics. Templated on <ComputeT, StorageT>.
 //------------------------------------------------------------------------------
 #pragma once
 
 #include "caif_device_pointwise_activation.h"
+#include "caif_gelu_approximation.h"
 #include "caif_storage_dtype.h"
 #include "caif_storage_dtype_float.h"
 #ifdef USE_CAIF_CUDA
@@ -35,6 +38,10 @@ template<typename ComputeT=float,typename StorageT=float>
 class CAIF_DeviceGELUActivation:public CAIF_DevicePointwiseActivation
 {
   public:
+    CAIF_DeviceGELUActivation():_approx(CAIF_GELUApproximation::CAIF_GELUApproximation_e::Tanh){}
+    explicit CAIF_DeviceGELUActivation(
+      const CAIF_GELUApproximation::CAIF_GELUApproximation_e approx):_approx(approx){}
+
     void Forward(const CAIF_DeviceTensor &input,
                  CAIF_DeviceTensor &output)const override;
 
@@ -46,9 +53,12 @@ class CAIF_DeviceGELUActivation:public CAIF_DevicePointwiseActivation
     std::string Description()const override;
     std::unique_ptr<CAIF_DeviceActivation> Clone()const override;
 
+    CAIF_GELUApproximation::CAIF_GELUApproximation_e Approx()const{return _approx;}
+
   protected:
 
   private:
+    CAIF_GELUApproximation::CAIF_GELUApproximation_e _approx;
 };
 
 #ifdef USE_CAIF_CUDA

@@ -82,6 +82,20 @@ class CAIF_DeviceLayerTyped:public CAIF_DeviceLayer
       return CAIF_StorageDtype_t<StorageT>::Value;
     }
 
+    // Polymorphic dtype introspection — override of the pure virtuals
+    // on CAIF_DeviceLayer. Returns the same value as the static
+    // constexpr StorageDtype() / ComputeDtype() above; only the call
+    // mechanism differs (callable through a `const CAIF_DeviceLayer&`
+    // reference, no compile-time template parameter required).
+    CAIF_DataType::CAIF_DataType_e RuntimeStorageDtype()const override
+    {
+      return StorageDtype();
+    }
+    CAIF_DataType::CAIF_DataType_e RuntimeComputeDtype()const override
+    {
+      return ComputeDtype();
+    }
+
   protected:
     // Shared boundary check — every templated layer's ForwardImpl
     // / BackwardImpl asserts input dtype matches StorageT once per

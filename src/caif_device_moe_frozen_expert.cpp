@@ -24,7 +24,7 @@ namespace instance
 
 template<typename ComputeT,typename StorageT>
 CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::CAIF_DeviceMoEFrozenExpert(
-    const Config_t &config,
+    const CAIF_DeviceMoEFrozenExpertConfig &config,
     FrozenSubLayers_t sub_layers,
     CAIF_CudaStream &stream)
   :CAIF_DeviceMoEExpertBase<ComputeT,StorageT>(stream)
@@ -33,11 +33,11 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::CAIF_DeviceMoEFrozenExpert(
 {
   try
   {
-    if(Config().input_dim==0)
+    if(Config().InputDim()==0)
     {
       THROW_CAIFE("MoEFrozenExpert: input_dim must be > 0");
     }
-    if(Config().hidden_dim==0)
+    if(Config().HiddenDim()==0)
     {
       THROW_CAIFE("MoEFrozenExpert: hidden_dim must be > 0");
     }
@@ -49,7 +49,7 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::CAIF_DeviceMoEFrozenExpert(
     {
       THROW_CAIFE("MoEFrozenExpert: down sub-layer required");
     }
-    if(Config().use_gated==true&&SubLayers().gate==nullptr)
+    if(Config().UseGated()==true&&SubLayers().gate==nullptr)
     {
       THROW_CAIFE("MoEFrozenExpert: gated config requires gate sub-layer");
     }
@@ -78,12 +78,12 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::operator=(
   if(this!=&other)
   {
     CAIF_DeviceMoEExpertBase<ComputeT,StorageT>::operator=(std::move(other));
-    _config=other._config;
-    _sub_layers=std::move(other._sub_layers);
-    _cached_input=std::move(other._cached_input);
-    _cached_gate_out=std::move(other._cached_gate_out);
-    _cached_up_out=std::move(other._cached_up_out);
-    _cached_hidden=std::move(other._cached_hidden);
+    SetConfig(other.Config());
+    SetSubLayers(std::move(other.SubLayersMut()));
+    SetCachedInput(std::move(other.CachedInput()));
+    SetCachedGateOut(std::move(other.CachedGateOut()));
+    SetCachedUpOut(std::move(other.CachedUpOut()));
+    SetCachedHidden(std::move(other.CachedHidden()));
   }
   return *this;
 }
@@ -96,7 +96,7 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::ForwardImpl(
   try
   {
     const auto &shape=input.Shape();
-    if(shape.size()!=2||shape[1]!=Config().input_dim)
+    if(shape.size()!=2||shape[1]!=Config().InputDim())
     {
       THROW_CAIFE("MoEFrozenExpert::Forward: expected [N, input_dim]");
     }
@@ -126,7 +126,7 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::ForwardImpl(
     }
 
     CAIF_DeviceTensor hidden;
-    if(Config().use_gated==true)
+    if(Config().UseGated()==true)
     {
       CAIF_DeviceLayer *gate_layer=dynamic_cast<CAIF_DeviceLayer*>(SubLayers().gate.get());
       CAIF_DeviceTensor gate_out_fp32=gate_layer->Forward(input,ctx);
@@ -145,11 +145,11 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::ForwardImpl(
       // broke parity vs the reference implementation on every loaded
       // MoE expert (the trained weights aren't symmetric in gate/up).
       // Same fix sits in CAIF_DeviceMoEExpert.
-      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},
+      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},
                                                                         Stream(),
                                                                         sd);
       CAIF_Ops::SiLU(gate_out,gate_activated);
-      hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},Stream(),sd);
       CAIF_Ops::Multiply(gate_activated,up_out,hidden);
       if(ctx.Training()==true)
       {
@@ -158,7 +158,7 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::ForwardImpl(
     }
     else
     {
-      hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      hidden=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},Stream(),sd);
       CAIF_Ops::SiLU(up_out,hidden);
     }
 
@@ -195,7 +195,7 @@ void CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::ForwardInto(
     // pay one extra D2D copy per forward, same as the projections
     // branch).
     const auto &out_shape=output.Shape();
-    if(out_shape.size()!=2||out_shape[0]!=input.Shape()[0]||out_shape[1]!=Config().input_dim)
+    if(out_shape.size()!=2||out_shape[0]!=input.Shape()[0]||out_shape[1]!=Config().InputDim())
     {
       THROW_CAIFE("MoEFrozenExpert::ForwardInto: output shape must be [N, input_dim]");
     }
@@ -260,7 +260,7 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::BackwardImpl(
       grad_hidden=grad_hidden_fp32.To(sd);
     }
 
-    if(Config().use_gated==true)
+    if(Config().UseGated()==true)
     {
       CAIF_DeviceLayer *gate_layer=dynamic_cast<CAIF_DeviceLayer*>(SubLayers().gate.get());
 
@@ -272,20 +272,20 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::BackwardImpl(
       //   grad_gate         = SiLUBackward(gate_out, grad_gate_activated)
       // Re-materialize SiLU(_cached_gate_out) since we don't cache the
       // post-activation tensor (fp16/bf16 cache cost > recompute cost).
-      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},
+      CAIF_DeviceTensor gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},
                                                                         Stream(),
                                                                         sd);
       CAIF_Ops::SiLU(CachedGateOut(),gate_activated);
 
-      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},Stream(),sd);
       CAIF_Ops::Multiply(grad_hidden,gate_activated,grad_up);
 
-      CAIF_DeviceTensor grad_gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},
+      CAIF_DeviceTensor grad_gate_activated=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},
                                                                              Stream(),
                                                                              sd);
       CAIF_Ops::Multiply(grad_hidden,CachedUpOut(),grad_gate_activated);
 
-      CAIF_DeviceTensor grad_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_DeviceTensor grad_gate=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},Stream(),sd);
       CAIF_Ops::SiLUBackward(CachedGateOut(),grad_gate_activated,grad_gate);
 
       // Push grad through gate + up FrozenLinear; both return grad_input
@@ -311,14 +311,14 @@ CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::BackwardImpl(
       {
         gi_gate=gi_gate_fp32.To(sd);
       }
-      CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().input_dim},Stream(),sd);
+      CAIF_DeviceTensor grad_input=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().InputDim()},Stream(),sd);
       CAIF_Ops::Add(gi_up,gi_gate,grad_input);
       return grad_input;
     }
     else
     {
       // grad_up = silu_backward(up_out, grad_hidden)
-      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().hidden_dim},Stream(),sd);
+      CAIF_DeviceTensor grad_up=CAIF_DeviceTensor::Uninitialized({num_tokens,Config().HiddenDim()},Stream(),sd);
       CAIF_Ops::SiLUBackward(CachedUpOut(),grad_hidden,grad_up);
       CAIF_DeviceTensor gi_fp32=up_layer->Backward(grad_up,ctx);
       if(gi_fp32.Dtype()==sd)
@@ -379,11 +379,11 @@ template<typename ComputeT,typename StorageT>
 std::string CAIF_DeviceMoEFrozenExpert<ComputeT,StorageT>::Description()const
 {
   return std::string("CAIF_DeviceMoEFrozenExpert(input_dim=")
-        +std::to_string(Config().input_dim)
+        +std::to_string(Config().InputDim())
         +",hidden_dim="
-        +std::to_string(Config().hidden_dim)
+        +std::to_string(Config().HiddenDim())
         +",use_gated="
-        +(Config().use_gated?"true":"false")
+        +(Config().UseGated()?"true":"false")
         +",frozen=true)";
 }
 

@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "caif_base.h"
 #include "caif_device_layer.h"
 #include "caif_data_type.h"
 #include "caif_cuda_stream.h"
@@ -27,11 +28,10 @@
 namespace instance
 {
 
-class CAIF_DeviceDropoutFactory
+class CAIF_DeviceDropoutFactory:public CAIF_Base
 {
   public:
     CAIF_DeviceDropoutFactory()=delete;
-    ~CAIF_DeviceDropoutFactory()=delete;
 
     static std::unique_ptr<CAIF_DeviceLayer>
     Create(float rate,

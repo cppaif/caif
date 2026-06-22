@@ -20,10 +20,11 @@
 #define CAIF_DEVICE_LAYER_H
 
 #include "caif_base.h"
+#include "caif_data_type.h"
 #include "caif_device_tensor.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_subsystem_scope.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -128,6 +129,23 @@ class CAIF_DeviceLayer:public CAIF_Base
     }
 
     virtual size_t TotalParameterCount()const=0;
+
+    /**
+     * @brief Runtime introspection of the layer's storage / compute dtype.
+     *
+     * Companion to the compile-time `StorageDtype()` / `ComputeDtype()`
+     * statics on `CAIF_DeviceLayerTyped<ComputeT,StorageT>`: those are
+     * known at compile time inside templated layer bodies; these are
+     * the polymorphic equivalents callable through a
+     * `const CAIF_DeviceLayer&` reference. Container layers
+     * (`CAIF_DevicePreNormBlock`, `CAIF_DeviceNetwork`, etc.) hold
+     * heterogeneous-dtype children and have no single answer — they
+     * return `Float32` as a sentinel; callers should recurse into
+     * their children via the parameter-tensor / sublayer APIs to
+     * inspect per-leaf dtypes.
+     */
+    virtual CAIF_DataType::CAIF_DataType_e RuntimeStorageDtype()const=0;
+    virtual CAIF_DataType::CAIF_DataType_e RuntimeComputeDtype()const=0;
 
     virtual std::string Description()const=0;
 
