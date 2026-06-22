@@ -155,7 +155,7 @@
 # ===========================================================================
 
 cmake_minimum_required(VERSION 3.18)
-project(caif VERSION 0.2.0 LANGUAGES CXX)
+project(caif VERSION 0.3.0 LANGUAGES CXX)
 # Pre-release tag appended to PROJECT_VERSION for display / packaging.
 # The numeric PROJECT_VERSION above stays strictly numeric so it can stamp
 # the libcaif.so SOVERSION; the full release string with the pre-release

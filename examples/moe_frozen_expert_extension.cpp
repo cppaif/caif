@@ -48,7 +48,7 @@
 #include "caif_device_context.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
@@ -141,10 +141,7 @@ int main()
     sub_layers.up=std::move(up_layer);
     sub_layers.down=std::move(down_layer);
 
-    FrozenExpert_t::Config_t expert_cfg;
-    expert_cfg.input_dim=input_dim;
-    expert_cfg.hidden_dim=hidden_dim;
-    expert_cfg.use_gated=true;
+    CAIF_DeviceMoEFrozenExpertConfig expert_cfg(input_dim,hidden_dim,true);
 
     FrozenExpert_t expert(expert_cfg,std::move(sub_layers),stream);
 

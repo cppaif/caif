@@ -625,6 +625,12 @@ Flash attention kernels available for `head_dim ∈ {32, 64, 80, 96, 128}`
 backward). Standard attention fallback for other head_dims (e.g.,
 GLM-4.7's 256).
 
+Optional per-config attention features, all default-off: logit soft-cap
+(`attn_logit_softcap`, Gemma-2/3) applies `cap*tanh(score/cap)` after the
+scale; sliding-window masking (`sliding_window`, Mistral); ALiBi linear
+position bias (`use_alibi`, MPT/BLOOM — replaces RoPE); and training-time
+attention dropout (`attention_dropout`).
+
 #### CAIF_DeviceCrossAttention
 **File:** `caif_device_cross_attention.h` / `caif_device_cross_attention.cpp`
 
@@ -767,7 +773,13 @@ new code.
 **File:** `caif_device_moe_router.h` / `caif_device_moe_router.cpp`
 
 Expert routing network. Routes each token to top-k experts. Routing types:
-TopK (default), ExpertChoice, Soft.
+TopK (default), ExpertChoice, Soft. Gating kinds: `SoftmaxTopK_e` and
+`SigmoidNoauxTc_e` (DeepSeek-V2 / GLM-4-MoE). Optional DeepSeek-V3
+group-limited routing (`n_group` / `topk_group` — group score is the sum of
+its top-2 expert sigmoids; the top groups are kept and the rest masked before
+top-k) and the aux-loss-free load-balancing bias update (`bias_update_rate`,
+applied via `UpdateAuxLossFreeBias()` once per optimizer step). Both default
+off.
 
 #### CAIF_DeviceMoEExpert
 **File:** `caif_device_moe_expert.h` / `caif_device_moe_expert.cpp`
@@ -782,14 +794,19 @@ activation via GPU dispatch/combine.
 
 - Auxiliary losses: `LastZLoss()`, `LastBalanceLoss()` — summed into
   `AuxLoss()` via container aggregation
-- Overflow strategies: only `Drop` is supported on the GPU dispatch path;
-  `NoOp` and `Redistribute` throw `CAIF_Exception` explicitly
+- Overflow strategies (`CAIF_MoEOverflowStrategy::CAIF_MoEOverflowStrategy_e`,
+  a shared non-templated enum): `Drop` and `NoDrop` (HF-parity, unlimited
+  capacity) are supported on the GPU dispatch path; `NoOp` and `Redistribute`
+  throw `CAIF_Exception` explicitly
 
 #### CAIF_MoEComposer
 **File:** `caif_moe_composer.h` / `caif_moe_composer.cpp`
 
-Convenience factory for common MoE block configurations. Produces a
-`CAIF_DevicePreNormBlock` with attention + MoE stages wired in.
+Convenience factory for whole MoE models and blocks. `BuildMoEBlock` produces
+a `CAIF_DevicePreNormBlock` (attention + MoE stages); `BuildModel` assembles a
+full decoder-only MoE model (embedding + blocks + final norm + head). Both
+dispatch on the model config's compute/storage dtype, so a model is built at
+fp32, fp16, or bf16 storage from a single config.
 
 ---
 
@@ -1157,13 +1174,13 @@ CrossEntropyLoss(logits, targets, mask)      # masked loss on assistant tokens o
 
 ## Test Suite
 
-31 test executables in `tests/`. Shared infrastructure:
+70 test executables in `tests/`. Shared infrastructure:
 
 - `caif_test_harness.{h,cpp}` — `ReportResult`, `FloatEqual`, counters, summary
 - `caif_gradcheck.{h,cpp}` — single FD entry with auto precision matching
   (scopes `MatmulMode_e::Accuracy_e` for the FD window, restoring on exit)
 - `caif_tolerances.h` — canonical per-op-class tolerances
-- `caif_cpu_reference/` — 14 extracted CPU reference implementations used as
+- `caif_cpu_reference/` — 11 extracted CPU reference implementations used as
   parity anchors
 - `run_all_tests.cpp` — walks the test directory and executes `test_*` binaries
 

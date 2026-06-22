@@ -70,19 +70,19 @@ int main()
     const uint32_t num_layers=2;
     const uint32_t ffn_dim=dim*4;
 
-    Model_t::Config_t model_cfg;
-    model_cfg.vocab_size=vocab_size;
-    model_cfg.max_seq_len=max_seq_len;
-    model_cfg.dim=dim;
-    model_cfg.num_heads=num_heads;
-    model_cfg.num_kv_heads=num_heads;
-    model_cfg.num_layers=num_layers;
-    model_cfg.ffn_dim=ffn_dim;
-    model_cfg.causal=true;
-    model_cfg.use_rope=true;
-    model_cfg.pe_mode=PositionalEncodingMode_e::Sinusoidal;
-    model_cfg.output_dim=vocab_size;
-    model_cfg.tie_weights=true;
+    CAIF_DeviceTransformerModelConfig model_cfg(
+                                           vocab_size,
+                                           max_seq_len,
+                                           dim,
+                                           num_heads,
+                                           num_layers,
+                                           CAIF_PositionalEncodingMode::CAIF_PositionalEncodingMode_e::Sinusoidal,
+                                           true,
+                                           true,
+                                           true);
+    model_cfg.SetNumKvHeads(num_heads);
+    model_cfg.SetFfnDim(ffn_dim);
+    model_cfg.SetOutputDim(vocab_size);
 
     CAIF_DeviceNetwork network(stream);
     std::unique_ptr<Model_t> model=std::make_unique<Model_t>(model_cfg,stream);

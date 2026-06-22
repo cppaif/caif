@@ -40,7 +40,7 @@
 #include "caif_device_context.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
@@ -81,18 +81,17 @@ int main()
     // effect as rope_dim==0 (full rotation, the default).
     const int rope_dim_partial=static_cast<int>(head_dim)/2;
 
-    MHA_t::AttentionConfig_t cfg;
-    cfg.dim=dim;
-    cfg.num_heads=num_heads;
-    cfg.num_kv_heads=num_kv_heads;
-    cfg.head_dim=head_dim;
-    cfg.causal=true;
-    cfg.use_rope=true;
-    cfg.rope_base=rope_base;
-    cfg.rope_style=0;
-    cfg.rope_dim=rope_dim_partial;
-    cfg.dropout_rate=dropout_rate;
-    cfg.qk_norm_eps=1.0e-5f;
+    CAIF_DeviceMultiHeadAttentionConfig cfg(dim,
+                                            num_heads,
+                                            num_kv_heads,
+                                            head_dim,
+                                            true,
+                                            true,
+                                            rope_base,
+                                            dropout_rate);
+    cfg.SetRopeStyle(0);
+    cfg.SetRopeDim(rope_dim_partial);
+    cfg.SetQkNormEps(1.0e-5f);
 
     MHA_t mha(cfg,stream);
     mha.InitializeWeights();

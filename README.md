@@ -29,16 +29,28 @@ See `CHANGES.md` for the re-arch release notes.
   backward.
 - **Transformer stack** — multi-head attention, GQA, FlashAttention,
   optional QK-norm (OLMoE / Olmo2 / Qwen3), partial-rotary RoPE for
-  Glm4Moe-style models, RMSNorm, LayerNorm.
+  Glm4Moe-style models, RMSNorm, LayerNorm. Optional per-config
+  attention features: logit soft-cap (Gemma-2/3), sliding-window
+  (Mistral), ALiBi (MPT / BLOOM), and training-time attention dropout.
 - **Multi-head Latent Attention (MLA)** — DeepSeek-V2 / GLM-4.7-Flash
-  style attention with compressed KV cache.
+  style attention with compressed KV cache and a fused tensor-core
+  flash-prefill kernel (O(seq) prefill memory for 16K+ context).
 - **MoE** — `SoftmaxTopK_e` and `SigmoidNoauxTc_e` (DeepSeek-V2 /
-  GLM-4-MoE) gating, top-k expert FFNs with the standard
-  `silu(gate) * up` SwiGLU, load-balancing and z-loss auxiliaries,
-  `norm_topk_prob` toggle.
-- **MoE Phase 4 — layer surgery** — wrap pretrained experts as frozen
-  via `CAIF_DeviceMoEFrozenExpert` and append new trainable experts to
-  grow MoE capacity from a base checkpoint.
+  GLM-4-MoE) gating, optional DeepSeek-V3 group-limited routing
+  (`n_group` / `topk_group`) and aux-loss-free load-balancing bias,
+  top-k expert FFNs with the standard `silu(gate) * up` SwiGLU,
+  load-balancing and z-loss auxiliaries, `norm_topk_prob` toggle.
+- **Whole-model MoE composer** — `CAIF_MoEComposer` assembles a complete
+  decoder-only MoE model (embedding + blocks + final norm + head) at
+  fp32, fp16, or bf16 from a single config.
+- **MoE layer surgery** — wrap pretrained experts as frozen via
+  `CAIF_DeviceMoEFrozenExpert` and append new trainable experts to grow
+  MoE capacity from a base checkpoint.
+- **Mixed-precision loss scaling** — `CAIF_LossScaler` with dynamic
+  loss-scale, overflow detection, and unscale-in-place.
+- **Large-tensor 64-bit indexing** — element counts and indices are
+  64-bit, so large-vocab logits at long context (>2.1B elements)
+  compute correctly.
 - **Optimizers** — Adam, AdamW (with master-weights), SGD, Momentum,
   RMSprop, AdaGrad, plus an offloaded-Adam variant for offload mode.
   All share `CAIF_DeviceOptimizer`.

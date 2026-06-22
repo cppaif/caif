@@ -1,5 +1,110 @@
 # CAIF — Changes
 
+## 0.3.0-alpha — 2026-06-22
+
+Training-fidelity and architecture-coverage features on top of the
+0.2.0 re-arch, plus a round of correctness fixes from internal
+validation. Almost everything new is gated behind config knobs that
+default to the prior behavior, so models built against 0.2.0 compile
+and run unchanged unless they opt in.
+
+### Highlights
+
+- **Attention feature parity.** `CAIF_DeviceMultiHeadAttention` picks
+  up four optional, independently-gated features used by recent open
+  models:
+  - **Logit soft-cap** (Gemma-2/3): `attn_logit_softcap` applies
+    `cap * tanh(score / cap)` after the scale, before the mask, on all
+    three score paths (tensor-core flash, scalar flash, explicit);
+    backward included.
+  - **Sliding-window attention** (Mistral / Gemma-2 local layers):
+    `sliding_window` masks keys older than the window.
+  - **ALiBi** (MPT / BLOOM): `use_alibi` adds a per-head linear
+    position bias `slope_h * (k - q)` before the softmax in place of
+    rotary encoding.
+  - **Attention dropout** (training only): `attention_dropout` applies
+    inverted dropout to the softmax weights, with the mask cached so
+    backward gates by the same draw.
+- **DeepSeek-V3 MoE routing.** The router gains group-limited routing
+  (`n_group` / `topk_group` — group score is the sum of its top-2
+  expert sigmoids; the top groups are kept and the rest masked before
+  top-k) and the aux-loss-free load-balancing bias update
+  (`bias[e] += rate * sign(mean_load - load[e])`, gradient-free, driven
+  by `CAIF_DeviceMoERouter::UpdateAuxLossFreeBias()` once per optimizer
+  step). Both default off.
+- **bf16 / fp16 MoE composer.** `CAIF_MoEComposer::BuildModel` /
+  `BuildMoEBlock` dispatch on the config's compute/storage dtype and
+  assemble a whole decoder-only MoE model (embedding + blocks + final
+  norm + head) at fp32, fp16, or bf16 — no longer pinned to
+  `<float, float>`.
+- **Fused MLA flash-prefill.** A tensor-core FlashAttention prefill
+  kernel for Multi-head Latent Attention (DeepSeek-V2/V3) with decoupled
+  Q/K and V head dims and O(seq) prefill memory, so 16K+ context
+  prefill no longer materializes an O(seq²) score matrix and OOMs.
+- **Mixed-precision loss scaling.** `CAIF_LossScaler` — dynamic
+  loss-scale with overflow detection and unscale-in-place (the
+  equivalent of `torch.cuda.amp.GradScaler`).
+- **64-bit element counts / indices.** Elementwise / activation / cast
+  / fill kernels, extent products, the optimizer offset path, and
+  cross-entropy indexing widened to 64-bit, so tensors past 2.1B
+  elements (e.g. large-vocab logits at long context) compute correctly
+  instead of overflowing a 32-bit index.
+- **`embed_scale` / `logit_scale`.** Config knobs (default 1.0) for
+  √dim embedding scaling and a separate head logit scale (Gemma).
+- **Exact-erf GELU.** Selectable exact-`erf` GELU alongside the tanh
+  approximation.
+
+### Correctness fixes
+
+- **AdamW weight-decay order** — decay now applies to the pre-step
+  weight, not the post-step weight.
+- **Fused-Adam NaN/Inf gradients** — no longer silently zeroed.
+- **Dense-layer gradient accumulation** — weight/bias gradients
+  accumulate across micro-batches instead of overwriting.
+- **Embedding backward precision** — gradient accumulates in fp32.
+- **LayerNorm variance** — per-row variance computed correctly.
+- **MoE capacity no-drop** — the GPU dispatch path honors the no-drop
+  (unlimited-capacity) request instead of always applying a finite
+  capacity.
+- **MoE routed-scaling** — `routed_scaling_factor` is applied and
+  reversed consistently across forward and backward.
+- **`Fill(value != 0)` use-after-free** — fixed an async-copy lifetime
+  bug.
+- **SafeTensors validation** — single-tensor loads validate dtype and
+  shape, not just presence.
+- **Host MatMul dtype guard** — the host MatMul family enforces the
+  same dtype contract as the device path.
+
+### Public API surface (additive)
+
+- New `CAIF_DeviceMultiHeadAttention` config fields:
+  `attn_logit_softcap`, `sliding_window`, `use_alibi`,
+  `attention_dropout`.
+- New `CAIF_DeviceMoERouterConfig` fields: `n_group`, `topk_group`,
+  `bias_update_rate`; new `CAIF_DeviceMoERouter::UpdateAuxLossFreeBias()`.
+- New ops `CAIF_Ops::MoEGroupMask` and `CAIF_Ops::MoEBiasUpdate`.
+- New `CAIF_MoEOverflowStrategy` wrapper class — a shared,
+  non-templated capacity-overflow enum, replacing the former
+  per-instantiation nested enum on `CAIF_DeviceMoELayer` (the member
+  typedef `OverflowStrategy_e` still resolves, now to the shared type).
+- New `CAIF_LossScaler`.
+- `CAIF_MoEComposer` model and block configs carry compute/storage
+  dtype, selected via `SetComputeDtype` / `SetStorageDtype`.
+- New exact-`erf` GELU activation selection.
+
+### Internal cleanups (visible in source diff)
+
+- The monolithic CUDA kernel translation unit was split into per-domain
+  modules (`caif_cuda_kernels_*.{cu,cuh}`: activations, elementwise,
+  normalization, embeddings, loss, optimizers, quant, tensor-ops,
+  attention-support, flash self / cross / MLA, MoE); CPU-only builds
+  link no-op stubs.
+- Closed-value enums moved into their own wrapper classes
+  (`CAIF_PositionalEncodingMode`, `CAIF_ActivationType`,
+  `CAIF_LossType`, `CAIF_OptimizerType`, `CAIF_LayerType`,
+  `CAIF_MoEOverflowStrategy`); layer/value/config classes are split
+  one-per-header.
+
 ## 2026-05 — re-arch release
 
 This is a major rework of the device-side runtime, picking up every
@@ -31,7 +136,7 @@ defaults.
 - **Activation (gradient) checkpointing** on
   `CAIF_DevicePreNormBlock` — opt-in, drops the per-block forward
   cache and recomputes during backward.
-- **MoE Phase 4 layer surgery.** New `CAIF_DeviceMoEFrozenExpert`
+- **MoE layer surgery.** New `CAIF_DeviceMoEFrozenExpert`
   wraps pretrained expert weights as a frozen 3-projection block;
   external model builders can replace a `CAIF_DeviceFFN` slot in a
   transformer block with a fresh `CAIF_DeviceMoELayer` containing the

@@ -40,7 +40,7 @@
 #include "caif_device_context.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_exception.h"
 #include "ise_lib/ise_out.h"
 #include <vector>
@@ -67,21 +67,20 @@ int main()
     const uint32_t num_tokens=4;
     const uint32_t init_seed=7;
 
-    Router_t::Config_t base_cfg;
-    base_cfg.input_dim=input_dim;
-    base_cfg.num_experts=num_experts;
-    base_cfg.top_k=top_k;
-    base_cfg.routing_type=Router_t::RoutingType_e::TopK;
-    base_cfg.use_bias=false;
-    base_cfg.noise_std=0.0f;
-    base_cfg.gating_kind=CAIF_DeviceMoELayerFactory::GatingKind_e::SoftmaxTopK_e;
-    base_cfg.routed_scaling_factor=1.0f;
+    CAIF_DeviceMoERouterConfig base_cfg(input_dim,
+                                        num_experts,
+                                        top_k,
+                                        Router_t::RoutingType_e::TopK,
+                                        false,
+                                        0.0f);
+    base_cfg.SetGatingKind(CAIF_DeviceMoELayerFactory::GatingKind_e::SoftmaxTopK_e);
+    base_cfg.SetRoutedScalingFactor(1.0f);
 
-    Router_t::Config_t cfg_norm=base_cfg;
-    cfg_norm.norm_topk_prob=true;
+    CAIF_DeviceMoERouterConfig cfg_norm=base_cfg;
+    cfg_norm.SetNormTopkProb(true);
 
-    Router_t::Config_t cfg_raw=base_cfg;
-    cfg_raw.norm_topk_prob=false;
+    CAIF_DeviceMoERouterConfig cfg_raw=base_cfg;
+    cfg_raw.SetNormTopkProb(false);
 
     Router_t router_norm(cfg_norm,stream);
     Router_t router_raw(cfg_raw,stream);

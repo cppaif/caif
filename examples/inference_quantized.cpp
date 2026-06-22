@@ -41,7 +41,7 @@
 #include "caif_device_context.h"
 #include "caif_cuda_stream.h"
 #include "caif_run_context.h"
-#include "caif_run_context_scope.h"
+#include "caif_run_context_pass_scope.h"
 #include "caif_ops.h"
 #include "caif_exception.h"
 #include "caif_int4_packed_t.h"

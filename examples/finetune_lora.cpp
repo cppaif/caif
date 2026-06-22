@@ -74,18 +74,14 @@ int main()
     // Layer 1: base dense layer wrapped with a LoRA adapter.
     // The dense layer's weights stay frozen; only the LoRA A and B
     // matrices (rank * 2 * dim parameters) train.
-    LoRAAdapter_t::LoRAConfig_t lora_cfg;
-    lora_cfg.rank=lora_rank;
-    lora_cfg.alpha=lora_alpha;
-    lora_cfg.input_dim=dim;
-    lora_cfg.output_dim=dim;
+    CAIF_DeviceLoRAAdapterConfig lora_cfg(lora_rank,lora_alpha,dim,dim);
 
     std::unique_ptr<DenseLayer_t> base_dense=std::make_unique<DenseLayer_t>(
-                                                              dim,
-                                                              dim,
-                                                              CAIF_DeviceActivation_e::None,
-                                                              stream,
-                                                              true);
+                                                             dim,
+                                                             dim,
+                                                             CAIF_DeviceActivation::CAIF_DeviceActivation_e::None,
+                                                             stream,
+                                                             true);
     std::unique_ptr<LoRAAdapter_t> lora=std::make_unique<LoRAAdapter_t>(
                                                               lora_cfg,
                                                               std::move(base_dense),
@@ -95,10 +91,7 @@ int main()
 
     network.AddLayer(std::make_unique<RMSNorm_t>(dim,stream));
 
-    LinearHead_t::Config_t head_cfg;
-    head_cfg.input_dim=dim;
-    head_cfg.output_dim=num_classes;
-    head_cfg.use_bias=false;
+    CAIF_DeviceLinearHeadConfig head_cfg(dim,num_classes,false);
     network.AddLayer(std::make_unique<LinearHead_t>(head_cfg,stream));
 
     // Freeze the norm and the head — only the LoRA inside the first
